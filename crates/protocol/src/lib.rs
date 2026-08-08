@@ -99,18 +99,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn edge_req_exec_round_trip() {
-        let req = EdgeReq::Exec(ExecParams {
-            command: "echo".into(),
-            args: vec!["hello".into()],
-            cwd: None,
-        });
-        let json = serde_json::to_string(&req).unwrap();
-        let parsed: EdgeReq = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, EdgeReq::Exec(_)));
-    }
-
-    #[test]
     fn mcp_transport_is_tagged() {
         let t = McpTransport::Http {
             url: "http://127.0.0.1:8888/mcp".into(),

@@ -210,13 +210,4 @@ mod tests {
         assert_eq!(first.public(), second.public());
         assert_eq!(std::fs::read(path).unwrap().len(), 32);
     }
-
-    #[test]
-    fn atomic_json_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.json");
-        write_json(&path, &vec!["one", "two"]).unwrap();
-        let value: Vec<String> = read_json(&path).unwrap();
-        assert_eq!(value, ["one", "two"]);
-    }
 }

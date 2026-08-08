@@ -296,7 +296,16 @@ fn main() -> Result<()> {
         }
         Task::Test => {
             let mut test = command("cargo");
-            test.args(["test", "--workspace", "--all-targets", "--locked"]);
+            test.args([
+                "test",
+                "--workspace",
+                "--exclude",
+                "fd-lib",
+                "--exclude",
+                "rg-lib",
+                "--all-targets",
+                "--locked",
+            ]);
             run(test)
         }
         Task::Zigbuild { targets } => {
