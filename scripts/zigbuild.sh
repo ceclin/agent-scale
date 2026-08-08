@@ -19,7 +19,6 @@ ZIGBUILD_RUSTFLAGS="${ZIGBUILD_RUSTFLAGS# }"
 default_targets=(
   x86_64-unknown-linux-musl
   aarch64-unknown-linux-musl
-  x86_64-pc-windows-gnu
 )
 
 if [ "$#" -gt 0 ]; then

@@ -53,6 +53,10 @@ The workflow creates versioned archives for:
 - `as-control`: Linux x86-64 and Linux ARM64;
 - `as-relay`: Linux x86-64 and Linux ARM64.
 
+Linux archives use Rust's static musl targets on matching x86-64 and ARM64
+runners. Windows archives use the native `x86_64-pc-windows-msvc` toolchain;
+the release workflow does not cross-compile either platform.
+
 Every archive has an entry in the distribution's `SHA256SUMS`. Verify a download
 from the directory containing both files with:
 

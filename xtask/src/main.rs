@@ -37,11 +37,11 @@ enum Task {
     Lint,
     /// Run repository policy checks independently from compiler-backed checks.
     Quality,
-    /// Build cross-platform edge artifacts for a release.
+    /// Cross-build Linux artifacts with the distribution profile.
     Dist,
     /// Run all workspace tests.
     Test,
-    /// Cross-compile edge artifacts with the fast development profile.
+    /// Cross-build Linux artifacts with the fast development profile.
     Zigbuild {
         /// Targets to build; defaults to all supported edge targets.
         targets: Vec<String>,

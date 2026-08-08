@@ -103,10 +103,10 @@ modified by repository tooling; wrapper builds copy their sources to Cargo's
 cache automatically.
 
 End-to-end tests are intentionally local-only. Run `cargo x e2e` when changing
-transport or lifecycle behavior. Development cross-builds use `cargo x
-zigbuild [TARGET...]` with Cargo's default release profile (no LTO, 16 codegen
-units). Run `cargo x dist` only while preparing a release; it enables full LTO
-with one codegen unit for the slower three-target Docker/cargo-zigbuild build.
+transport or lifecycle behavior. Local Linux cross-builds use `cargo x zigbuild
+[TARGET...]` with Cargo's default release profile (no LTO, 16 codegen units);
+`cargo x dist` selects full LTO with one codegen unit. Official distributions
+are built natively on x86-64 and ARM64 Linux, Windows, and macOS runners.
 
 `cargo x lint` checks formatting, strict Clippy, documentation, generated
 wrapper manifests, TOML formatting, spelling, and dependency policy. The build
