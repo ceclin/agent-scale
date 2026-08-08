@@ -22,6 +22,9 @@ case "$binary" in
 esac
 
 mkdir -p "$output_root"
+# Packaging runs from a temporary staging directory, so callers may safely pass
+# the relative output paths used by local and CI release commands.
+output_root="$(cd "$output_root" && pwd -P)"
 found=0
 
 for target_dir in "$input_root"/*; do
