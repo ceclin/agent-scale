@@ -11,8 +11,9 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -20,8 +21,9 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand};
 use control_api::{
     CONTROL_PROTOCOL_VERSION, CenterInfo, ClaimRequest, ControlStatus, EdgeInfo, EdgeInviteRequest, Invite, InviteInfo,
-    InviteKind, InviteResult, JoinResult, JoinToken, NodeMap, Overview, RelayInfo, RelayNodeInfo, SignedNodeMap,
-    WatchRequest, hash_secret,
+    InviteKind, InviteResult, JoinResult, JoinToken, ManagedCenterInfo, ManagedEdgeInfo, NodeMap, Overview,
+    ProvisionerAction, ProvisionerRequest, ProvisionerResponse, ProvisionerTopology, RelayInfo, RelayNodeInfo,
+    SignedNodeMap, WatchRequest, action_hash, hash_secret, verify_provisioner_authorization,
 };
 use iroh_base::{EndpointId, SecretKey};
 use rand::Rng;
@@ -85,6 +87,11 @@ enum Command {
     Relay {
         #[command(subcommand)]
         command: RelayCommand,
+    },
+    /// Manage external topology reconcilers through the local administration socket.
+    Provisioner {
+        #[command(subcommand)]
+        command: ProvisionerCommand,
     },
     /// Inspect or revoke enrollment invitations.
     Invite {
@@ -160,6 +167,13 @@ enum RelayCommand {
 }
 
 #[derive(Subcommand)]
+enum ProvisionerCommand {
+    Add { name: String, endpoint_id: String },
+    Ls,
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
 enum InviteCommand {
     Ls,
     Revoke { invite_id: String },
@@ -173,6 +187,7 @@ enum LocalAdminRequest {
     ListEdges,
     ListRelays,
     ListInvites,
+    ListProvisioners,
     InviteCenter { name: String, ttl_secs: u64 },
     InviteEdge { name: String, owner: String, ttl_secs: u64 },
     InviteRelay { name: String, url: String, ttl_secs: u64 },
@@ -181,6 +196,8 @@ enum LocalAdminRequest {
     TransferEdge { edge: String, new_center: String },
     RemoveEdge { edge: String },
     RemoveRelay { name: String },
+    AddProvisioner { name: String, endpoint_id: String },
+    RemoveProvisioner { name: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -191,6 +208,7 @@ enum LocalAdminResponse {
     Edges(Vec<EdgeInfo>),
     Relays(Vec<RelayNodeInfo>),
     Invites(Vec<InviteInfo>),
+    Provisioners(Vec<ProvisionerInfo>),
     Invite(InviteResult),
     Ok,
     Error(String),
@@ -200,6 +218,8 @@ enum LocalAdminResponse {
 struct CenterRecord {
     name: String,
     endpoint_id: String,
+    #[serde(default)]
+    managed_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +234,19 @@ struct RelayRecord {
     name: String,
     endpoint_id: String,
     url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProvisionerRecord {
+    name: String,
+    endpoint_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProvisionerInfo {
+    name: String,
+    endpoint_id: String,
+    centers: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,6 +264,10 @@ struct InviteRecord {
     claimed_by: Option<String>,
     #[serde(default)]
     request_id: Option<String>,
+    #[serde(default)]
+    managed_by: Option<String>,
+    #[serde(default)]
+    request_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,6 +284,8 @@ struct ControlState {
     relays: Vec<RelayRecord>,
     #[serde(default)]
     invites: Vec<InviteRecord>,
+    #[serde(default)]
+    provisioners: Vec<ProvisionerRecord>,
 }
 
 struct Store {
@@ -355,6 +394,16 @@ async fn main() -> Result<()> {
             };
             print_admin_response(admin_call(&admin_socket, request).await?)
         }
+        Command::Provisioner { command } => {
+            let request = match command {
+                ProvisionerCommand::Add { name, endpoint_id } => {
+                    LocalAdminRequest::AddProvisioner { name, endpoint_id }
+                }
+                ProvisionerCommand::Ls => LocalAdminRequest::ListProvisioners,
+                ProvisionerCommand::Rm { name } => LocalAdminRequest::RemoveProvisioner { name },
+            };
+            print_admin_response(admin_call(&admin_socket, request).await?)
+        }
         Command::Invite { command } => {
             let request = match command {
                 InviteCommand::Ls => LocalAdminRequest::ListInvites,
@@ -395,6 +444,7 @@ fn init(state_dir: Option<PathBuf>, public_url: String, audience: String) -> Res
         edges: vec![],
         relays: vec![],
         invites: vec![],
+        provisioners: vec![],
     };
     persist_state(&dir, &state)?;
     println!("initialized control {}", key.public());
@@ -458,6 +508,7 @@ async fn run(state_dir: Option<PathBuf>, bind: SocketAddr, admin_socket: PathBuf
         .route("/v1/status", get(status))
         .route("/v1/claim", post(claim))
         .route("/v1/edge/invite", post(center_edge_invite))
+        .route("/v1/provisioner", post(provisioner_request))
         .route("/v1/watch", post(watch))
         .route("/v1/relay/watch", post(relay_watch))
         .with_state(app_state);
@@ -522,7 +573,8 @@ async fn claim(
     }
     let mut next = state.clone();
     let invite = next.invites[index].invite.clone();
-    add_claimed_node(&mut next, &invite, endpoint_id)?;
+    let managed_by = next.invites[index].managed_by.clone();
+    add_claimed_node(&mut next, &invite, endpoint_id, managed_by.as_deref())?;
     next.invites[index].state = InviteState::Claimed;
     next.invites[index].claimed_by = Some(endpoint_id.to_string());
     next.revision = next
@@ -552,13 +604,12 @@ async fn center_edge_invite(
     if request.audience != state.audience {
         return Err(ApiError::unauthorized("control audience mismatch"));
     }
-    if !state
+    let managed_by = state
         .centers
         .iter()
-        .any(|center| center.endpoint_id == center_id.to_string())
-    {
-        return Err(ApiError::forbidden("center is not registered"));
-    }
+        .find(|center| center.endpoint_id == center_id.to_string())
+        .map(|center| center.managed_by.clone())
+        .ok_or_else(|| ApiError::forbidden("center is not registered"))?;
     if state
         .invites
         .iter()
@@ -576,8 +627,300 @@ async fn center_edge_invite(
         .last_mut()
         .expect("create_invite always appends an invitation")
         .request_id = Some(request.request_id);
-    persist_candidate(&store, &mut state, next, false)?;
+    next.invites
+        .last_mut()
+        .expect("create_invite always appends an invitation")
+        .managed_by = managed_by;
+    commit_candidate(&store, &mut state, next)?;
     Ok(Json(result))
+}
+
+async fn provisioner_request(
+    State(AppState(store)): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<ProvisionerResponse>, ApiError> {
+    if body.len() > 64 * 1024 {
+        return Err(ApiError::bad("provisioner request body exceeds 64 KiB"));
+    }
+    let authorization = headers
+        .get(AUTHORIZATION)
+        .ok_or_else(|| ApiError::unauthorized("missing provisioner authorization"))?
+        .to_str()
+        .map_err(ApiError::unauthorized)?;
+    let provisioner_id = verify_provisioner_authorization(authorization, &body)
+        .map_err(ApiError::unauthorized)?
+        .to_string();
+    let request: ProvisionerRequest = serde_json::from_slice(&body).map_err(ApiError::bad)?;
+    request.verify_protocol().map_err(ApiError::bad)?;
+    check_time(request.issued_at, unix_timestamp()).map_err(ApiError::unauthorized)?;
+    validate_request_id(&request.request_id).map_err(ApiError::bad)?;
+
+    let mut state = store.state.lock().await;
+    if request.audience != state.audience {
+        return Err(ApiError::unauthorized("control audience mismatch"));
+    }
+    if !state.provisioners.iter().any(|item| item.endpoint_id == provisioner_id) {
+        return Err(ApiError::forbidden("provisioner is not registered"));
+    }
+
+    if matches!(request.action, ProvisionerAction::GetTopology) {
+        return Ok(Json(ProvisionerResponse::Topology(provisioner_topology(
+            &state,
+            &provisioner_id,
+        ))));
+    }
+
+    let response = dispatch_provisioner_mutation(&store, &mut state, &provisioner_id, &request)?;
+    Ok(Json(response))
+}
+
+fn dispatch_provisioner_mutation(
+    store: &Store,
+    state: &mut ControlState,
+    provisioner_id: &str,
+    request: &ProvisionerRequest,
+) -> Result<ProvisionerResponse, ApiError> {
+    match &request.action {
+        ProvisionerAction::GetTopology => unreachable!("queries are handled before mutation dispatch"),
+        ProvisionerAction::InviteCenter { name, ttl_secs, secret } => provisioner_invite(
+            store,
+            state,
+            provisioner_id,
+            request,
+            name,
+            InviteKind::Center,
+            *ttl_secs,
+            secret,
+        ),
+        ProvisionerAction::InviteEdge {
+            owner,
+            name,
+            ttl_secs,
+            secret,
+        } => {
+            let owner_id = managed_center_id(state, owner, provisioner_id)?;
+            provisioner_invite(
+                store,
+                state,
+                provisioner_id,
+                request,
+                name,
+                InviteKind::Edge { owner_id },
+                *ttl_secs,
+                secret,
+            )
+        }
+        ProvisionerAction::RevokeInvite { invite_id } => {
+            let Some(index) = state.invites.iter().position(|item| {
+                item.invite.invite_id == *invite_id && item.managed_by.as_deref() == Some(provisioner_id)
+            }) else {
+                return Err(ApiError::bad("unknown managed invite"));
+            };
+            match state.invites[index].state {
+                InviteState::Revoked => return provisioner_ok(state),
+                InviteState::Claimed => return Err(ApiError::conflict("claimed invites cannot be revoked")),
+                InviteState::Pending => {}
+            }
+            check_expected_revision(state, request.expected_revision)?;
+            let mut next = state.clone();
+            next.invites[index].state = InviteState::Revoked;
+            commit_candidate(store, state, next)?;
+            provisioner_ok(state)
+        }
+        ProvisionerAction::RemoveCenter { name } => {
+            let Some(center) = state
+                .centers
+                .iter()
+                .find(|item| item.name == *name && item.managed_by.as_deref() == Some(provisioner_id))
+                .cloned()
+            else {
+                if state.centers.iter().any(|item| item.name == *name) {
+                    return Err(ApiError::forbidden("center is managed by another authority"));
+                }
+                return provisioner_ok(state);
+            };
+            if state.edges.iter().any(|edge| edge.owner_id == center.endpoint_id) {
+                return Err(ApiError::conflict("center still owns edges"));
+            }
+            if state.invites.iter().any(|invite| {
+                invite_is_active_pending(invite)
+                    && matches!(&invite.invite.kind, InviteKind::Edge { owner_id } if owner_id == &center.endpoint_id)
+            }) {
+                return Err(ApiError::conflict("center still has pending edge invites"));
+            }
+            check_expected_revision(state, request.expected_revision)?;
+            let mut next = state.clone();
+            next.centers.retain(|item| item.endpoint_id != center.endpoint_id);
+            commit_candidate(store, state, next)?;
+            provisioner_ok(state)
+        }
+        ProvisionerAction::RemoveEdge { owner, name } => {
+            let owner_id = managed_center_id(state, owner, provisioner_id)?;
+            let exists = state
+                .edges
+                .iter()
+                .any(|item| item.owner_id == owner_id && item.name == *name);
+            if !exists {
+                return provisioner_ok(state);
+            }
+            check_expected_revision(state, request.expected_revision)?;
+            let mut next = state.clone();
+            next.edges
+                .retain(|item| !(item.owner_id == owner_id && item.name == *name));
+            commit_candidate(store, state, next)?;
+            provisioner_ok(state)
+        }
+        ProvisionerAction::TransferEdge {
+            owner,
+            name,
+            endpoint_id,
+            new_owner,
+        } => {
+            let endpoint_id = endpoint_id
+                .parse::<EndpointId>()
+                .map_err(|error| ApiError::bad(format!("invalid edge endpoint id: {error}")))?
+                .to_string();
+            let owner_id = managed_center_id(state, owner, provisioner_id)?;
+            let new_owner_id = managed_center_id(state, new_owner, provisioner_id)?;
+            if !state
+                .edges
+                .iter()
+                .any(|item| item.owner_id == owner_id && item.name == *name && item.endpoint_id == endpoint_id)
+            {
+                if state
+                    .edges
+                    .iter()
+                    .any(|item| item.owner_id == new_owner_id && item.name == *name && item.endpoint_id == endpoint_id)
+                {
+                    return provisioner_ok(state);
+                }
+                return Err(ApiError::bad("unknown managed edge"));
+            }
+            if state
+                .edges
+                .iter()
+                .any(|item| item.owner_id == new_owner_id && item.name == *name)
+            {
+                return Err(ApiError::conflict("target center already has an edge with this name"));
+            }
+            check_expected_revision(state, request.expected_revision)?;
+            let mut next = state.clone();
+            next.edges
+                .iter_mut()
+                .find(|item| item.owner_id == owner_id && item.name == *name && item.endpoint_id == endpoint_id)
+                .expect("managed edge was checked above")
+                .owner_id = new_owner_id;
+            commit_candidate(store, state, next)?;
+            provisioner_ok(state)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn provisioner_invite(
+    store: &Store,
+    state: &mut ControlState,
+    provisioner_id: &str,
+    request: &ProvisionerRequest,
+    name: &str,
+    kind: InviteKind,
+    ttl_secs: u64,
+    secret: &str,
+) -> Result<ProvisionerResponse, ApiError> {
+    validate_name(name).map_err(ApiError::bad)?;
+    validate_join_secret(secret).map_err(ApiError::bad)?;
+    let request_hash = action_hash(&request.action).map_err(ApiError::internal)?;
+    if let Some(existing) = state.invites.iter().find(|item| {
+        item.managed_by.as_deref() == Some(provisioner_id) && item.request_id.as_deref() == Some(&request.request_id)
+    }) {
+        if existing.request_hash.as_deref() != Some(&request_hash) {
+            return Err(ApiError::conflict("request id was already used for another action"));
+        }
+        let result = invite_result(&store.key, &existing.invite, secret).map_err(ApiError::internal)?;
+        return Ok(ProvisionerResponse::Invite(result));
+    }
+
+    check_expected_revision(state, request.expected_revision)?;
+    validate_invite_name(state, name, &kind)?;
+    let mut next = state.clone();
+    let result = create_invite_with_secret(
+        &store.key,
+        &mut next,
+        name.to_owned(),
+        kind,
+        ttl_secs,
+        secret.to_owned(),
+    )
+    .map_err(ApiError::bad)?;
+    let record = next
+        .invites
+        .last_mut()
+        .expect("create_invite always appends an invitation");
+    record.request_id = Some(request.request_id.clone());
+    record.managed_by = Some(provisioner_id.to_owned());
+    record.request_hash = Some(request_hash);
+    commit_candidate(store, state, next)?;
+    Ok(ProvisionerResponse::Invite(result))
+}
+
+fn provisioner_topology(state: &ControlState, provisioner_id: &str) -> ProvisionerTopology {
+    let centers = state
+        .centers
+        .iter()
+        .filter(|center| center.managed_by.as_deref() == Some(provisioner_id))
+        .map(|center| ManagedCenterInfo {
+            name: center.name.clone(),
+            endpoint_id: center.endpoint_id.clone(),
+            edges: state
+                .edges
+                .iter()
+                .filter(|edge| edge.owner_id == center.endpoint_id)
+                .map(|edge| ManagedEdgeInfo {
+                    name: edge.name.clone(),
+                    endpoint_id: edge.endpoint_id.clone(),
+                })
+                .collect(),
+        })
+        .collect();
+    let invites = state
+        .invites
+        .iter()
+        .filter(|invite| invite.managed_by.as_deref() == Some(provisioner_id))
+        .map(invite_info)
+        .collect();
+    ProvisionerTopology {
+        revision: state.revision,
+        centers,
+        invites,
+    }
+}
+
+fn provisioner_ok(state: &ControlState) -> Result<ProvisionerResponse, ApiError> {
+    Ok(ProvisionerResponse::Ok {
+        revision: state.revision,
+    })
+}
+
+fn managed_center_id(state: &ControlState, name: &str, provisioner_id: &str) -> Result<String, ApiError> {
+    state
+        .centers
+        .iter()
+        .find(|center| center.name == name && center.managed_by.as_deref() == Some(provisioner_id))
+        .map(|center| center.endpoint_id.clone())
+        .ok_or_else(|| ApiError::bad(format!("unknown managed center '{name}'")))
+}
+
+fn check_expected_revision(state: &ControlState, expected: Option<u64>) -> Result<(), ApiError> {
+    if let Some(expected) = expected
+        && expected != state.revision
+    {
+        return Err(ApiError::conflict(format!(
+            "revision mismatch: expected {expected}, current {}",
+            state.revision
+        )));
+    }
+    Ok(())
 }
 
 async fn watch(
@@ -729,24 +1072,42 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
             let state = store.state.lock().await;
             Ok(LocalAdminResponse::Invites(overview(&state).invites))
         }
+        LocalAdminRequest::ListProvisioners => {
+            let state = store.state.lock().await;
+            Ok(LocalAdminResponse::Provisioners(
+                state
+                    .provisioners
+                    .iter()
+                    .map(|item| ProvisionerInfo {
+                        name: item.name.clone(),
+                        endpoint_id: item.endpoint_id.clone(),
+                        centers: state
+                            .centers
+                            .iter()
+                            .filter(|center| center.managed_by.as_deref() == Some(&item.endpoint_id))
+                            .count(),
+                    })
+                    .collect(),
+            ))
+        }
         LocalAdminRequest::InviteCenter { name, ttl_secs } => {
-            local_create_invite(store, name, InviteKind::Center, ttl_secs).await
+            local_create_invite(store, name, InviteKind::Center, ttl_secs, None).await
         }
         LocalAdminRequest::InviteEdge { name, owner, ttl_secs } => {
-            let owner_id = {
+            let (owner_id, managed_by) = {
                 let state = store.state.lock().await;
                 state
                     .centers
                     .iter()
                     .find(|center| center.name == owner)
-                    .map(|center| center.endpoint_id.clone())
+                    .map(|center| (center.endpoint_id.clone(), center.managed_by.clone()))
                     .ok_or_else(|| ApiError::bad(format!("unknown center '{owner}'")))?
             };
-            local_create_invite(store, name, InviteKind::Edge { owner_id }, ttl_secs).await
+            local_create_invite(store, name, InviteKind::Edge { owner_id }, ttl_secs, managed_by).await
         }
         LocalAdminRequest::InviteRelay { name, url, ttl_secs } => {
             let url = normalize_relay_url(&url).map_err(ApiError::bad)?;
-            local_create_invite(store, name, InviteKind::Relay { url }, ttl_secs).await
+            local_create_invite(store, name, InviteKind::Relay { url }, ttl_secs, None).await
         }
         LocalAdminRequest::RevokeInvite { invite_id } => {
             let mut state = store.state.lock().await;
@@ -760,7 +1121,7 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
                 return Err(ApiError::conflict("claimed invites cannot be revoked"));
             }
             invite.state = InviteState::Revoked;
-            persist_candidate(store, &mut state, next, false)?;
+            commit_candidate(store, &mut state, next)?;
             Ok(LocalAdminResponse::Ok)
         }
         LocalAdminRequest::RemoveCenter { name } => {
@@ -773,6 +1134,15 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
                 .ok_or_else(|| ApiError::bad(format!("unknown center '{name}'")))?;
             if state.edges.iter().any(|edge| edge.owner_id == center.endpoint_id) {
                 return Err(ApiError::conflict("center still owns edges"));
+            }
+            if state.invites.iter().any(|invite| {
+                invite_is_active_pending(invite)
+                    && matches!(
+                        &invite.invite.kind,
+                        InviteKind::Edge { owner_id } if owner_id == &center.endpoint_id
+                    )
+            }) {
+                return Err(ApiError::conflict("center still has pending edge invites"));
             }
             let mut next = state.clone();
             next.centers.retain(|item| item.endpoint_id != center.endpoint_id);
@@ -826,6 +1196,48 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
             commit_candidate(store, &mut state, next)?;
             Ok(LocalAdminResponse::Ok)
         }
+        LocalAdminRequest::AddProvisioner { name, endpoint_id } => {
+            validate_name(&name).map_err(ApiError::bad)?;
+            let endpoint_id = endpoint_id
+                .parse::<EndpointId>()
+                .map_err(|error| ApiError::bad(format!("invalid provisioner endpoint id: {error}")))?
+                .to_string();
+            let mut state = store.state.lock().await;
+            if state
+                .provisioners
+                .iter()
+                .any(|item| item.name == name || item.endpoint_id == endpoint_id)
+            {
+                return Err(ApiError::conflict("provisioner name or identity already exists"));
+            }
+            let mut next = state.clone();
+            next.provisioners.push(ProvisionerRecord { name, endpoint_id });
+            commit_candidate(store, &mut state, next)?;
+            Ok(LocalAdminResponse::Ok)
+        }
+        LocalAdminRequest::RemoveProvisioner { name } => {
+            let mut state = store.state.lock().await;
+            let Some(provisioner) = state.provisioners.iter().find(|item| item.name == name).cloned() else {
+                return Err(ApiError::bad(format!("unknown provisioner '{name}'")));
+            };
+            if state
+                .centers
+                .iter()
+                .any(|center| center.managed_by.as_deref() == Some(&provisioner.endpoint_id))
+            {
+                return Err(ApiError::conflict("provisioner still manages centers"));
+            }
+            if state.invites.iter().any(|invite| {
+                invite_is_active_pending(invite) && invite.managed_by.as_deref() == Some(&provisioner.endpoint_id)
+            }) {
+                return Err(ApiError::conflict("provisioner still owns pending invites"));
+            }
+            let mut next = state.clone();
+            next.provisioners
+                .retain(|item| item.endpoint_id != provisioner.endpoint_id);
+            commit_candidate(store, &mut state, next)?;
+            Ok(LocalAdminResponse::Ok)
+        }
     }
 }
 
@@ -834,13 +1246,18 @@ async fn local_create_invite(
     name: String,
     kind: InviteKind,
     ttl_secs: u64,
+    managed_by: Option<String>,
 ) -> Result<LocalAdminResponse, ApiError> {
     validate_name(&name).map_err(ApiError::bad)?;
     let mut state = store.state.lock().await;
     validate_invite_name(&state, &name, &kind)?;
     let mut next = state.clone();
     let result = create_invite(&store.key, &mut next, name, kind, ttl_secs).map_err(ApiError::bad)?;
-    persist_candidate(store, &mut state, next, false)?;
+    next.invites
+        .last_mut()
+        .expect("create_invite always appends an invitation")
+        .managed_by = managed_by;
+    commit_candidate(store, &mut state, next)?;
     Ok(LocalAdminResponse::Invite(result))
 }
 
@@ -879,26 +1296,26 @@ fn overview(state: &ControlState) -> Overview {
                 url: relay.url.clone(),
             })
             .collect(),
-        invites: state
-            .invites
-            .iter()
-            .map(|invite| InviteInfo {
-                invite_id: invite.invite.invite_id.clone(),
-                name: invite.invite.name.clone(),
-                kind: invite.invite.kind.clone(),
-                expires_at: invite.invite.expires_at,
-                state: if invite.state == InviteState::Pending && invite.invite.expires_at < unix_timestamp() {
-                    "expired"
-                } else {
-                    match invite.state {
-                        InviteState::Pending => "pending",
-                        InviteState::Claimed => "claimed",
-                        InviteState::Revoked => "revoked",
-                    }
-                }
-                .into(),
-            })
-            .collect(),
+        invites: state.invites.iter().map(invite_info).collect(),
+    }
+}
+
+fn invite_info(invite: &InviteRecord) -> InviteInfo {
+    InviteInfo {
+        invite_id: invite.invite.invite_id.clone(),
+        name: invite.invite.name.clone(),
+        kind: invite.invite.kind.clone(),
+        expires_at: invite.invite.expires_at,
+        state: if invite.state == InviteState::Pending && invite.invite.expires_at < unix_timestamp() {
+            "expired"
+        } else {
+            match invite.state {
+                InviteState::Pending => "pending",
+                InviteState::Claimed => "claimed",
+                InviteState::Revoked => "revoked",
+            }
+        }
+        .into(),
     }
 }
 
@@ -977,6 +1394,13 @@ fn print_admin_response(response: LocalAdminResponse) -> Result<()> {
                 println!("  expires: {}", invite.expires_at);
             }
         }
+        LocalAdminResponse::Provisioners(values) => {
+            for provisioner in values {
+                println!("{}", provisioner.name);
+                println!("  endpoint_id: {}", provisioner.endpoint_id);
+                println!("  centers:    {}", provisioner.centers);
+            }
+        }
         LocalAdminResponse::Invite(value) => println!("{}", value.join_url),
         LocalAdminResponse::Ok => {}
         LocalAdminResponse::Error(message) => anyhow::bail!(message),
@@ -1006,7 +1430,12 @@ fn persist_candidate(
     Ok(())
 }
 
-fn add_claimed_node(state: &mut ControlState, invite: &Invite, endpoint_id: EndpointId) -> Result<(), ApiError> {
+fn add_claimed_node(
+    state: &mut ControlState,
+    invite: &Invite,
+    endpoint_id: EndpointId,
+    managed_by: Option<&str>,
+) -> Result<(), ApiError> {
     match &invite.kind {
         InviteKind::Center => {
             if state
@@ -1019,6 +1448,7 @@ fn add_claimed_node(state: &mut ControlState, invite: &Invite, endpoint_id: Endp
             state.centers.push(CenterRecord {
                 name: invite.name.clone(),
                 endpoint_id: endpoint_id.to_string(),
+                managed_by: managed_by.map(ToOwned::to_owned),
             });
         }
         InviteKind::Edge { owner_id } => {
@@ -1111,12 +1541,22 @@ fn create_invite(
     kind: InviteKind,
     ttl_secs: u64,
 ) -> Result<InviteResult> {
+    create_invite_with_secret(key, state, name, kind, ttl_secs, random_token(32))
+}
+
+fn create_invite_with_secret(
+    key: &SecretKey,
+    state: &mut ControlState,
+    name: String,
+    kind: InviteKind,
+    ttl_secs: u64,
+    secret: String,
+) -> Result<InviteResult> {
     anyhow::ensure!(
         (1..=7 * 24 * 60 * 60).contains(&ttl_secs),
         "TTL must be between 1 second and 7 days"
     );
     let invite_id = random_token(16);
-    let secret = random_token(32);
     let expires_at = unix_timestamp()
         .checked_add(ttl_secs as i64)
         .context("invite expiry overflow")?;
@@ -1138,11 +1578,26 @@ fn create_invite(
         state: InviteState::Pending,
         claimed_by: None,
         request_id: None,
+        managed_by: None,
+        request_hash: None,
     });
     Ok(InviteResult {
         invite_id,
         join_url,
         expires_at,
+    })
+}
+
+fn invite_result(key: &SecretKey, invite: &Invite, secret: &str) -> Result<InviteResult> {
+    anyhow::ensure!(
+        hash_secret(secret) == invite.secret_hash,
+        "join secret does not match existing request"
+    );
+    let token = JoinToken::new(invite.clone(), secret.to_owned(), key)?;
+    Ok(InviteResult {
+        invite_id: invite.invite_id.clone(),
+        join_url: token.join_url()?,
+        expires_at: invite.expires_at,
     })
 }
 
@@ -1173,7 +1628,7 @@ fn validate_token_for_state(
 }
 
 fn validate_invite_name(state: &ControlState, name: &str, kind: &InviteKind) -> Result<(), ApiError> {
-    let duplicate = match kind {
+    let registered_duplicate = match kind {
         InviteKind::Center => state.centers.iter().any(|item| item.name == name),
         InviteKind::Edge { owner_id } => state
             .edges
@@ -1181,11 +1636,56 @@ fn validate_invite_name(state: &ControlState, name: &str, kind: &InviteKind) -> 
             .any(|item| item.owner_id == *owner_id && item.name == name),
         InviteKind::Relay { url } => state.relays.iter().any(|item| item.name == name || item.url == *url),
     };
-    if duplicate {
+    let pending_duplicate = state.invites.iter().any(|record| {
+        invite_is_active_pending(record)
+            && match (&record.invite.kind, kind) {
+                (InviteKind::Center, InviteKind::Center) => record.invite.name == name,
+                (InviteKind::Edge { owner_id: left }, InviteKind::Edge { owner_id: right }) => {
+                    left == right && record.invite.name == name
+                }
+                (InviteKind::Relay { url: left }, InviteKind::Relay { url: right }) => {
+                    record.invite.name == name || left == right
+                }
+                _ => false,
+            }
+    });
+    if registered_duplicate || pending_duplicate {
         Err(ApiError::conflict("name or relay URL already exists"))
     } else {
         Ok(())
     }
+}
+
+fn invite_is_active_pending(record: &InviteRecord) -> bool {
+    record.state == InviteState::Pending && record.invite.expires_at >= unix_timestamp()
+}
+
+fn validate_request_id(value: &str) -> Result<()> {
+    anyhow::ensure!(
+        (1..=128).contains(&value.len()),
+        "request id must contain 1-128 characters"
+    );
+    anyhow::ensure!(
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')),
+        "request id contains unsupported characters"
+    );
+    Ok(())
+}
+
+fn validate_join_secret(value: &str) -> Result<()> {
+    anyhow::ensure!(
+        (32..=128).contains(&value.len()),
+        "join secret must contain 32-128 characters"
+    );
+    anyhow::ensure!(
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "join secret must use URL-safe base64 characters"
+    );
+    Ok(())
 }
 
 fn center_name<'a>(state: &'a ControlState, id: &str) -> Option<&'a str> {
@@ -1313,6 +1813,16 @@ fn unix_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use control_api::ProvisionerHttpRequest;
+
+    async fn send_provisioner_request(
+        store: Arc<Store>,
+        request: ProvisionerHttpRequest,
+    ) -> Result<Json<ProvisionerResponse>, ApiError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, request.authorization.parse().unwrap());
+        provisioner_request(State(AppState(store)), headers, Bytes::from(request.body)).await
+    }
 
     #[test]
     fn bootstrap_is_single_center_and_persistent() {
@@ -1402,10 +1912,12 @@ mod tests {
                 CenterRecord {
                     name: "a".into(),
                     endpoint_id: a.public().to_string(),
+                    managed_by: None,
                 },
                 CenterRecord {
                     name: "b".into(),
                     endpoint_id: b.public().to_string(),
+                    managed_by: None,
                 },
             ],
             edges: vec![EdgeRecord {
@@ -1415,6 +1927,7 @@ mod tests {
             }],
             relays: vec![],
             invites: vec![],
+            provisioners: vec![],
         };
         let edge_map = signed_map(&state, &key, edge.public()).unwrap();
         assert_eq!(edge_map.map.allowed_centers, vec![b.public().to_string()]);
@@ -1437,6 +1950,7 @@ mod tests {
             edges: vec![],
             relays: vec![],
             invites: vec![],
+            provisioners: vec![],
         };
         let mut next = current.clone();
         next.revision = 2;
@@ -1461,6 +1975,7 @@ mod tests {
         state.centers.push(CenterRecord {
             name: "main".into(),
             endpoint_id: center.public().to_string(),
+            managed_by: None,
         });
         persist_state(dir.path(), &state).unwrap();
         let store = Arc::new(Store {
@@ -1512,5 +2027,233 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn provisioner_requests_are_scoped_authenticated_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        init(Some(dir.path().into()), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
+        let (lock, control_key, mut state) = open_exclusive(dir.path()).unwrap();
+        let provisioner = SecretKey::generate();
+        let other_provisioner = SecretKey::generate();
+        let center = SecretKey::generate();
+        let other_center = SecretKey::generate();
+        state.provisioners = vec![
+            ProvisionerRecord {
+                name: "controller-a".into(),
+                endpoint_id: provisioner.public().to_string(),
+            },
+            ProvisionerRecord {
+                name: "controller-b".into(),
+                endpoint_id: other_provisioner.public().to_string(),
+            },
+        ];
+        state.centers = vec![
+            CenterRecord {
+                name: "job-a".into(),
+                endpoint_id: center.public().to_string(),
+                managed_by: Some(provisioner.public().to_string()),
+            },
+            CenterRecord {
+                name: "job-b".into(),
+                endpoint_id: other_center.public().to_string(),
+                managed_by: Some(other_provisioner.public().to_string()),
+            },
+        ];
+        persist_state(dir.path(), &state).unwrap();
+        let store = Arc::new(Store {
+            dir: dir.path().into(),
+            key: control_key,
+            state: Mutex::new(state),
+            changed: Notify::new(),
+            _lock: lock,
+        });
+
+        let topology_request = ProvisionerRequest::sign(
+            &provisioner,
+            "test".into(),
+            "topology-1".into(),
+            unix_timestamp(),
+            None,
+            ProvisionerAction::GetTopology,
+        )
+        .unwrap();
+        let response = send_provisioner_request(store.clone(), topology_request)
+            .await
+            .unwrap()
+            .0;
+        let ProvisionerResponse::Topology(topology) = response else {
+            panic!("expected topology response");
+        };
+        assert_eq!(topology.centers.len(), 1);
+        assert_eq!(topology.centers[0].name, "job-a");
+
+        let stranger = SecretKey::generate();
+        let unauthorized = ProvisionerRequest::sign(
+            &stranger,
+            "test".into(),
+            "topology-2".into(),
+            unix_timestamp(),
+            None,
+            ProvisionerAction::GetTopology,
+        )
+        .unwrap();
+        let error = send_provisioner_request(store.clone(), unauthorized).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+
+        let revision = store.state.lock().await.revision;
+        let invite_action = ProvisionerAction::InviteCenter {
+            name: "job-new".into(),
+            ttl_secs: 900,
+            secret: "a".repeat(43),
+        };
+        let invite_request = ProvisionerRequest::sign(
+            &provisioner,
+            "test".into(),
+            "invite-center-1".into(),
+            unix_timestamp(),
+            Some(revision),
+            invite_action.clone(),
+        )
+        .unwrap();
+        let first = send_provisioner_request(store.clone(), invite_request.clone())
+            .await
+            .unwrap()
+            .0;
+        let revision_after_first = store.state.lock().await.revision;
+        assert_eq!(revision_after_first, revision + 1);
+        let retry = send_provisioner_request(store.clone(), invite_request).await.unwrap().0;
+        assert_eq!(first, retry);
+        assert_eq!(store.state.lock().await.revision, revision_after_first);
+
+        let reused_request_id = ProvisionerRequest::sign(
+            &provisioner,
+            "test".into(),
+            "invite-center-1".into(),
+            unix_timestamp(),
+            Some(revision_after_first),
+            ProvisionerAction::InviteCenter {
+                name: "different".into(),
+                ttl_secs: 900,
+                secret: "b".repeat(43),
+            },
+        )
+        .unwrap();
+        let error = send_provisioner_request(store.clone(), reused_request_id)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+
+        let stale = ProvisionerRequest::sign(
+            &provisioner,
+            "test".into(),
+            "invite-center-stale".into(),
+            unix_timestamp(),
+            Some(revision),
+            ProvisionerAction::InviteCenter {
+                name: "stale".into(),
+                ttl_secs: 900,
+                secret: "c".repeat(43),
+            },
+        )
+        .unwrap();
+        let error = send_provisioner_request(store, stale).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn provisioner_enrollment_persists_center_edge_grouping() {
+        let dir = tempfile::tempdir().unwrap();
+        init(Some(dir.path().into()), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
+        let (lock, control_key, mut state) = open_exclusive(dir.path()).unwrap();
+        let provisioner = SecretKey::generate();
+        state.provisioners.push(ProvisionerRecord {
+            name: "controller".into(),
+            endpoint_id: provisioner.public().to_string(),
+        });
+        persist_state(dir.path(), &state).unwrap();
+        let store = Arc::new(Store {
+            dir: dir.path().into(),
+            key: control_key,
+            state: Mutex::new(state),
+            changed: Notify::new(),
+            _lock: lock,
+        });
+
+        let center_secret = "c".repeat(43);
+        let center_invite = ProvisionerRequest::sign(
+            &provisioner,
+            "test".into(),
+            "center-invite".into(),
+            unix_timestamp(),
+            Some(store.state.lock().await.revision),
+            ProvisionerAction::InviteCenter {
+                name: "job".into(),
+                ttl_secs: 900,
+                secret: center_secret,
+            },
+        )
+        .unwrap();
+        let ProvisionerResponse::Invite(center_result) =
+            send_provisioner_request(store.clone(), center_invite).await.unwrap().0
+        else {
+            panic!("expected center invite");
+        };
+        let center_token = JoinToken::decode(center_result.join_url.split_once('#').unwrap().1).unwrap();
+        let center_key = SecretKey::generate();
+        let center_claim =
+            ClaimRequest::sign(center_token, &center_key, unix_timestamp(), "center-claim".into()).unwrap();
+        let _ = claim(State(AppState(store.clone())), Json(center_claim)).await.unwrap();
+
+        let edge_invite = ProvisionerRequest::sign(
+            &provisioner,
+            "test".into(),
+            "edge-invite".into(),
+            unix_timestamp(),
+            Some(store.state.lock().await.revision),
+            ProvisionerAction::InviteEdge {
+                owner: "job".into(),
+                name: "lab".into(),
+                ttl_secs: 900,
+                secret: "e".repeat(43),
+            },
+        )
+        .unwrap();
+        let ProvisionerResponse::Invite(edge_result) =
+            send_provisioner_request(store.clone(), edge_invite).await.unwrap().0
+        else {
+            panic!("expected edge invite");
+        };
+        let edge_token = JoinToken::decode(edge_result.join_url.split_once('#').unwrap().1).unwrap();
+        let edge_key = SecretKey::generate();
+        let edge_claim = ClaimRequest::sign(edge_token, &edge_key, unix_timestamp(), "edge-claim".into()).unwrap();
+        let _ = claim(State(AppState(store.clone())), Json(edge_claim)).await.unwrap();
+
+        let topology = provisioner_topology(&*store.state.lock().await, &provisioner.public().to_string());
+        assert_eq!(topology.centers.len(), 1);
+        assert_eq!(topology.centers[0].name, "job");
+        assert_eq!(topology.centers[0].endpoint_id, center_key.public().to_string());
+        assert_eq!(topology.centers[0].edges.len(), 1);
+        assert_eq!(topology.centers[0].edges[0].name, "lab");
+        assert_eq!(topology.centers[0].edges[0].endpoint_id, edge_key.public().to_string());
+    }
+
+    #[test]
+    fn expired_invites_do_not_reserve_names() {
+        let key = SecretKey::generate();
+        let mut state = ControlState {
+            schema: STATE_SCHEMA,
+            audience: "test".into(),
+            public_url: "http://127.0.0.1:1".into(),
+            revision: 1,
+            centers: vec![],
+            edges: vec![],
+            relays: vec![],
+            invites: vec![],
+            provisioners: vec![],
+        };
+        create_invite(&key, &mut state, "job".into(), InviteKind::Center, 1).unwrap();
+        state.invites[0].invite.expires_at = unix_timestamp() - 1;
+        assert!(validate_invite_name(&state, "job", &InviteKind::Center).is_ok());
     }
 }

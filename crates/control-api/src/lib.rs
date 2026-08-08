@@ -1,5 +1,13 @@
 //! Signed wire types shared by control, centers, edges, and managed relays.
 
+mod provisioner;
+
+pub use provisioner::{
+    ManagedCenterInfo, ManagedEdgeInfo, PROVISIONER_AUTH_SCHEME, ProvisionerAction, ProvisionerHttpRequest,
+    ProvisionerRequest, ProvisionerResponse, ProvisionerTopology, action_hash, provisioner_authorization,
+    provisioner_signing_bytes, verify_provisioner_authorization,
+};
+
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use iroh_base::{EndpointId, SecretKey, Signature};
@@ -348,7 +356,7 @@ pub fn hash_secret(secret: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn ensure_protocol_version(version: u32) -> Result<()> {
+pub(crate) fn ensure_protocol_version(version: u32) -> Result<()> {
     anyhow::ensure!(
         version == CONTROL_PROTOCOL_VERSION,
         "unsupported control protocol version {version}; expected {CONTROL_PROTOCOL_VERSION}"
@@ -356,7 +364,7 @@ fn ensure_protocol_version(version: u32) -> Result<()> {
     Ok(())
 }
 
-fn domain_bytes<T: Serialize>(domain: &[u8], value: &T) -> Result<Vec<u8>> {
+pub(crate) fn domain_bytes<T: Serialize>(domain: &[u8], value: &T) -> Result<Vec<u8>> {
     let encoded = serde_json::to_vec(value).context("serialize signed payload")?;
     let mut bytes = Vec::with_capacity(domain.len() + encoded.len());
     bytes.extend_from_slice(domain);

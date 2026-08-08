@@ -144,6 +144,25 @@ The administration socket is mode `0600` and is not published or mounted into
 the Relay container. CLI mutations go through the running Control process, so
 state persistence and watcher notifications remain atomic.
 
+## External Controllers
+
+An external scheduler controller can be registered as a Provisioner and
+reconcile its own Center-to-Edge topology through a signed remote API. Control
+does not create Kubernetes Jobs, Pods, VMs, or processes; the controller owns
+those resources and their lifecycle. Control persists the authoritative
+identity grouping and isolates each Provisioner's partition.
+
+```sh
+docker compose exec control \
+  as-control provisioner add lab-controller <controller-endpoint-id>
+```
+
+Claimed nodes never expire automatically. The controller explicitly removes an
+Edge and then its empty Center when their workloads are deleted. Enrollment
+invitations retain a bounded TTL because they are bearer capabilities. See the
+[Provisioner reconcile API](provisioner-api.md) for signing, idempotency,
+revision, and action details.
+
 Interactive edge enrollment offers a persistent current-user service. For
 automation, choose explicitly:
 

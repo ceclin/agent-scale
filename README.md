@@ -61,10 +61,12 @@ See [simple mode](docs/simple-mode.md) and the
 - built-in full `fd` and `rg` CLIs in the single `as-edge` multicall binary;
 - transparent stdio, Streamable HTTP, and legacy SSE MCP proxying;
 - private relay membership snapshots signed by the center;
-- optional multi-center enrollment and hot-reloaded desired state.
+- optional multi-center enrollment and hot-reloaded desired state;
+- scheduler-neutral Provisioner API for isolated Center-to-Edge reconciliation.
 
 More detail is in [MCP](docs/mcp.md), [private relay](docs/private-relay.md), and
-[control plane](docs/control-plane.md).
+[control plane](docs/control-plane.md). External controllers should also see the
+[Provisioner API](docs/provisioner-api.md).
 
 ## Development
 
