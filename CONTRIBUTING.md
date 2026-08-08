@@ -18,6 +18,10 @@ The generated `.upstreams/` directory is ignored. Do not edit or commit these
 upstream checkouts; update `scripts/upstreams.lock` and regenerate the wrapper
 manifests with `./scripts/sync-deps.py` instead.
 
+Install [uv](https://docs.astral.sh/uv/) before running the full lint task. It
+provides the Python version declared by the dependency synchronization script;
+the script has no third-party Python packages.
+
 Use the repository task runner before submitting a change:
 
 ```console
@@ -34,13 +38,15 @@ some end-to-end scenarios.
 
 ## Supported targets
 
-- center CLI/daemon: Linux and macOS;
+- center CLI/daemon: Linux x86-64/ARM64, macOS ARM64/x86-64, and Windows
+  x86-64 (experimental);
 - control and private relay: Linux;
 - edge: Linux x86-64, Linux ARM64, and Windows x86-64.
 
 Changes to platform-specific code should preserve these targets. CI checks the
-native Linux workspace, macOS center, and Windows edge. The distribution task
-cross-compiles the documented edge artifacts with `cargo-zigbuild`.
+native Linux workspace, macOS Center, and Windows Center and Edge. Distribution
+cross-compiles Linux and Windows binaries with `cargo-zigbuild` and builds the
+macOS Center binaries natively.
 
 ## Change discipline
 
