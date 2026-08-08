@@ -12,6 +12,7 @@ bao-tree = "0.16"
 futures-util = { workspace = true }
 iroh = "1.0.3"
 iroh-blobs = { version = "0.103", features = ["fs-store"] }
+iroh-relay = "1.0.3"
 protocol = { package = "scale-protocol", path = "../protocol" }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tempfile = "3"

@@ -50,12 +50,17 @@ RELAY_PUBLIC_URL=https://relay.example.com
 CONTROL_AUDIENCE=prod
 CONTROL_CENTER_NAME=main
 RELAY_NAME=relay-a
+RELAY_QAD_PORT=4433
+RELAY_QAD_BIND_PORT=7842
 ```
 
 Publish those HTTPS routes through a reverse proxy. Control targets port 3350;
 the Relay data plane targets port 3340 and must preserve WebSocket upgrades.
-The Relay management port 3341 stays bound to host loopback. Compose does not
-provision DNS or TLS certificates.
+The Relay management port 3341 stays bound to host loopback. Compose also maps
+the chosen public QAD UDP port to the independently configurable container bind
+port (both default to 7842). Control automatically issues and distributes the private QAD TLS chain;
+you still provision DNS and the HTTPS certificate used by the WebSocket reverse
+proxy.
 
 Inspect or stop the stack with:
 
@@ -219,16 +224,19 @@ docker compose exec control as-control relay invite \
 On the relay host:
 
 ```sh
-as-relay join '<relay-url>' --state-dir /var/lib/agent-scale-relay
+as-relay join '<relay-url>' --qad-port 4433 \
+  --state-dir /var/lib/agent-scale-relay
 as-relay run \
   --relay-bind 127.0.0.1:3340 \
+  --qad-bind 0.0.0.0:7842 \
   --state-dir /var/lib/agent-scale-relay
 ```
 
 The relay pulls control-signed membership over HTTPS and immediately disconnects
 revoked EndpointIds. Its data-plane route still needs a TLS reverse proxy with
 WebSocket upgrades. The admin listener defaults to loopback and is only needed
-for local health/status inspection.
+for local health/status inspection. Publish `4433/udp` to the example local
+QAD port `7842/udp`; these ports do not need to be equal.
 
 ## Ownership And Offline Behavior
 

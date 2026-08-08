@@ -63,6 +63,8 @@ services:
       as-relay run
       --relay-bind 0.0.0.0:3340
       --admin-bind 0.0.0.0:3341
+      --qad-bind 0.0.0.0:${RELAY_QAD_BIND_PORT:-7842}
+      --qad-port ${RELAY_QAD_PORT:-7842}
       --state-dir /relay
       --join-if-needed /bootstrap/relay.join
       --control-url http://control:3350
@@ -71,6 +73,7 @@ services:
         condition: service_completed_successfully
     ports:
       - "${RELAY_PORT:-3340}:3340"
+      - "${RELAY_QAD_PORT:-7842}:${RELAY_QAD_BIND_PORT:-7842}/udp"
       - "127.0.0.1:${RELAY_ADMIN_PORT:-3341}:3341"
     volumes:
       - relay-state:/relay

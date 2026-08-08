@@ -75,6 +75,7 @@ See [simple mode](docs/simple-mode.md) and the
 - built-in full `fd` and `rg` CLIs in the single `as-edge` multicall binary;
 - transparent stdio, Streamable HTTP, and legacy SSE MCP proxying;
 - Control-signed private relay membership with offline snapshot recovery;
+- configurable Relay QAD UDP ports with Control-issued private TLS certificates;
 - optional multi-center enrollment and hot-reloaded desired state;
 - scheduler-neutral Provisioner API for isolated Center-to-Edge reconciliation.
 

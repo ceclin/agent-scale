@@ -29,6 +29,10 @@ use control_api::{
 };
 use iroh_base::{EndpointId, SecretKey};
 use rand::Rng;
+use rcgen::{
+    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose,
+};
 use relay_api::{MembershipSnapshot, RELAY_PROTOCOL_VERSION, RelayMember, SignedSnapshot};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
@@ -36,7 +40,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
-const STATE_SCHEMA: u32 = 3;
+const STATE_SCHEMA: u32 = 4;
 const CLOCK_SKEW_SECS: i64 = 300;
 const DEFAULT_TTL_SECS: u64 = 15 * 60;
 
@@ -250,6 +254,7 @@ struct RelayRecord {
     name: String,
     endpoint_id: String,
     url: String,
+    qad_port: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -288,6 +293,7 @@ struct ControlState {
     schema: u32,
     audience: String,
     public_url: String,
+    relay_ca_der: Vec<u8>,
     revision: u64,
     centers: Vec<CenterRecord>,
     edges: Vec<EdgeRecord>,
@@ -299,6 +305,7 @@ struct ControlState {
 struct Store {
     database: db::Database,
     key: SecretKey,
+    relay_ca: Issuer<'static, KeyPair>,
     state: Mutex<ControlState>,
     changed: Notify,
     _lock: scale_core::FileLock,
@@ -448,10 +455,12 @@ fn init(dir: PathBuf, public_url: String, audience: String) -> Result<()> {
         "control state already exists"
     );
     let key = scale_core::load_or_create_secret(&key_path(&dir))?;
+    let (relay_ca_der, _) = load_or_create_relay_ca(&dir)?;
     let state = ControlState {
         schema: STATE_SCHEMA,
         audience,
         public_url,
+        relay_ca_der,
         revision: 0,
         centers: vec![],
         edges: vec![],
@@ -486,6 +495,8 @@ fn prepare(
     scale_core::ensure_private_dir(&dir)?;
     if key_path(&dir).exists()
         && database_path(&dir).exists()
+        && relay_ca_key_path(&dir).exists()
+        && relay_ca_cert_path(&dir).exists()
         && center_invite_out.exists()
         && relay_invite_out.exists()
     {
@@ -514,9 +525,10 @@ fn prepare(
 
     let key_exists = key_path(&dir).exists();
     let database_exists = database_path(&dir).exists();
+    let ca_exists = relay_ca_key_path(&dir).exists() && relay_ca_cert_path(&dir).exists();
     anyhow::ensure!(
-        key_exists == database_exists,
-        "incomplete control state: control.key and control.db must either both exist or both be absent"
+        key_exists == database_exists && database_exists == ca_exists,
+        "incomplete control state: control.key, control.db, relay-ca.key, and relay-ca.der must all exist or all be absent"
     );
     let (key, database, mut state) = if database_exists {
         let key = scale_core::read_secret(&key_path(&dir))?;
@@ -525,10 +537,12 @@ fn prepare(
         (key, database, state)
     } else {
         let key = scale_core::load_or_create_secret(&key_path(&dir))?;
+        let (relay_ca_der, _) = load_or_create_relay_ca(&dir)?;
         let state = ControlState {
             schema: STATE_SCHEMA,
             audience: audience.clone(),
             public_url: public_url.clone(),
+            relay_ca_der,
             revision: 0,
             centers: vec![],
             edges: vec![],
@@ -668,6 +682,11 @@ fn bootstrap_relay(dir: PathBuf, name: String, url: String, ttl_secs: u64) -> Re
 
 async fn run(dir: PathBuf, bind: SocketAddr, admin_socket: PathBuf) -> Result<()> {
     let (lock, key, database, mut state) = open_exclusive(&dir)?;
+    let (relay_ca_der, relay_ca) = load_relay_ca(&dir)?;
+    anyhow::ensure!(
+        state.relay_ca_der == relay_ca_der,
+        "Relay CA files do not match control.db"
+    );
     anyhow::ensure!(
         state.schema == STATE_SCHEMA,
         "unsupported state schema {}",
@@ -678,6 +697,7 @@ async fn run(dir: PathBuf, bind: SocketAddr, admin_socket: PathBuf) -> Result<()
     let store = Arc::new(Store {
         database,
         key,
+        relay_ca,
         state: Mutex::new(state),
         changed: Notify::new(),
         _lock: lock,
@@ -745,14 +765,34 @@ async fn claim(
         .iter()
         .position(|record| record.invite.invite_id == request.claim.invite_id)
         .ok_or_else(|| ApiError::gone("unknown invite"))?;
+    let relay_qad_port = validate_relay_claim(
+        &state.invites[index].invite.kind,
+        request.claim.relay_qad_port,
+        request.claim.relay_tls_csr.as_deref(),
+    )?;
+    let relay_tls_certificate_der = issue_relay_tls_certificate(
+        &request.claim.relay_tls_csr,
+        &state.invites[index].invite.kind,
+        relay_qad_port,
+        &store.relay_ca,
+    )?;
     match state.invites[index].state {
         InviteState::Pending => {}
         InviteState::Claimed if state.invites[index].claimed_by.as_deref() == Some(&request.claim.endpoint_id) => {
+            if let Some(relay) = state
+                .relays
+                .iter()
+                .find(|relay| relay.endpoint_id == request.claim.endpoint_id)
+                && relay.qad_port != relay_qad_port
+            {
+                return Err(ApiError::conflict("Relay QAD port differs from its enrolled value"));
+            }
             let map = signed_map(&state, &store.key, endpoint_id).map_err(ApiError::internal)?;
             return Ok(Json(JoinResult {
                 name: state.invites[index].invite.name.clone(),
                 kind: state.invites[index].invite.kind.clone(),
                 map,
+                relay_tls_certificate_der,
             }));
         }
         InviteState::Claimed => return Err(ApiError::conflict("invite was already claimed")),
@@ -761,7 +801,7 @@ async fn claim(
     let mut next = state.clone();
     let invite = next.invites[index].invite.clone();
     let managed_by = next.invites[index].managed_by.clone();
-    add_claimed_node(&mut next, &invite, endpoint_id, managed_by.as_deref())?;
+    add_claimed_node(&mut next, &invite, endpoint_id, managed_by.as_deref(), relay_qad_port)?;
     next.invites[index].state = InviteState::Claimed;
     next.invites[index].claimed_by = Some(endpoint_id.to_string());
     next.invites[index].terminal_at = Some(now);
@@ -775,7 +815,73 @@ async fn claim(
         name: invite.name,
         kind: invite.kind,
         map,
+        relay_tls_certificate_der,
     }))
+}
+
+fn issue_relay_tls_certificate(
+    csr_der: &Option<Vec<u8>>,
+    kind: &InviteKind,
+    qad_port: Option<u16>,
+    issuer: &Issuer<'static, KeyPair>,
+) -> Result<Option<Vec<u8>>, ApiError> {
+    let InviteKind::Relay { url } = kind else {
+        if csr_der.is_some() {
+            return Err(ApiError::bad("only Relay claims may include a TLS CSR"));
+        }
+        return Ok(None);
+    };
+    let Some(_port) = qad_port else {
+        if csr_der.is_some() {
+            return Err(ApiError::bad("QAD is disabled for this Relay enrollment"));
+        }
+        return Ok(None);
+    };
+    let csr_der = csr_der
+        .as_deref()
+        .ok_or_else(|| ApiError::bad("QAD-enabled Relay claim is missing its TLS CSR"))?;
+    if csr_der.len() > 16 * 1024 {
+        return Err(ApiError::bad("Relay TLS CSR is too large"));
+    }
+    let host = Url::parse(url)
+        .map_err(ApiError::bad)?
+        .host_str()
+        .ok_or_else(|| ApiError::bad("Relay URL has no host"))?
+        .to_owned();
+    let mut csr = CertificateSigningRequestParams::from_der(&csr_der.into()).map_err(ApiError::bad)?;
+    let expected = CertificateParams::new(vec![host.clone()]).map_err(ApiError::bad)?;
+    if csr.params.subject_alt_names != expected.subject_alt_names {
+        return Err(ApiError::bad("Relay TLS CSR SAN does not match its Relay URL host"));
+    }
+    csr.params.is_ca = IsCa::ExplicitNoCa;
+    csr.params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    csr.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    csr.params.use_authority_key_identifier_extension = true;
+    csr.params.distinguished_name = expected.distinguished_name;
+    csr.params.distinguished_name.push(DnType::CommonName, host);
+    let now = time::OffsetDateTime::now_utc();
+    csr.params.not_before = now - time::Duration::days(1);
+    csr.params.not_after = now + time::Duration::days(825);
+    let certificate = csr.signed_by(issuer).map_err(ApiError::internal)?;
+    Ok(Some(certificate.der().to_vec()))
+}
+
+fn validate_relay_claim(
+    kind: &InviteKind,
+    qad_port: Option<u16>,
+    csr_der: Option<&[u8]>,
+) -> Result<Option<u16>, ApiError> {
+    if !matches!(kind, InviteKind::Relay { .. }) {
+        if qad_port.is_some() || csr_der.is_some() {
+            return Err(ApiError::bad("only Relay claims may advertise QAD"));
+        }
+        return Ok(None);
+    }
+    validate_qad_port(qad_port).map_err(ApiError::bad)?;
+    if qad_port.is_some() != csr_der.is_some() {
+        return Err(ApiError::bad("Relay QAD port and TLS CSR must be provided together"));
+    }
+    Ok(qad_port)
 }
 
 async fn center_edge_invite(
@@ -1135,6 +1241,20 @@ async fn relay_watch(
 ) -> Result<Json<SignedSnapshot>, ApiError> {
     let endpoint_id = request.verify().map_err(ApiError::unauthorized)?;
     check_time(request.issued_at, unix_timestamp()).map_err(ApiError::unauthorized)?;
+    validate_qad_port(request.relay_qad_port).map_err(ApiError::bad)?;
+    {
+        let mut state = store.state.lock().await;
+        let index = state
+            .relays
+            .iter()
+            .position(|relay| relay.endpoint_id == endpoint_id.to_string())
+            .ok_or_else(|| ApiError::forbidden("relay is not registered"))?;
+        if state.relays[index].qad_port != request.relay_qad_port {
+            let mut next = state.clone();
+            next.relays[index].qad_port = request.relay_qad_port;
+            commit_candidate(&store, &mut state, next).await?;
+        }
+    }
     wait_for_revision(&store, endpoint_id, request.known_revision, true).await?;
     let state = store.state.lock().await;
     anyhow_relay_exists(&state, endpoint_id)?;
@@ -1490,6 +1610,7 @@ fn overview(state: &ControlState) -> Overview {
                 name: relay.name.clone(),
                 endpoint_id: relay.endpoint_id.clone(),
                 url: relay.url.clone(),
+                qad_port: relay.qad_port,
             })
             .collect(),
         invites: state.invites.iter().map(invite_info).collect(),
@@ -1579,6 +1700,10 @@ fn print_admin_response(response: LocalAdminResponse) -> Result<()> {
                 println!("{}", relay.name);
                 println!("  endpoint_id: {}", relay.endpoint_id);
                 println!("  url:         {}", relay.url);
+                match relay.qad_port {
+                    Some(port) => println!("  qad:         udp/{port}"),
+                    None => println!("  qad:         disabled"),
+                }
             }
         }
         LocalAdminResponse::Invites(values) => {
@@ -1660,6 +1785,7 @@ fn add_claimed_node(
     invite: &Invite,
     endpoint_id: EndpointId,
     managed_by: Option<&str>,
+    relay_qad_port: Option<u16>,
 ) -> Result<(), ApiError> {
     match &invite.kind {
         InviteKind::Center => {
@@ -1701,6 +1827,7 @@ fn add_claimed_node(
                 name: invite.name.clone(),
                 endpoint_id: endpoint_id.to_string(),
                 url: url.clone(),
+                qad_port: relay_qad_port,
             });
         }
     }
@@ -1715,6 +1842,7 @@ fn signed_map(state: &ControlState, key: &SecretKey, recipient: EndpointId) -> R
         .map(|relay| RelayInfo {
             name: relay.name.clone(),
             url: relay.url.clone(),
+            qad_port: relay.qad_port,
         })
         .collect();
     let (allowed_centers, edges) =
@@ -1752,6 +1880,7 @@ fn signed_map(state: &ControlState, key: &SecretKey, recipient: EndpointId) -> R
             issued_at: unix_timestamp(),
             recipient_id: recipient_string,
             relays,
+            relay_ca_der: state.relay_ca_der.clone(),
             allowed_centers,
             edges,
         },
@@ -2002,6 +2131,11 @@ fn normalize_relay_url(value: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
+fn validate_qad_port(port: Option<u16>) -> Result<()> {
+    anyhow::ensure!(port != Some(0), "QAD public port must be between 1 and 65535");
+    Ok(())
+}
+
 fn random_token(bytes: usize) -> String {
     let mut value = vec![0u8; bytes];
     rand::rng().fill_bytes(&mut value);
@@ -2023,8 +2157,50 @@ fn key_path(dir: &Path) -> PathBuf {
 fn database_path(dir: &Path) -> PathBuf {
     dir.join("control.db")
 }
+fn relay_ca_key_path(dir: &Path) -> PathBuf {
+    dir.join("relay-ca.key")
+}
+fn relay_ca_cert_path(dir: &Path) -> PathBuf {
+    dir.join("relay-ca.der")
+}
 fn lock_path(dir: &Path) -> PathBuf {
     dir.join("control.lock")
+}
+
+fn load_or_create_relay_ca(dir: &Path) -> Result<(Vec<u8>, Issuer<'static, KeyPair>)> {
+    let key_path = relay_ca_key_path(dir);
+    let cert_path = relay_ca_cert_path(dir);
+    match (key_path.exists(), cert_path.exists()) {
+        (true, true) => load_relay_ca(dir),
+        (false, false) => {
+            let key = KeyPair::generate().context("generate Relay CA key")?;
+            let mut params = CertificateParams::new(Vec::<String>::new())?;
+            params
+                .distinguished_name
+                .push(DnType::CommonName, "agent-scale Control Relay CA");
+            params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+            params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+            let now = time::OffsetDateTime::now_utc();
+            params.not_before = now - time::Duration::days(1);
+            params.not_after = now + time::Duration::days(3650);
+            let cert = params.self_signed(&key)?;
+            let key_der = key.serialize_der();
+            let cert_der = cert.der().to_vec();
+            scale_core::atomic_write(&key_path, &key_der).with_context(|| format!("write {}", key_path.display()))?;
+            scale_core::atomic_write(&cert_path, &cert_der)
+                .with_context(|| format!("write {}", cert_path.display()))?;
+            load_relay_ca(dir)
+        }
+        _ => anyhow::bail!("incomplete Relay CA state: relay-ca.key and relay-ca.der must both exist"),
+    }
+}
+
+fn load_relay_ca(dir: &Path) -> Result<(Vec<u8>, Issuer<'static, KeyPair>)> {
+    let key_der = std::fs::read(relay_ca_key_path(dir)).context("read Relay CA key")?;
+    let cert_der = std::fs::read(relay_ca_cert_path(dir)).context("read Relay CA certificate")?;
+    let key = KeyPair::try_from(key_der).context("parse Relay CA key")?;
+    let issuer = Issuer::from_ca_cert_der(&cert_der.as_slice().into(), key).context("parse Relay CA certificate")?;
+    Ok((cert_der, issuer))
 }
 fn unix_timestamp() -> i64 {
     SystemTime::now()
@@ -2075,6 +2251,44 @@ mod tests {
     }
 
     #[test]
+    fn control_ca_signs_only_the_invited_relay_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca_der, issuer) = load_or_create_relay_ca(dir.path()).unwrap();
+        assert!(!ca_der.is_empty());
+        let key = KeyPair::generate().unwrap();
+        let params = CertificateParams::new(vec!["relay.example.com".into()]).unwrap();
+        let csr = params.serialize_request(&key).unwrap();
+        let kind = InviteKind::Relay {
+            url: "https://relay.example.com/".into(),
+        };
+        let certificate = issue_relay_tls_certificate(&Some(csr.der().to_vec()), &kind, Some(4433), &issuer)
+            .unwrap()
+            .unwrap();
+        assert!(!certificate.is_empty());
+
+        let wrong_key = KeyPair::generate().unwrap();
+        let wrong = CertificateParams::new(vec!["other.example.com".into()])
+            .unwrap()
+            .serialize_request(&wrong_key)
+            .unwrap();
+        assert!(issue_relay_tls_certificate(&Some(wrong.der().to_vec()), &kind, Some(4433), &issuer).is_err());
+    }
+
+    #[test]
+    fn relay_claim_reports_qad_port_with_its_csr() {
+        let relay = InviteKind::Relay {
+            url: "https://relay.example.com/".into(),
+        };
+        assert_eq!(
+            validate_relay_claim(&relay, Some(4433), Some(&[1])).unwrap(),
+            Some(4433)
+        );
+        assert!(validate_relay_claim(&relay, Some(4433), None).is_err());
+        assert!(validate_relay_claim(&relay, None, Some(&[1])).is_err());
+        assert!(validate_relay_claim(&InviteKind::Center, Some(4433), Some(&[1])).is_err());
+    }
+
+    #[test]
     fn prepare_is_idempotent_and_does_not_require_invitation_artifacts_after_enrollment() {
         let dir = tempfile::tempdir().unwrap();
         let center_out = dir.path().join("bootstrap/center.join");
@@ -2119,6 +2333,7 @@ mod tests {
             name: "relay-a".into(),
             endpoint_id: relay_id.clone(),
             url: "http://127.0.0.1:3340/".into(),
+            qad_port: None,
         });
         for invite in &mut state.invites {
             invite.state = InviteState::Claimed;
@@ -2177,7 +2392,7 @@ mod tests {
         assert_eq!(
             state.invites[0].invite.kind,
             InviteKind::Relay {
-                url: "http://localhost:3340/".into()
+                url: "http://localhost:3340/".into(),
             }
         );
     }
@@ -2225,6 +2440,7 @@ mod tests {
             schema: STATE_SCHEMA,
             audience: "test".into(),
             public_url: "http://127.0.0.1:1".into(),
+            relay_ca_der: vec![1, 2, 3],
             revision: 3,
             centers: vec![
                 CenterRecord {
@@ -2275,6 +2491,7 @@ mod tests {
         let store = Store {
             database,
             key,
+            relay_ca: load_relay_ca(dir.path()).unwrap().1,
             state: Mutex::new(current.clone()),
             changed: Notify::new(),
             _lock: lock,
@@ -2299,6 +2516,7 @@ mod tests {
         let store = Arc::new(Store {
             database,
             key: control_key,
+            relay_ca: load_relay_ca(dir.path()).unwrap().1,
             state: Mutex::new(state),
             changed: Notify::new(),
             _lock: lock,
@@ -2382,6 +2600,7 @@ mod tests {
         let store = Arc::new(Store {
             database,
             key: control_key,
+            relay_ca: load_relay_ca(dir.path()).unwrap().1,
             state: Mutex::new(state),
             changed: Notify::new(),
             _lock: lock,
@@ -2493,6 +2712,7 @@ mod tests {
         let store = Arc::new(Store {
             database,
             key: control_key,
+            relay_ca: load_relay_ca(dir.path()).unwrap().1,
             state: Mutex::new(state),
             changed: Notify::new(),
             _lock: lock,
@@ -2563,6 +2783,7 @@ mod tests {
             schema: STATE_SCHEMA,
             audience: "test".into(),
             public_url: "http://127.0.0.1:1".into(),
+            relay_ca_der: vec![1, 2, 3],
             revision: 1,
             centers: vec![],
             edges: vec![],
@@ -2583,6 +2804,7 @@ mod tests {
             schema: STATE_SCHEMA,
             audience: "test".into(),
             public_url: "http://127.0.0.1:1".into(),
+            relay_ca_der: vec![1, 2, 3],
             revision: 9,
             centers: vec![],
             edges: vec![],
@@ -2625,6 +2847,7 @@ mod tests {
         let store = Arc::new(Store {
             database,
             key,
+            relay_ca: load_relay_ca(dir.path()).unwrap().1,
             state: Mutex::new(state),
             changed: Notify::new(),
             _lock: lock,
@@ -2652,6 +2875,7 @@ mod tests {
         let store = Arc::new(Store {
             database,
             key,
+            relay_ca: load_relay_ca(dir.path()).unwrap().1,
             state: Mutex::new(state),
             changed: Notify::new(),
             _lock: lock,

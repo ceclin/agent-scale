@@ -20,6 +20,7 @@ control-api = { path = "../control-api" }
 iroh-base = { version = "1.0.3", features = ["key"] }
 iroh-relay = { version = "1.0.3", features = ["server"] }
 rand = { workspace = true }
+rcgen = "0.14"
 relay-api = { path = "../relay-api" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

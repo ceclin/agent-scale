@@ -93,27 +93,54 @@ pub fn relay_urls_or_default(values: &[String]) -> Result<Vec<RelayUrl>> {
         .collect()
 }
 
+/// Construct the exact Relay/QAD settings distributed in a signed Control map.
+pub fn managed_relay_config(url: RelayUrl, qad_port: Option<u16>) -> iroh::RelayConfig {
+    iroh::RelayConfig::new(url, qad_port.map(iroh_relay::RelayQuicConfig::new))
+}
+
 /// Build a relay-only-capable endpoint: minimal preset (ring crypto provider,
 /// no discovery), custom relays, given identity + ALPNs. Direct paths are left
 /// enabled — iroh will hole-punch when it can and fall back to the relay.
 pub async fn build_endpoint(secret_key: SecretKey, relay_urls: &[RelayUrl], alpns: Vec<Vec<u8>>) -> Result<Endpoint> {
+    let relays = relay_urls
+        .iter()
+        .cloned()
+        .map(iroh::RelayConfig::from)
+        .collect::<Vec<_>>();
+    build_endpoint_with_config(secret_key, relays, None, alpns).await
+}
+
+/// Build an endpoint from an explicit relay configuration. Managed mode uses
+/// this to install Control-signed QAD ports and its private Relay CA.
+pub async fn build_endpoint_with_config(
+    secret_key: SecretKey,
+    relays: Vec<iroh::RelayConfig>,
+    relay_ca_der: Option<Vec<u8>>,
+    alpns: Vec<Vec<u8>>,
+) -> Result<Endpoint> {
     // reqwest (shared with iroh, for net-report probes + our MCP-HTTP bridge)
     // builds rustls bring-your-own-provider, so install `ring` as the process
     // default once. Idempotent — a no-op if iroh already installed one.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let urls: Vec<String> = relay_urls.iter().map(|u| u.to_string()).collect();
-    let map = RelayMap::try_from_iter(urls.iter().map(|s| s.as_str()))?;
-    let ep = Endpoint::builder(presets::Minimal)
+    let relay_count = relays.len();
+    let map = RelayMap::from_iter(relays);
+    let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret_key)
         .relay_mode(RelayMode::Custom(map))
-        .alpns(alpns)
-        .bind()
-        .await?;
+        .alpns(alpns);
+    if let Some(ca_der) = relay_ca_der {
+        anyhow::ensure!(!ca_der.is_empty(), "managed Relay CA certificate is empty");
+        builder = builder.ca_tls_config(
+            iroh_relay::tls::CaTlsConfig::embedded()
+                .with_extra_roots([rustls::pki_types::CertificateDer::from(ca_der)]),
+        );
+    }
+    let ep = builder.bind().await?;
     // A freshly enrolled control-managed node may legitimately receive an
     // empty relay map until the first relay finishes enrollment. Waiting for
     // `online()` with no relay configured never completes, which would prevent
     // the control watcher from installing the first relay.
-    if !relay_urls.is_empty() {
+    if relay_count != 0 {
         ep.online().await;
     }
     Ok(ep)
@@ -123,6 +150,15 @@ pub async fn build_endpoint(secret_key: SecretKey, relay_urls: &[RelayUrl], alpn
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn managed_relay_uses_the_control_qad_port() {
+        let url: RelayUrl = "https://relay.example.com".parse().unwrap();
+        let enabled = managed_relay_config(url.clone(), Some(4433));
+        assert_eq!(enabled.quic.as_ref().map(|quic| quic.port), Some(4433));
+        let disabled = managed_relay_config(url, None);
+        assert!(disabled.quic.is_none());
+    }
 
     #[test]
     fn official_relay_preset_is_available() {

@@ -7,6 +7,10 @@ The project uses semantic versioning after its first public release. Before
 
 ## Unreleased
 
+- Added configurable Relay QAD UDP ports and Control-managed private TLS:
+  Relays generate their own keys and CSRs, while Control signs certificates and
+  distributes its dedicated CA through the signed topology.
+
 ## 0.5.0 - 2026-08-07
 
 - Added the `agent-scale` Center, `as-edge`, `as-control`, and `as-relay`

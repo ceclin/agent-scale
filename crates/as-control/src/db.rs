@@ -67,17 +67,44 @@ impl Database {
                 [unix_timestamp()],
             )?;
         }
+        let applied: bool = transaction
+            .query_row("SELECT 1 FROM migrations WHERE version = 2", [], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        if !applied {
+            if !has_column(&transaction, "metadata", "relay_ca_der")? {
+                transaction.execute("ALTER TABLE metadata ADD COLUMN relay_ca_der BLOB", [])?;
+            }
+            if !has_column(&transaction, "relays", "qad_port")? {
+                transaction.execute(
+                    "ALTER TABLE relays ADD COLUMN qad_port INTEGER CHECK (qad_port BETWEEN 1 AND 65535)",
+                    [],
+                )?;
+            }
+            transaction.execute(
+                "INSERT INTO migrations(version, applied_at) VALUES (2, ?1)",
+                [unix_timestamp()],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
 
     pub fn load(&self) -> Result<ControlState> {
         let connection = self.connection.lock().expect("database mutex poisoned");
-        let (schema, audience, public_url, revision) = connection
+        let (schema, audience, public_url, relay_ca_der, revision) = connection
             .query_row(
-                "SELECT schema_version, audience, public_url, revision FROM metadata WHERE id = 1",
+                "SELECT schema_version, audience, public_url, relay_ca_der, revision FROM metadata WHERE id = 1",
                 [],
-                |row| Ok((row.get::<_, u32>(0)?, row.get(1)?, row.get(2)?, row.get::<_, i64>(3)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, u32>(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
             )
             .context("database is not initialized; run `as-control init` to initialize a new network")?;
         anyhow::ensure!(schema == STATE_SCHEMA, "unsupported state schema {schema}");
@@ -117,12 +144,13 @@ impl Database {
         )?;
         let relays = query_all(
             &connection,
-            "SELECT name, endpoint_id, url FROM relays ORDER BY name",
+            "SELECT name, endpoint_id, url, qad_port FROM relays ORDER BY name",
             |row| {
                 Ok(RelayRecord {
                     name: row.get(0)?,
                     endpoint_id: row.get(1)?,
                     url: row.get(2)?,
+                    qad_port: row.get(3)?,
                 })
             },
         )?;
@@ -160,6 +188,7 @@ impl Database {
             schema,
             audience,
             public_url,
+            relay_ca_der,
             revision,
             centers,
             edges,
@@ -190,8 +219,8 @@ impl Database {
         transaction.execute("UPDATE provisioners SET active = 0", [])?;
         let revision = i64::try_from(state.revision).context("control revision exceeds SQLite range")?;
         transaction.execute(
-            "INSERT INTO metadata(id, schema_version, audience, public_url, revision) VALUES (1, ?1, ?2, ?3, ?4) ON CONFLICT(id) DO UPDATE SET schema_version=excluded.schema_version, audience=excluded.audience, public_url=excluded.public_url, revision=excluded.revision",
-            params![state.schema, state.audience, state.public_url, revision],
+            "INSERT INTO metadata(id, schema_version, audience, public_url, relay_ca_der, revision) VALUES (1, ?1, ?2, ?3, ?4, ?5) ON CONFLICT(id) DO UPDATE SET schema_version=excluded.schema_version, audience=excluded.audience, public_url=excluded.public_url, relay_ca_der=excluded.relay_ca_der, revision=excluded.revision",
+            params![state.schema, state.audience, state.public_url, state.relay_ca_der, revision],
         )?;
         for item in &state.provisioners {
             transaction.execute(
@@ -213,8 +242,8 @@ impl Database {
         }
         for item in &state.relays {
             transaction.execute(
-                "INSERT INTO relays(endpoint_id, name, url) VALUES (?1, ?2, ?3)",
-                params![item.endpoint_id, item.name, item.url],
+                "INSERT INTO relays(endpoint_id, name, url, qad_port) VALUES (?1, ?2, ?3, ?4)",
+                params![item.endpoint_id, item.name, item.url, item.qad_port],
             )?;
         }
         for item in &state.invites {
@@ -271,6 +300,14 @@ fn query_all<T>(
     Ok(statement.query_map([], map)?.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+fn has_column(transaction: &rusqlite::Transaction<'_>, table: &str, column: &str) -> Result<bool> {
+    let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names.iter().any(|name| name == column))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +318,7 @@ mod tests {
             schema: STATE_SCHEMA,
             audience: "test".into(),
             public_url: "http://127.0.0.1:3350".into(),
+            relay_ca_der: vec![1, 2, 3],
             revision: 0,
             centers: vec![],
             edges: vec![],

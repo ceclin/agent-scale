@@ -20,7 +20,10 @@ use axum::{
 use clap::{Parser, Subcommand};
 use control_api::{ClaimRequest, InviteKind, JoinResult, JoinToken, WatchRequest};
 use iroh_base::{EndpointId, SecretKey};
-use iroh_relay::server::{Access, AccessControl, ClientRequest, RelayConfig, Server, ServerConfig, clients::Clients};
+use iroh_relay::server::{
+    Access, AccessControl, ClientRequest, QuicConfig, RelayConfig, Server, ServerConfig, clients::Clients,
+};
+use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
 use relay_api::{MembershipSnapshot, RELAY_PROTOCOL_VERSION, RelayStatus, SignedSnapshot};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -28,6 +31,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 const MAX_CLOCK_SKEW_SECS: i64 = 300;
+const DEFAULT_QAD_PORT: u16 = 7842;
 
 #[derive(Parser)]
 #[command(name = "as-relay", about = "Dynamically managed private iroh relay")]
@@ -44,6 +48,12 @@ enum Command {
         /// Connect to Control through this URL while retaining the signed public URL.
         #[arg(long)]
         control_url: Option<String>,
+        /// Public QAD UDP port to advertise through Control (default: 7842).
+        #[arg(long)]
+        qad_port: Option<u16>,
+        /// Enroll this Relay without QAD.
+        #[arg(long)]
+        no_qad: bool,
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
@@ -55,6 +65,15 @@ enum Command {
         /// Management API listen address. Expose only behind HTTPS in production.
         #[arg(long, default_value = "127.0.0.1:3341")]
         admin_bind: SocketAddr,
+        /// Local UDP bind address for QAD.
+        #[arg(long, default_value = "[::]:7842")]
+        qad_bind: SocketAddr,
+        /// Public QAD UDP port to advertise during enrollment (default: --qad-bind's port).
+        #[arg(long)]
+        qad_port: Option<u16>,
+        /// Enroll without QAD, or require an existing QAD-disabled profile.
+        #[arg(long)]
+        no_qad: bool,
         /// Directory containing the durable membership snapshot.
         #[arg(long)]
         state_dir: Option<PathBuf>,
@@ -65,6 +84,17 @@ enum Command {
         #[arg(long, requires = "join_if_needed")]
         control_url: Option<String>,
     },
+}
+
+struct RunOptions {
+    relay_bind: SocketAddr,
+    admin_bind: SocketAddr,
+    qad_bind: SocketAddr,
+    qad_port: Option<u16>,
+    no_qad: bool,
+    state_dir: Option<PathBuf>,
+    join_if_needed: Option<PathBuf>,
+    control_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,25 +178,54 @@ async fn main() -> Result<()> {
         Command::Join {
             join_url,
             control_url,
+            qad_port,
+            no_qad,
             state_dir,
-        } => join_control(join_url, control_url, state_dir).await,
+        } => {
+            join_control(
+                join_url,
+                control_url,
+                state_dir,
+                requested_qad_port(qad_port, no_qad, DEFAULT_QAD_PORT)?,
+            )
+            .await
+        }
         Command::Run {
             relay_bind,
             admin_bind,
+            qad_bind,
+            qad_port,
+            no_qad,
             state_dir,
             join_if_needed,
             control_url,
-        } => run(relay_bind, admin_bind, state_dir, join_if_needed, control_url).await,
+        } => {
+            run(RunOptions {
+                relay_bind,
+                admin_bind,
+                qad_bind,
+                qad_port,
+                no_qad,
+                state_dir,
+                join_if_needed,
+                control_url,
+            })
+            .await
+        }
     }
 }
 
-async fn run(
-    relay_bind: SocketAddr,
-    admin_bind: SocketAddr,
-    state_dir: Option<PathBuf>,
-    join_if_needed: Option<PathBuf>,
-    control_url: Option<String>,
-) -> Result<()> {
+async fn run(options: RunOptions) -> Result<()> {
+    let RunOptions {
+        relay_bind,
+        admin_bind,
+        qad_bind,
+        qad_port,
+        no_qad,
+        state_dir,
+        join_if_needed,
+        control_url,
+    } = options;
     let state_dir = state_dir.unwrap_or_else(default_state_dir);
     tokio::fs::create_dir_all(&state_dir)
         .await
@@ -174,9 +233,36 @@ async fn run(
     if !profile_path(&state_dir).exists()
         && let Some(join_file) = join_if_needed
     {
-        join_from_file(join_file, control_url, state_dir.clone()).await?;
+        join_from_file(
+            join_file,
+            control_url,
+            state_dir.clone(),
+            requested_qad_port(qad_port, no_qad, qad_bind.port())?,
+        )
+        .await?;
     }
-    let profile = load_profile(&state_dir)?;
+    let mut profile = load_profile(&state_dir)?;
+    if no_qad {
+        anyhow::ensure!(
+            profile.qad_port.is_none(),
+            "--no-qad cannot disable QAD after enrollment"
+        );
+    }
+    if let Some(qad_port) = qad_port {
+        let requested = requested_qad_port(Some(qad_port), false, qad_bind.port())?;
+        anyhow::ensure!(
+            profile.qad_port.is_some(),
+            "--qad-port cannot enable QAD after a QAD-disabled enrollment"
+        );
+        if profile.qad_port != requested {
+            profile.qad_port = requested;
+            persist_json(&profile_path(&state_dir), &profile).await?;
+            info!(
+                public_port = qad_port,
+                "updated public QAD port; reporting it to Control"
+            );
+        }
+    }
     let authority_id = profile.control_id.parse().context("invalid profile control id")?;
     let audience = profile.audience.clone();
     anyhow::ensure!(!audience.trim().is_empty(), "audience must not be empty");
@@ -192,6 +278,10 @@ async fn run(
     relay_config.access = Arc::new(access);
     let mut server_config = ServerConfig::default();
     server_config.relay = Some(relay_config);
+    server_config.quic = managed_qad_config(&profile, &state_dir, qad_bind)?;
+    if let Some(public_port) = profile.qad_port {
+        info!(bind = %qad_bind, public_port, "QAD enabled");
+    }
     let mut relay = Server::spawn(server_config).await.context("start relay")?;
     let clients = relay
         .relay_service()
@@ -218,6 +308,9 @@ async fn run(
     let actual_admin = listener.local_addr()?;
     println!("relay=http://{actual_relay}");
     println!("admin=http://{actual_admin}");
+    if let Some(public_port) = profile.qad_port {
+        println!("qad=udp://{qad_bind} (public port {public_port})");
+    }
     println!("audience={audience}");
     use std::io::Write;
     std::io::stdout().flush().context("flush startup metadata")?;
@@ -241,7 +334,42 @@ async fn run(
     Ok(())
 }
 
-async fn join_from_file(join_file: PathBuf, control_url: Option<String>, state_dir: PathBuf) -> Result<()> {
+fn managed_qad_config(profile: &ControlProfile, state_dir: &Path, qad_bind: SocketAddr) -> Result<Option<QuicConfig>> {
+    let Some(_public_port) = profile.qad_port else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        !profile.qad_certificate_der.is_empty(),
+        "managed QAD TLS certificate is empty"
+    );
+    anyhow::ensure!(
+        !profile.relay_ca_der.is_empty(),
+        "managed Relay CA certificate is empty"
+    );
+    let key_der = std::fs::read(qad_key_path(state_dir)).context("read managed QAD TLS key")?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let tls = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![
+                rustls::pki_types::CertificateDer::from(profile.qad_certificate_der.clone()),
+                rustls::pki_types::CertificateDer::from(profile.relay_ca_der.clone()),
+            ],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_der).into(),
+        )
+        .context("configure managed QAD TLS certificate")?;
+    let mut quic = QuicConfig::new(qad_bind);
+    quic.server_config = Some(tls);
+    Ok(Some(quic))
+}
+
+async fn join_from_file(
+    join_file: PathBuf,
+    control_url: Option<String>,
+    state_dir: PathBuf,
+    qad_port: Option<u16>,
+) -> Result<()> {
     let join_url = tokio::fs::read_to_string(&join_file).await.with_context(|| {
         format!(
             "read {} (restore relay state or provide a fresh Relay invitation)",
@@ -252,7 +380,7 @@ async fn join_from_file(join_file: PathBuf, control_url: Option<String>, state_d
     anyhow::ensure!(!join_url.is_empty(), "Relay invitation file is empty");
     let mut backoff = 1u64;
     loop {
-        match join_control(join_url.clone(), control_url.clone(), Some(state_dir.clone())).await {
+        match join_control(join_url.clone(), control_url.clone(), Some(state_dir.clone()), qad_port).await {
             Ok(()) => return Ok(()),
             Err(error) if error.chain().any(|cause| cause.is::<reqwest::Error>()) => {
                 warn!(%error, "Control unavailable during Relay enrollment; retrying");
@@ -269,6 +397,19 @@ fn default_state_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::home_dir().map(|home| home.join(".agent-scale-relay")))
         .unwrap_or_else(|| PathBuf::from(".agent-scale-relay"))
+}
+
+fn requested_qad_port(port: Option<u16>, disabled: bool, default_port: u16) -> Result<Option<u16>> {
+    anyhow::ensure!(
+        !(disabled && port.is_some()),
+        "--no-qad cannot be combined with --qad-port"
+    );
+    if disabled {
+        return Ok(None);
+    }
+    let port = port.unwrap_or(default_port);
+    anyhow::ensure!(port != 0, "--qad-port must be between 1 and 65535");
+    Ok(Some(port))
 }
 
 async fn load_or_initialize(path: &Path, audience: &str) -> Result<MembershipSnapshot> {
@@ -387,9 +528,18 @@ struct ControlProfile {
     control_id: String,
     audience: String,
     endpoint_id: String,
+    relay_url: String,
+    qad_port: Option<u16>,
+    relay_ca_der: Vec<u8>,
+    qad_certificate_der: Vec<u8>,
 }
 
-async fn join_control(join_url: String, control_url: Option<String>, state_dir: Option<PathBuf>) -> Result<()> {
+async fn join_control(
+    join_url: String,
+    control_url: Option<String>,
+    state_dir: Option<PathBuf>,
+    qad_port: Option<u16>,
+) -> Result<()> {
     let state_dir = state_dir.unwrap_or_else(default_state_dir);
     tokio::fs::create_dir_all(&state_dir).await?;
     anyhow::ensure!(
@@ -400,18 +550,33 @@ async fn join_control(join_url: String, control_url: Option<String>, state_dir: 
     let fragment = parsed.fragment().context("join URL is missing its token fragment")?;
     let token = JoinToken::decode(fragment)?;
     let control_id = token.verify()?;
-    let (name, audience, public_control_url) = match &token.invite.kind {
-        InviteKind::Relay { .. } => (
+    let (name, audience, public_control_url, relay_url) = match &token.invite.kind {
+        InviteKind::Relay { url } => (
             token.invite.name.clone(),
             token.invite.audience.clone(),
             token.invite.control_url.clone(),
+            url.clone(),
         ),
         _ => anyhow::bail!("this invitation is not for a relay"),
     };
     let control_url = control_url.unwrap_or(public_control_url);
     reqwest::Url::parse(&control_url).context("invalid Control connection URL")?;
     let key = load_or_create_relay_key(&state_dir)?;
-    let request = ClaimRequest::sign(token, &key, unix_timestamp(), random_nonce())?;
+    let (qad_key, csr_der) = if qad_port.is_some() {
+        let host = reqwest::Url::parse(&relay_url)?
+            .host_str()
+            .context("Relay URL has no host")?
+            .to_owned();
+        let qad_key = KeyPair::generate().context("generate QAD TLS key")?;
+        let mut params = CertificateParams::new(vec![host])?;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let csr = params.serialize_request(&qad_key).context("create QAD TLS CSR")?;
+        (Some(qad_key), Some(csr.der().to_vec()))
+    } else {
+        (None, None)
+    };
+    let request = ClaimRequest::sign_with_relay_qad(token, &key, unix_timestamp(), random_nonce(), qad_port, csr_der)?;
     let url = api_url(&control_url, "v1/claim")?;
     let response = http_client()
         .post(url)
@@ -428,13 +593,32 @@ async fn join_control(join_url: String, control_url: Option<String>, state_dir: 
     );
     let joined: JoinResult = serde_json::from_slice(&body).context("decode join response")?;
     joined.map.verify(control_id, key.public())?;
+    let qad_certificate_der = match qad_port {
+        Some(_) => joined
+            .relay_tls_certificate_der
+            .context("Control omitted the managed QAD TLS certificate")?,
+        None => Vec::new(),
+    };
+    if let Some(qad_key) = qad_key {
+        let key_der = qad_key.serialize_der();
+        tokio::task::spawn_blocking({
+            let path = qad_key_path(&state_dir);
+            move || scale_core::atomic_write(&path, &key_der)
+        })
+        .await
+        .context("join QAD key writer")??;
+    }
     let profile = ControlProfile {
-        schema_version: 1,
+        schema_version: 2,
         name,
         control_url,
         control_id: control_id.to_string(),
         audience,
         endpoint_id: key.public().to_string(),
+        relay_url,
+        qad_port,
+        relay_ca_der: joined.map.map.relay_ca_der,
+        qad_certificate_der,
     };
     persist_json(&profile_path(&state_dir), &profile).await?;
     println!("enrolled relay '{}' ({})", profile.name, profile.endpoint_id);
@@ -472,13 +656,14 @@ async fn poll_control(profile: ControlProfile, state_dir: PathBuf, state: AdminS
     let mut backoff = 1u64;
     loop {
         let known_revision = state.current.lock().await.version;
-        let request = match WatchRequest::sign(&key, known_revision, unix_timestamp(), random_nonce()) {
-            Ok(request) => request,
-            Err(error) => {
-                warn!("cannot sign relay watch: {error:#}");
-                return;
-            }
-        };
+        let request =
+            match WatchRequest::sign_relay(&key, known_revision, unix_timestamp(), random_nonce(), profile.qad_port) {
+                Ok(request) => request,
+                Err(error) => {
+                    warn!("cannot sign relay watch: {error:#}");
+                    return;
+                }
+            };
         match client.post(url.clone()).json(&request).send().await {
             Ok(response) if response.status().is_success() => match response.json::<SignedSnapshot>().await {
                 Ok(signed) => {
@@ -523,7 +708,7 @@ fn load_profile(state_dir: &Path) -> Result<ControlProfile> {
         &std::fs::read(&path).with_context(|| format!("read {} (run `as-relay join` first)", path.display()))?,
     )
     .with_context(|| format!("parse {}", path.display()))?;
-    anyhow::ensure!(profile.schema_version == 1, "unsupported relay profile schema");
+    anyhow::ensure!(profile.schema_version == 2, "unsupported relay profile schema");
     Ok(profile)
 }
 
@@ -543,6 +728,10 @@ async fn persist_json(path: &Path, value: &impl Serialize) -> Result<()> {
 
 fn profile_path(state_dir: &Path) -> PathBuf {
     state_dir.join("control.json")
+}
+
+fn qad_key_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("qad.key")
 }
 
 fn api_url(base: &str, path: &str) -> Result<reqwest::Url> {
@@ -574,6 +763,7 @@ fn unix_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::{BasicConstraints, IsCa, Issuer};
 
     #[test]
     fn run_accepts_first_start_enrollment_file() {
@@ -593,6 +783,65 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn run_accepts_non_default_qad_bind_port() {
+        let cli = Cli::try_parse_from(["as-relay", "run", "--qad-bind", "0.0.0.0:49152"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Run { qad_bind, .. } if qad_bind.port() == 49152
+        ));
+    }
+
+    #[test]
+    fn qad_is_enabled_by_default_and_can_be_overridden_or_disabled() {
+        assert_eq!(
+            requested_qad_port(None, false, DEFAULT_QAD_PORT).unwrap(),
+            Some(DEFAULT_QAD_PORT)
+        );
+        assert_eq!(requested_qad_port(None, false, 49152).unwrap(), Some(49152));
+        assert_eq!(requested_qad_port(Some(4433), false, 49152).unwrap(), Some(4433));
+        assert_eq!(requested_qad_port(None, true, 49152).unwrap(), None);
+        assert!(requested_qad_port(Some(4433), true, 49152).is_err());
+        assert!(requested_qad_port(Some(0), false, 49152).is_err());
+        assert!(requested_qad_port(None, false, 0).is_err());
+    }
+
+    #[tokio::test]
+    async fn managed_qad_listener_starts_with_control_issued_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let leaf_key = KeyPair::generate().unwrap();
+        let mut leaf_params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+        scale_core::atomic_write(&qad_key_path(dir.path()), &leaf_key.serialize_der()).unwrap();
+        let profile = ControlProfile {
+            schema_version: 2,
+            name: "relay-a".into(),
+            control_url: "http://127.0.0.1:3350".into(),
+            control_id: SecretKey::generate().public().to_string(),
+            audience: "test".into(),
+            endpoint_id: SecretKey::generate().public().to_string(),
+            relay_url: "http://localhost:3340/".into(),
+            qad_port: Some(4433),
+            relay_ca_der: ca_cert.der().to_vec(),
+            qad_certificate_der: leaf_cert.der().to_vec(),
+        };
+        let mut config = ServerConfig::default();
+        config.relay = Some(RelayConfig::new("127.0.0.1:0".parse::<SocketAddr>().unwrap()));
+        config.quic = managed_qad_config(&profile, dir.path(), "127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+        let server = Server::spawn(config).await.unwrap();
+        assert_ne!(server.quic_addr().unwrap().port(), 0);
+        server.shutdown().await.unwrap();
     }
 
     #[test]

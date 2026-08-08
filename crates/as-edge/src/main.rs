@@ -378,20 +378,32 @@ async fn run_iroh_edge(args: &RunArgs) -> Result<()> {
             "a control-managed edge cannot override --relay or --center"
         );
     }
-    let relays = if let Some(profile) = profile.as_ref() {
+    let (relays, relay_ca_der) = if let Some(profile) = profile.as_ref() {
         profile
             .map
             .map
             .relays
             .iter()
-            .map(|relay| relay.url.parse::<iroh::RelayUrl>())
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| anyhow::anyhow!("bad relay in control map: {error}"))?
+            .map(|relay| -> Result<iroh::RelayConfig> {
+                let url = relay
+                    .url
+                    .parse::<iroh::RelayUrl>()
+                    .map_err(|error| anyhow::anyhow!("bad relay in control map: {error}"))?;
+                Ok(scale_transport::managed_relay_config(url, relay.qad_port))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|relays| (relays, Some(profile.map.map.relay_ca_der.clone())))?
     } else {
         if args.relays.is_empty() {
             info!("using official iroh relays (simple mode)");
         }
-        scale_transport::relay_urls_or_default(&args.relays)?
+        (
+            scale_transport::relay_urls_or_default(&args.relays)?
+                .into_iter()
+                .map(iroh::RelayConfig::from)
+                .collect(),
+            None,
+        )
     };
 
     // --center => strict pinning; otherwise trust-on-first-use, remembered
@@ -441,9 +453,10 @@ async fn run_iroh_edge(args: &RunArgs) -> Result<()> {
     if profile.is_none() && args.relays.is_empty() {
         println!("relay mode: official iroh network");
     }
-    let endpoint = scale_transport::build_endpoint(
+    let endpoint = scale_transport::build_endpoint_with_config(
         key.clone(),
-        &relays,
+        relays,
+        relay_ca_der,
         vec![scale_transport::ALPN.to_vec(), iroh_blobs::ALPN.to_vec()],
     )
     .await?;

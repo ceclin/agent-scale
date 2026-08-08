@@ -5,7 +5,7 @@
 
 mod connection_pool;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -17,7 +17,9 @@ use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_blobs::BlobsProtocol;
 use iroh_blobs::store::fs::FsStore;
 use protocol::{EdgeReq, ExecParams, RemoteError, RpcResult, TransferResult};
-use scale_transport::{Frame, T_DATA, T_EXIT, T_RESULT, T_START, T_STDERR, build_endpoint, io_wire, iroh_wire};
+use scale_transport::{
+    Frame, T_DATA, T_EXIT, T_RESULT, T_START, T_STDERR, build_endpoint_with_config, io_wire, iroh_wire,
+};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
@@ -59,7 +61,7 @@ struct Ctx {
     /// In-flight client handlers; the daemon won't idle out while > 0.
     active: Arc<AtomicUsize>,
     /// Relay URLs currently installed in the live iroh endpoint.
-    known_relays: Arc<Mutex<HashSet<String>>>,
+    known_relays: Arc<Mutex<HashMap<String, Option<u16>>>>,
 }
 
 /// Increments the active-handler count for its lifetime (RAII so it decrements
@@ -86,24 +88,46 @@ pub async fn run() -> Result<()> {
     let key = common::load_or_create_key()?;
     let center_id = key.public();
 
-    let mut relays = Vec::new();
+    let mut relays = HashMap::new();
     for e in &cfg.edges {
         for r in &e.relays {
             let u = r
                 .parse::<iroh::RelayUrl>()
                 .with_context(|| format!("bad relay {r} for edge {}", e.name))?;
-            if !relays.contains(&u) {
-                relays.push(u);
-            }
+            relays
+                .entry(u.to_string())
+                .or_insert_with(|| iroh::RelayConfig::from(u));
+        }
+    }
+    if let Some(control) = &cfg.control {
+        for relay in &control.map.map.relays {
+            let url = relay
+                .url
+                .parse::<iroh::RelayUrl>()
+                .with_context(|| format!("bad managed relay {}", relay.url))?;
+            relays.insert(
+                relay.url.clone(),
+                scale_transport::managed_relay_config(url, relay.qad_port),
+            );
         }
     }
     let controlled = cfg.control.is_some();
-    let known_relays: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(
-        cfg.edges.iter().flat_map(|e| e.relays.iter().cloned()).collect(),
+    let known_relays = Arc::new(Mutex::new(
+        relays
+            .iter()
+            .map(|(url, config)| (url.clone(), config.quic.as_ref().map(|quic| quic.port)))
+            .collect(),
     ));
     // The daemon also *accepts* blobs connections (so edges can fetch during
     // upload), so it advertises the blobs ALPN.
-    let endpoint = build_endpoint(key, &relays, vec![iroh_blobs::ALPN.to_vec()]).await?;
+    let relay_ca_der = cfg.control.as_ref().map(|control| control.map.map.relay_ca_der.clone());
+    let endpoint = build_endpoint_with_config(
+        key,
+        relays.into_values().collect(),
+        relay_ca_der,
+        vec![iroh_blobs::ALPN.to_vec()],
+    )
+    .await?;
     let store = scale_transport::blobs::open_store(common::daemon_dir().join("blobs")).await?;
 
     let mut listener =
@@ -217,20 +241,41 @@ async fn reload_edges(ctx: &Ctx) {
             return;
         }
     };
-    let desired_relays: HashSet<String> = cfg.edges.iter().flat_map(|edge| edge.relays.iter().cloned()).collect();
+    let mut desired_relays: HashMap<String, Option<u16>> = cfg
+        .edges
+        .iter()
+        .flat_map(|edge| edge.relays.iter().cloned())
+        .map(|url| (url, Some(7842)))
+        .collect();
+    if let Some(control) = &cfg.control {
+        for relay in &control.map.map.relays {
+            desired_relays.insert(relay.url.clone(), relay.qad_port);
+        }
+    }
     {
         let mut current = ctx.known_relays.lock().await;
-        let added: Vec<_> = desired_relays.difference(&current).cloned().collect();
-        let removed: Vec<_> = current.difference(&desired_relays).cloned().collect();
+        let added: Vec<_> = desired_relays
+            .iter()
+            .filter(|(url, port)| current.get(*url) != Some(*port))
+            .map(|(url, port)| (url.clone(), *port))
+            .collect();
+        let removed: Vec<_> = current
+            .keys()
+            .filter(|url| !desired_relays.contains_key(*url))
+            .cloned()
+            .collect();
         // Install replacements before removing old relays so an address always
         // has the best chance of retaining a relay path during map rotation.
-        for value in added {
+        for (value, qad_port) in added {
             match value.parse::<iroh::RelayUrl>() {
                 Ok(url) => {
                     ctx.endpoint
-                        .insert_relay(url.clone(), Arc::new(iroh::RelayConfig::from(url)))
+                        .insert_relay(
+                            url.clone(),
+                            Arc::new(scale_transport::managed_relay_config(url, qad_port)),
+                        )
                         .await;
-                    current.insert(value);
+                    current.insert(value, qad_port);
                 }
                 Err(error) => warn!("reload: invalid relay {value}: {error}"),
             }

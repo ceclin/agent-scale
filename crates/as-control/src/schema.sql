@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS metadata (
     schema_version INTEGER NOT NULL,
     audience TEXT NOT NULL CHECK (length(audience) > 0),
     public_url TEXT NOT NULL CHECK (length(public_url) > 0),
+    relay_ca_der BLOB NOT NULL CHECK (length(relay_ca_der) > 0),
     revision INTEGER NOT NULL CHECK (revision >= 0)
 ) STRICT;
 
@@ -36,7 +37,8 @@ CREATE TABLE IF NOT EXISTS edges (
 CREATE TABLE IF NOT EXISTS relays (
     endpoint_id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
-    url TEXT NOT NULL UNIQUE
+    url TEXT NOT NULL UNIQUE,
+    qad_port INTEGER CHECK (qad_port BETWEEN 1 AND 65535)
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS invitations (

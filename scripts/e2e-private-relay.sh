@@ -10,6 +10,8 @@ RELAY_STATE="$TMP/relay"
 CONTROL_URL=http://127.0.0.1:35350
 RELAY_URL=http://127.0.0.1:35340
 RELAY_ADMIN_URL=http://127.0.0.1:35341
+RELAY_QAD_PORT=35443
+UPDATED_RELAY_QAD_PORT=35444
 control_pid=
 relay_pid=
 edge_pid=
@@ -45,6 +47,8 @@ AGENT_SCALE_HOME="$CENTER_HOME" "$BIN/agent-scale" control join "$center_join" >
 relay_join=$("$BIN/as-control" relay invite relay-a "$RELAY_URL")
 printf '%s\n' "$relay_join" >"$TMP/relay.join"
 "$BIN/as-relay" run --relay-bind 127.0.0.1:35340 --admin-bind 127.0.0.1:35341 \
+    --qad-bind "127.0.0.1:$RELAY_QAD_PORT" \
+    --qad-port "$RELAY_QAD_PORT" \
     --join-if-needed "$TMP/relay.join" --control-url "$CONTROL_URL" \
     --state-dir "$RELAY_STATE" >"$TMP/relay.out" 2>&1 &
 relay_pid=$!
@@ -73,6 +77,8 @@ done
 kill "$control_pid"; wait "$control_pid" >/dev/null 2>&1 || true; control_pid=
 kill "$relay_pid"; wait "$relay_pid" >/dev/null 2>&1 || true; relay_pid=
 "$BIN/as-relay" run --relay-bind 127.0.0.1:35340 --admin-bind 127.0.0.1:35341 \
+    --qad-bind "127.0.0.1:$RELAY_QAD_PORT" \
+    --qad-port "$RELAY_QAD_PORT" \
     --state-dir "$RELAY_STATE" >"$TMP/relay.out" 2>&1 &
 relay_pid=$!
 
@@ -87,6 +93,19 @@ control_pid=$!
 i=0
 until curl -fsS "$CONTROL_URL/healthz" >/dev/null 2>&1; do
     i=$((i + 1)); [ "$i" -lt 100 ] || { echo "as-control did not restart" >&2; exit 1; }
+    sleep 0.05
+done
+
+# An enrolled Relay may explicitly report a changed public QAD port.
+kill "$relay_pid"; wait "$relay_pid" >/dev/null 2>&1 || true; relay_pid=
+"$BIN/as-relay" run --relay-bind 127.0.0.1:35340 --admin-bind 127.0.0.1:35341 \
+    --qad-bind "127.0.0.1:$UPDATED_RELAY_QAD_PORT" \
+    --qad-port "$UPDATED_RELAY_QAD_PORT" \
+    --state-dir "$RELAY_STATE" >"$TMP/relay.out" 2>&1 &
+relay_pid=$!
+i=0
+until "$BIN/as-control" relay ls 2>/dev/null | grep "udp/$UPDATED_RELAY_QAD_PORT" >/dev/null; do
+    i=$((i + 1)); [ "$i" -lt 100 ] || { echo "Relay did not report its updated QAD port" >&2; exit 1; }
     sleep 0.05
 done
 

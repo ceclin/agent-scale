@@ -14,12 +14,12 @@ use iroh_base::{EndpointId, SecretKey, Signature};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
-const INVITE_DOMAIN: &[u8] = b"agent-scale-control-invite-v2\0";
-const CLAIM_DOMAIN: &[u8] = b"agent-scale-control-claim-v2\0";
-const EDGE_INVITE_REQUEST_DOMAIN: &[u8] = b"agent-scale-control-edge-invite-request-v2\0";
-const WATCH_DOMAIN: &[u8] = b"agent-scale-control-watch-v2\0";
-const MAP_DOMAIN: &[u8] = b"agent-scale-control-map-v2\0";
-pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
+const INVITE_DOMAIN: &[u8] = b"agent-scale-control-invite-v3\0";
+const CLAIM_DOMAIN: &[u8] = b"agent-scale-control-claim-v3\0";
+const EDGE_INVITE_REQUEST_DOMAIN: &[u8] = b"agent-scale-control-edge-invite-request-v3\0";
+const WATCH_DOMAIN: &[u8] = b"agent-scale-control-watch-v3\0";
+const MAP_DOMAIN: &[u8] = b"agent-scale-control-map-v3\0";
+pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -96,6 +96,12 @@ pub struct Claim {
     pub endpoint_id: String,
     pub issued_at: i64,
     pub nonce: String,
+    /// Public UDP port advertised by an enrolling managed Relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_qad_port: Option<u16>,
+    /// DER PKCS#10 request for a managed Relay's QAD certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_tls_csr: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,12 +113,25 @@ pub struct ClaimRequest {
 
 impl ClaimRequest {
     pub fn sign(token: JoinToken, key: &SecretKey, issued_at: i64, nonce: String) -> Result<Self> {
+        Self::sign_with_relay_qad(token, key, issued_at, nonce, None, None)
+    }
+
+    pub fn sign_with_relay_qad(
+        token: JoinToken,
+        key: &SecretKey,
+        issued_at: i64,
+        nonce: String,
+        relay_qad_port: Option<u16>,
+        relay_tls_csr: Option<Vec<u8>>,
+    ) -> Result<Self> {
         let claim = Claim {
             protocol_version: CONTROL_PROTOCOL_VERSION,
             invite_id: token.invite.invite_id.clone(),
             endpoint_id: key.public().to_string(),
             issued_at,
             nonce,
+            relay_qad_port,
+            relay_tls_csr,
         };
         let signature = key.sign(&domain_bytes(CLAIM_DOMAIN, &claim)?);
         Ok(Self {
@@ -201,6 +220,9 @@ pub struct WatchRequest {
     pub known_revision: u64,
     pub issued_at: i64,
     pub nonce: String,
+    /// Current public QAD port, reported only by a managed Relay watcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_qad_port: Option<u16>,
     pub signature: Signature,
 }
 
@@ -212,8 +234,22 @@ impl WatchRequest {
             known_revision,
             issued_at,
             nonce,
+            relay_qad_port: None,
             signature: key.sign(b"placeholder"),
         };
+        request.signature = key.sign(&request.signing_bytes()?);
+        Ok(request)
+    }
+
+    pub fn sign_relay(
+        key: &SecretKey,
+        known_revision: u64,
+        issued_at: i64,
+        nonce: String,
+        relay_qad_port: Option<u16>,
+    ) -> Result<Self> {
+        let mut request = Self::sign(key, known_revision, issued_at, nonce)?;
+        request.relay_qad_port = relay_qad_port;
         request.signature = key.sign(&request.signing_bytes()?);
         Ok(request)
     }
@@ -235,6 +271,7 @@ impl WatchRequest {
                 self.known_revision,
                 self.issued_at,
                 &self.nonce,
+                self.relay_qad_port,
             ),
         )
     }
@@ -244,6 +281,7 @@ impl WatchRequest {
 pub struct RelayInfo {
     pub name: String,
     pub url: String,
+    pub qad_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +304,7 @@ pub struct RelayNodeInfo {
     pub name: String,
     pub endpoint_id: String,
     pub url: String,
+    pub qad_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,6 +335,8 @@ pub struct NodeMap {
     pub issued_at: i64,
     pub recipient_id: String,
     pub relays: Vec<RelayInfo>,
+    /// DER-encoded private CA certificate used only for managed Relay TLS.
+    pub relay_ca_der: Vec<u8>,
     #[serde(default)]
     pub allowed_centers: Vec<String>,
     #[serde(default)]
@@ -340,6 +381,9 @@ pub struct JoinResult {
     pub name: String,
     pub kind: InviteKind,
     pub map: SignedNodeMap,
+    /// DER leaf certificate returned only while enrolling a managed Relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_tls_certificate_der: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -441,6 +485,17 @@ mod tests {
     }
 
     #[test]
+    fn relay_watch_binds_the_reported_qad_port_to_its_signature() {
+        let relay = SecretKey::generate();
+        let request = WatchRequest::sign_relay(&relay, 4, 50, "nonce".into(), Some(4433)).unwrap();
+        assert_eq!(request.verify().unwrap(), relay.public());
+
+        let mut tampered = request;
+        tampered.relay_qad_port = Some(7842);
+        assert!(tampered.verify().is_err());
+    }
+
+    #[test]
     fn node_map_is_recipient_bound() {
         let control = SecretKey::generate();
         let a = SecretKey::generate();
@@ -455,6 +510,7 @@ mod tests {
                 issued_at: 1,
                 recipient_id: a.public().to_string(),
                 relays: vec![],
+                relay_ca_der: vec![1, 2, 3],
                 allowed_centers: vec![],
                 edges: vec![],
             },
