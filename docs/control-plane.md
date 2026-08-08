@@ -19,6 +19,12 @@ docker compose up -d
 agent-scale control join "$(docker compose run --rm center-invite)"
 ```
 
+Compose uses the native `as-control prepare` command to initialize durable
+state and atomically write first-enrollment invitations. The Relay runs
+`as-relay run --join-if-needed`; it enrolls itself on the first start and later
+starts directly from its persisted profile and membership snapshot, without a
+shell init script or a Control-health dependency.
+
 Released deployments pull
 `ghcr.io/agent-scale/agent-scale-infrastructure:latest` by default. During local
 development, build the static binaries on the host and use the local override:
@@ -57,9 +63,11 @@ docker compose logs -f control relay
 docker compose down
 ```
 
-`docker compose down -v` also destroys the Control authority, enrollment, and
-initial Center invitation. Back up the `control-state` volume for durable
-deployments.
+`docker compose down -v` also destroys the Control authority, Relay identity,
+and initial Center invitation. Back up both `control-state` and `relay-state`
+for durable deployments. After Center and Relay enrollment, `bootstrap-data`
+contains only consumed invitation artifacts and is not needed to authorize the
+existing deployment.
 
 ### Manual Deployment
 

@@ -43,10 +43,12 @@ done
 
 AGENT_SCALE_HOME="$work/center-a" target/debug/agent-scale control join "$center_a_url" >/dev/null
 relay_join=$("${control[@]}" relay invite relay-a "$relay_url")
-target/debug/as-relay join "$relay_join" --state-dir "$work/relay" >/dev/null
+printf '%s\n' "$relay_join" >"$work/relay.join"
 target/debug/as-relay run \
   --relay-bind "127.0.0.1:$relay_port" \
   --admin-bind "127.0.0.1:$relay_admin_port" \
+  --join-if-needed "$work/relay.join" \
+  --control-url "$control_url" \
   --state-dir "$work/relay" >"$work/relay.log" 2>&1 &
 relay_pid=$!
 

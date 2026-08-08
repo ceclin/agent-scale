@@ -58,6 +58,12 @@ enum Command {
         /// Directory containing the durable membership snapshot.
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// Enroll from this invitation file when no Control profile exists.
+        #[arg(long)]
+        join_if_needed: Option<PathBuf>,
+        /// Connect to Control through this URL during first-run enrollment.
+        #[arg(long, requires = "join_if_needed")]
+        control_url: Option<String>,
     },
 }
 
@@ -148,15 +154,28 @@ async fn main() -> Result<()> {
             relay_bind,
             admin_bind,
             state_dir,
-        } => run(relay_bind, admin_bind, state_dir).await,
+            join_if_needed,
+            control_url,
+        } => run(relay_bind, admin_bind, state_dir, join_if_needed, control_url).await,
     }
 }
 
-async fn run(relay_bind: SocketAddr, admin_bind: SocketAddr, state_dir: Option<PathBuf>) -> Result<()> {
+async fn run(
+    relay_bind: SocketAddr,
+    admin_bind: SocketAddr,
+    state_dir: Option<PathBuf>,
+    join_if_needed: Option<PathBuf>,
+    control_url: Option<String>,
+) -> Result<()> {
     let state_dir = state_dir.unwrap_or_else(default_state_dir);
     tokio::fs::create_dir_all(&state_dir)
         .await
         .with_context(|| format!("create {}", state_dir.display()))?;
+    if !profile_path(&state_dir).exists()
+        && let Some(join_file) = join_if_needed
+    {
+        join_from_file(join_file, control_url, state_dir.clone()).await?;
+    }
     let profile = load_profile(&state_dir)?;
     let authority_id = profile.control_id.parse().context("invalid profile control id")?;
     let audience = profile.audience.clone();
@@ -220,6 +239,29 @@ async fn run(relay_bind: SocketAddr, admin_bind: SocketAddr, state_dir: Option<P
     }
     control_poll.abort();
     Ok(())
+}
+
+async fn join_from_file(join_file: PathBuf, control_url: Option<String>, state_dir: PathBuf) -> Result<()> {
+    let join_url = tokio::fs::read_to_string(&join_file).await.with_context(|| {
+        format!(
+            "read {} (restore relay state or provide a fresh Relay invitation)",
+            join_file.display()
+        )
+    })?;
+    let join_url = join_url.trim().to_owned();
+    anyhow::ensure!(!join_url.is_empty(), "Relay invitation file is empty");
+    let mut backoff = 1u64;
+    loop {
+        match join_control(join_url.clone(), control_url.clone(), Some(state_dir.clone())).await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.chain().any(|cause| cause.is::<reqwest::Error>()) => {
+                warn!(%error, "Control unavailable during Relay enrollment; retrying");
+            }
+            Err(error) => return Err(error),
+        }
+        tokio::time::sleep(Duration::from_secs(backoff)).await;
+        backoff = (backoff * 2).min(30);
+    }
 }
 
 fn default_state_dir() -> PathBuf {
@@ -532,6 +574,26 @@ fn unix_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_accepts_first_start_enrollment_file() {
+        let cli = Cli::try_parse_from([
+            "as-relay",
+            "run",
+            "--join-if-needed",
+            "/bootstrap/relay.join",
+            "--control-url",
+            "http://control:3350",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                join_if_needed: Some(_),
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn validation_requires_unique_members() {

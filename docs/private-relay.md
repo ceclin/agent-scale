@@ -25,6 +25,20 @@ as-relay run \
   --state-dir /var/lib/agent-scale-relay
 ```
 
+For unattended first startup, combine enrollment and serving:
+
+```sh
+as-relay run \
+  --join-if-needed /run/secrets/relay.join \
+  --control-url https://control.example.com \
+  --relay-bind 127.0.0.1:3340 \
+  --admin-bind 127.0.0.1:3341 \
+  --state-dir /var/lib/agent-scale-relay
+```
+
+Once `control.json` exists, the invitation file and Control URL are ignored;
+the Relay can restart from its verified offline snapshot while Control is down.
+
 `as-relay run` requires the Control profile created by `as-relay join`. There is
 no Center-signed initialization mode and no remote snapshot mutation endpoint.
 The relay actively long-polls Control for complete, signed membership snapshots.

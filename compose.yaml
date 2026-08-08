@@ -4,24 +4,35 @@ x-image: &image
   image: ${AGENT_SCALE_INFRA_IMAGE:-ghcr.io/agent-scale/agent-scale-infrastructure:latest}
 
 x-environment: &environment
-  CONTROL_PUBLIC_URL: ${CONTROL_PUBLIC_URL:-http://localhost:3350}
-  CONTROL_INTERNAL_URL: http://control:3350
-  CONTROL_AUDIENCE: ${CONTROL_AUDIENCE:-agent-scale-local}
-  CONTROL_CENTER_NAME: ${CONTROL_CENTER_NAME:-main}
-  CONTROL_CENTER_TTL_SECS: ${CONTROL_CENTER_TTL_SECS:-604800}
   AS_CONTROL_STATE_DIR: /control
-  RELAY_NAME: ${RELAY_NAME:-relay-a}
-  RELAY_PUBLIC_URL: ${RELAY_PUBLIC_URL:-http://localhost:3340}
-  RELAY_INVITE_TTL_SECS: ${RELAY_INVITE_TTL_SECS:-900}
 
 services:
   bootstrap:
     <<: *image
-    command: compose-bootstrap
+    command:
+      - as-control
+      - prepare
+      - --public-url
+      - ${CONTROL_PUBLIC_URL:-http://localhost:3350}
+      - --audience
+      - ${CONTROL_AUDIENCE:-agent-scale-local}
+      - --center
+      - ${CONTROL_CENTER_NAME:-main}
+      - --center-ttl-secs
+      - ${CONTROL_CENTER_TTL_SECS:-604800}
+      - --center-invite-out
+      - /bootstrap/center.join
+      - --relay-name
+      - ${RELAY_NAME:-relay-a}
+      - --relay-url
+      - ${RELAY_PUBLIC_URL:-http://localhost:3340}
+      - --relay-ttl-secs
+      - ${RELAY_INVITE_TTL_SECS:-900}
+      - --relay-invite-out
+      - /bootstrap/relay.join
     environment: *environment
     volumes:
       - control-state:/control
-      - relay-state:/relay
       - bootstrap-data:/bootstrap
     restart: "no"
 
@@ -43,20 +54,6 @@ services:
       retries: 30
     restart: unless-stopped
 
-  relay-init:
-    <<: *image
-    command: compose-relay-init
-    environment: *environment
-    depends_on:
-      bootstrap:
-        condition: service_completed_successfully
-      control:
-        condition: service_healthy
-    volumes:
-      - relay-state:/relay
-      - bootstrap-data:/bootstrap:ro
-    restart: "no"
-
   relay:
     <<: *image
     command: >-
@@ -64,14 +61,17 @@ services:
       --relay-bind 0.0.0.0:3340
       --admin-bind 0.0.0.0:3341
       --state-dir /relay
+      --join-if-needed /bootstrap/relay.join
+      --control-url http://control:3350
     depends_on:
-      relay-init:
+      bootstrap:
         condition: service_completed_successfully
     ports:
       - "${RELAY_PORT:-3340}:3340"
       - "127.0.0.1:${RELAY_ADMIN_PORT:-3341}:3341"
     volumes:
       - relay-state:/relay
+      - bootstrap-data:/bootstrap:ro
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://localhost:3341/healthz"]
       interval: 2s

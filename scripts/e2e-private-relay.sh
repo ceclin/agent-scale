@@ -43,8 +43,9 @@ done
 
 AGENT_SCALE_HOME="$CENTER_HOME" "$BIN/agent-scale" control join "$center_join" >/dev/null
 relay_join=$("$BIN/as-control" relay invite relay-a "$RELAY_URL")
-"$BIN/as-relay" join "$relay_join" --state-dir "$RELAY_STATE" >/dev/null
+printf '%s\n' "$relay_join" >"$TMP/relay.join"
 "$BIN/as-relay" run --relay-bind 127.0.0.1:35340 --admin-bind 127.0.0.1:35341 \
+    --join-if-needed "$TMP/relay.join" --control-url "$CONTROL_URL" \
     --state-dir "$RELAY_STATE" >"$TMP/relay.out" 2>&1 &
 relay_pid=$!
 

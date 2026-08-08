@@ -61,6 +61,27 @@ enum Command {
         #[arg(long)]
         audience: String,
     },
+    /// Idempotently initialize a deployment and write its first enrollment invitations.
+    Prepare {
+        #[arg(long)]
+        public_url: String,
+        #[arg(long)]
+        audience: String,
+        #[arg(long)]
+        center: String,
+        #[arg(long, default_value_t = 7 * 24 * 60 * 60)]
+        center_ttl_secs: u64,
+        #[arg(long)]
+        center_invite_out: PathBuf,
+        #[arg(long)]
+        relay_name: String,
+        #[arg(long)]
+        relay_url: String,
+        #[arg(long, default_value_t = DEFAULT_TTL_SECS)]
+        relay_ttl_secs: u64,
+        #[arg(long)]
+        relay_invite_out: PathBuf,
+    },
     /// Create initial invitations before the first server start.
     Bootstrap {
         #[command(subcommand)]
@@ -336,6 +357,28 @@ async fn main() -> Result<()> {
     let admin_socket = state_dir.join("admin.sock");
     match cli.command {
         Command::Init { public_url, audience } => init(state_dir, public_url, audience),
+        Command::Prepare {
+            public_url,
+            audience,
+            center,
+            center_ttl_secs,
+            center_invite_out,
+            relay_name,
+            relay_url,
+            relay_ttl_secs,
+            relay_invite_out,
+        } => prepare(
+            state_dir,
+            public_url,
+            audience,
+            center,
+            center_ttl_secs,
+            center_invite_out,
+            relay_name,
+            relay_url,
+            relay_ttl_secs,
+            relay_invite_out,
+        ),
         Command::Bootstrap { command } => match command {
             BootstrapCommand::Center { name, ttl_secs } => bootstrap_center(state_dir, name, ttl_secs),
             BootstrapCommand::Relay { name, url, ttl_secs } => bootstrap_relay(state_dir, name, url, ttl_secs),
@@ -420,6 +463,174 @@ fn init(dir: PathBuf, public_url: String, audience: String) -> Result<()> {
     println!("initialized control {}", key.public());
     println!("next: as-control bootstrap center <name>");
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare(
+    dir: PathBuf,
+    public_url: String,
+    audience: String,
+    center: String,
+    center_ttl_secs: u64,
+    center_invite_out: PathBuf,
+    relay_name: String,
+    relay_url: String,
+    relay_ttl_secs: u64,
+    relay_invite_out: PathBuf,
+) -> Result<()> {
+    validate_name(&center)?;
+    validate_name(&relay_name)?;
+    anyhow::ensure!(!audience.trim().is_empty(), "--audience must not be empty");
+    let public_url = normalize_public_url(&public_url)?;
+    let relay_url = normalize_relay_url(&relay_url)?;
+    scale_core::ensure_private_dir(&dir)?;
+    if key_path(&dir).exists()
+        && database_path(&dir).exists()
+        && center_invite_out.exists()
+        && relay_invite_out.exists()
+    {
+        let key = scale_core::read_secret(&key_path(&dir))?;
+        validate_prepared_invitation(
+            &center_invite_out,
+            key.public(),
+            &audience,
+            &public_url,
+            &center,
+            &InviteKind::Center,
+        )?;
+        validate_prepared_invitation(
+            &relay_invite_out,
+            key.public(),
+            &audience,
+            &public_url,
+            &relay_name,
+            &InviteKind::Relay { url: relay_url.clone() },
+        )?;
+        println!("control {} is already prepared", key.public());
+        return Ok(());
+    }
+    let _lock = scale_core::FileLock::try_acquire(&lock_path(&dir))
+        .context("control state is already in use; prepare must run before as-control run")?;
+
+    let key_exists = key_path(&dir).exists();
+    let database_exists = database_path(&dir).exists();
+    anyhow::ensure!(
+        key_exists == database_exists,
+        "incomplete control state: control.key and control.db must either both exist or both be absent"
+    );
+    let (key, database, mut state) = if database_exists {
+        let key = scale_core::read_secret(&key_path(&dir))?;
+        let database = db::Database::open(&database_path(&dir))?;
+        let state = database.load()?;
+        (key, database, state)
+    } else {
+        let key = scale_core::load_or_create_secret(&key_path(&dir))?;
+        let state = ControlState {
+            schema: STATE_SCHEMA,
+            audience: audience.clone(),
+            public_url: public_url.clone(),
+            revision: 0,
+            centers: vec![],
+            edges: vec![],
+            relays: vec![],
+            invites: vec![],
+            provisioners: vec![],
+        };
+        let database = db::Database::create(&database_path(&dir), &state)?;
+        (key, database, state)
+    };
+    anyhow::ensure!(
+        state.audience == audience,
+        "configured Control audience does not match durable state"
+    );
+    anyhow::ensure!(
+        state.public_url == public_url,
+        "configured Control public URL does not match durable state"
+    );
+
+    let center_invite = if state.centers.is_empty() {
+        state
+            .invites
+            .retain(|invite| !matches!(invite.invite.kind, InviteKind::Center) || invite.state != InviteState::Pending);
+        Some(create_invite(
+            &key,
+            &mut state,
+            center,
+            InviteKind::Center,
+            center_ttl_secs,
+        )?)
+    } else {
+        None
+    };
+    let relay_invite = if state.relays.is_empty() {
+        state.invites.retain(|invite| {
+            !matches!(invite.invite.kind, InviteKind::Relay { .. }) || invite.state != InviteState::Pending
+        });
+        Some(create_invite(
+            &key,
+            &mut state,
+            relay_name,
+            InviteKind::Relay { url: relay_url },
+            relay_ttl_secs,
+        )?)
+    } else {
+        anyhow::ensure!(
+            state
+                .relays
+                .iter()
+                .any(|relay| relay.name == relay_name && relay.url == relay_url),
+            "configured Relay name or URL does not match durable state"
+        );
+        None
+    };
+    database.replace_sync(&state)?;
+    if let Some(invite) = center_invite {
+        write_invitation(&center_invite_out, &invite.join_url)?;
+    }
+    if let Some(invite) = relay_invite {
+        write_invitation(&relay_invite_out, &invite.join_url)?;
+    }
+    println!("prepared control {}", key.public());
+    Ok(())
+}
+
+fn validate_prepared_invitation(
+    path: &Path,
+    control_id: EndpointId,
+    audience: &str,
+    public_url: &str,
+    name: &str,
+    kind: &InviteKind,
+) -> Result<()> {
+    let join_url = std::fs::read_to_string(path).with_context(|| format!("read invitation {}", path.display()))?;
+    let parsed = Url::parse(join_url.trim()).with_context(|| format!("parse invitation {}", path.display()))?;
+    let fragment = parsed
+        .fragment()
+        .with_context(|| format!("invitation {} has no token", path.display()))?;
+    let token = JoinToken::decode(fragment).with_context(|| format!("decode invitation {}", path.display()))?;
+    anyhow::ensure!(
+        token.verify()? == control_id,
+        "invitation {} belongs to another Control",
+        path.display()
+    );
+    anyhow::ensure!(
+        token.invite.audience == audience
+            && token.invite.control_url == public_url
+            && token.invite.name == name
+            && token.invite.kind == *kind,
+        "invitation {} does not match configured deployment",
+        path.display()
+    );
+    Ok(())
+}
+
+fn write_invitation(path: &Path, join_url: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        scale_core::ensure_private_dir(parent)?;
+    }
+    let mut contents = join_url.as_bytes().to_vec();
+    contents.push(b'\n');
+    scale_core::atomic_write(path, &contents).with_context(|| format!("write invitation {}", path.display()))
 }
 
 fn bootstrap_center(dir: PathBuf, name: String, ttl_secs: u64) -> Result<()> {
@@ -1861,6 +2072,86 @@ mod tests {
     fn state_directory_and_admin_socket_are_not_cli_options() {
         assert!(Cli::try_parse_from(["as-control", "--admin-socket", "/tmp/admin.sock", "status"]).is_err());
         assert!(Cli::try_parse_from(["as-control", "--state-dir", "/tmp/control", "status"]).is_err());
+    }
+
+    #[test]
+    fn prepare_is_idempotent_and_does_not_require_invitation_artifacts_after_enrollment() {
+        let dir = tempfile::tempdir().unwrap();
+        let center_out = dir.path().join("bootstrap/center.join");
+        let relay_out = dir.path().join("bootstrap/relay.join");
+        let run_prepare = || {
+            prepare(
+                dir.path().join("control"),
+                "http://127.0.0.1:3350".into(),
+                "test".into(),
+                "main".into(),
+                900,
+                center_out.clone(),
+                "relay-a".into(),
+                "http://127.0.0.1:3340".into(),
+                900,
+                relay_out.clone(),
+            )
+        };
+        run_prepare().unwrap();
+        assert!(
+            std::fs::read_to_string(&center_out)
+                .unwrap()
+                .starts_with("http://127.0.0.1:3350/join#")
+        );
+        assert!(
+            std::fs::read_to_string(&relay_out)
+                .unwrap()
+                .starts_with("http://127.0.0.1:3350/join#")
+        );
+
+        let control_dir = dir.path().join("control");
+        let (lock, _key, database, mut state) = open_exclusive(&control_dir).unwrap();
+        run_prepare().unwrap();
+        let center_id = SecretKey::generate().public().to_string();
+        let relay_id = SecretKey::generate().public().to_string();
+        state.centers.push(CenterRecord {
+            name: "main".into(),
+            endpoint_id: center_id.clone(),
+            managed_by: None,
+        });
+        state.relays.push(RelayRecord {
+            name: "relay-a".into(),
+            endpoint_id: relay_id.clone(),
+            url: "http://127.0.0.1:3340/".into(),
+        });
+        for invite in &mut state.invites {
+            invite.state = InviteState::Claimed;
+            invite.terminal_at = Some(unix_timestamp());
+            invite.claimed_by = Some(match invite.invite.kind {
+                InviteKind::Center => center_id.clone(),
+                _ => relay_id.clone(),
+            });
+        }
+        database.replace_sync(&state).unwrap();
+        drop(database);
+        drop(lock);
+        std::fs::remove_file(&center_out).unwrap();
+        std::fs::remove_file(&relay_out).unwrap();
+
+        run_prepare().unwrap();
+        assert!(!center_out.exists());
+        assert!(!relay_out.exists());
+        assert!(
+            prepare(
+                control_dir,
+                "http://127.0.0.1:9999".into(),
+                "test".into(),
+                "main".into(),
+                900,
+                center_out,
+                "relay-a".into(),
+                "http://127.0.0.1:3340".into(),
+                900,
+                relay_out,
+            )
+            .is_err()
+        );
     }
 
     #[test]
