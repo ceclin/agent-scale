@@ -1,4 +1,5 @@
-//! Signed wire types shared by control, centers, edges, and managed relays.
+//! One canonical serialization surface prevents participants from signing
+//! subtly different representations of the same Control message.
 
 mod provisioner;
 

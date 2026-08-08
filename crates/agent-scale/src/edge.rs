@@ -1,11 +1,11 @@
-//! `agent-scale edge add/ls/rm` — manage the edge registry in config.json.
+//! Simple-mode registry changes stay local and hot-reload the daemon; managed
+//! topology is deliberately handled elsewhere.
 
 use crate::common::{self, EdgeCfg};
 use anyhow::Result;
 
 /// Add a new edge, or update an existing one with the same name.
 pub async fn add(name: String, endpoint_id: String, relays: Vec<String>) -> Result<()> {
-    // Validate formats up front so typos fail here, not at dial time.
     endpoint_id
         .parse::<iroh::EndpointId>()
         .map_err(|e| anyhow::anyhow!("invalid endpoint_id: {e}"))?;

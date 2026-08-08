@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Milestone 2b end-to-end: relay + edge agent + auto-spawned center daemon,
-# proving streaming exec, exit-code propagation, and the daemon lifecycle.
+# Keep this broad path test because unit tests cannot expose cross-process
+# streaming, lifecycle, or transport regressions.
 set -uo pipefail
-cd "$(dirname "$0")/.."   # repo root (workspace); scripts live in scripts/
+cd "$(dirname "$0")/.."
 
 BIN=target/debug
 AGENT=$BIN/as-edge
@@ -28,7 +28,6 @@ trap cleanup EXIT
 
 check() { if [ "$1" = "PASS" ]; then echo "  ✅ $2"; else echo "  ❌ $2"; FAILED=1; fi; }
 
-# 1. relay
 "$RELAY" >"$RELAY_LOG" 2>/dev/null &
 RELAY_PID=$!
 URL=""
@@ -36,17 +35,14 @@ for _ in $(seq 1 50); do URL=$(head -n1 "$RELAY_LOG" 2>/dev/null); [ -n "$URL" ]
 [ -n "$URL" ] || { echo "relay failed to start"; exit 1; }
 echo "relay:  $URL"
 
-# 2. edge identity (the only id a human copies — no CENTER_ID needed)
 EDGE_ID=$(AGENT_SCALE_HOME="$EDGE_HOME" "$AGENT" id test)
 echo "edge:   $EDGE_ID"
 
-# 3. register the edge via the CLI (exercises `edge add` + `edge ls`)
 AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" edge add test "$EDGE_ID" --relay "$URL" >/dev/null
 AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" edge ls | grep -q "$EDGE_ID" \
   && echo "edge add/ls ok" || { echo "edge add/ls FAILED"; exit 1; }
 
-# 4. start edge agent WITHOUT --center: it trusts the first center to connect
-#    (TOFU). Give it time to come online.
+# Omitting --center exercises TOFU rather than strict pre-pinning.
 AGENT_SCALE_HOME="$EDGE_HOME" "$AGENT" run test --relay "$URL" >"$EDGE_LOG" 2>&1 &
 EDGE_PID=$!
 sleep 3
@@ -60,8 +56,8 @@ AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test exec -- true >/dev/null 2>&1
 check $([ $? -eq 0 ] && echo PASS || echo FAIL) "warmup exec (auto-spawn daemon + dial edge)"
 [ -f "$EDGE_HOME/test/trusted_center" ] && check PASS "TOFU: edge pinned center on first connect" || check FAIL "TOFU pin"
 
-# T1: streaming. Command prints FIRST, waits 2s, prints SECOND. At t=1s FIRST
-# must already be visible (streamed) and SECOND must not be (process still running).
+# At t=1s FIRST must already be visible and SECOND must not be, proving output
+# arrives before process exit.
 AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test exec -- sh -c 'echo FIRST; sleep 2; echo SECOND' >"$OUT" 2>/dev/null &
 CPID=$!
 sleep 1
@@ -69,21 +65,21 @@ if grep -q FIRST "$OUT" && ! grep -q SECOND "$OUT"; then check PASS "streaming: 
 wait "$CPID"
 grep -q SECOND "$OUT" && check PASS "full output received after exit" || check FAIL "missing SECOND"
 
-# T2: exit-code propagation
+# Remote exit codes must remain process exit codes at the CLI boundary.
 AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test exec -- sh -c 'exit 7' >/dev/null 2>&1
 [ $? -eq 7 ] && check PASS "exit code 7 propagated" || check FAIL "exit code propagation"
 
-# T3: stdout/stderr separation
+# The framing contract must not merge stdout and stderr.
 AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test exec -- sh -c 'echo to-out; echo to-err 1>&2' >"$OUT" 2>/dev/null
 grep -q to-out "$OUT" && check PASS "stdout captured" || check FAIL "stdout"
 
-# T4: daemon was auto-spawned and is registered/alive
+# The first command must discover an automatically spawned daemon.
 STATUS=$(AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" daemon --status)
 echo "  $STATUS"
 echo "$STATUS" | grep -qE '^daemon pid=[0-9]+ version=[^ ]+ active=[0-9]+ edges=[0-9]+ endpoint=' \
   && check PASS "daemon auto-spawned and alive" || check FAIL "daemon status"
 
-# T5: iroh-blobs file transfer round-trip (upload then download back)
+# A round trip detects both transfer-direction and content-addressing mistakes.
 SRC=$(mktemp); DL=$(mktemp); REMOTE=$(mktemp -u)
 head -c 4000000 /dev/urandom >"$SRC"
 AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test upload "$SRC" "$REMOTE" >/dev/null 2>&1 \
@@ -94,8 +90,7 @@ AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test download "$REMOTE" "$DL" >/dev/
 cmp -s "$SRC" "$DL" && check PASS "downloaded bytes match" || check FAIL "download content"
 rm -f "$SRC" "$DL" "$REMOTE"
 
-# T6: MCP-proxy transparent pipe. `cat` stands in for an MCP server (echoes
-# stdin->stdout); a line sent in must come back out through the whole chain.
+# `cat` keeps the transparent MCP assertion independent of a third-party server.
 AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test mcp add echo -- cat >/dev/null
 MCP_OUT=$(printf 'mcp-ping\n' | timeout 20 env AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test mcp run echo 2>/dev/null | head -1)
 [ "$MCP_OUT" = "mcp-ping" ] && check PASS "mcp-proxy round-trip (via cat)" || check FAIL "mcp-proxy (got '$MCP_OUT')"
@@ -110,8 +105,7 @@ AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test mcp sync \
   && grep -q 'test__echo' "$PROJECT/.agent-scale/mcp-sync.json"; } \
   && check PASS "project-level Claude/Codex mcp sync" || check FAIL "mcp project sync"
 
-# T7: MCP-proxy HTTP (Streamable). A tiny Python echo server stands in for an
-# HTTP-transport MCP server (like x64dbg's); a JSON-RPC POST must round-trip.
+# A tiny echo server keeps the Streamable HTTP assertion self-contained.
 if command -v python3 >/dev/null; then
   PYSRV=$(mktemp --suffix=.py)
   cat >"$PYSRV" <<'PY'
@@ -158,8 +152,7 @@ PY
     && check PASS "mcp-proxy http/streamable server-initiated (GET-SSE)" || check FAIL "mcp-proxy GET-SSE (got '$HTTP_OUT')"
   kill "$PYPID" 2>/dev/null; PYPID=""
 
-  # T8: MCP-proxy legacy HTTP+SSE. GET sse advertises a POST endpoint; the
-  # response comes back asynchronously on the SSE stream.
+  # Legacy HTTP+SSE must accept responses arriving asynchronously on the GET stream.
   PYSSE=$(mktemp --suffix=.py)
   cat >"$PYSSE" <<'PY'
 import http.server, json, queue
@@ -197,12 +190,12 @@ else
   echo "  (skipped http mcp test: no python3)"
 fi
 
-# T9: idle-shutdown must not kill in-flight work. Spawn a fresh daemon with a 2s
-# idle timeout and run a 5s exec — it must survive (the old bug killed it at 2s).
+# A shorter idle timeout than command duration catches shutdown that ignores
+# in-flight work.
 AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" daemon --stop >/dev/null 2>&1
 IDLE_OUT=$(AGENT_SCALE_IDLE_SECS=2 AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test exec -- sh -c 'sleep 5; echo survived' 2>/dev/null)
 [ "$IDLE_OUT" = "survived" ] && check PASS "idle timer doesn't kill in-flight exec" || check FAIL "idle killed exec (got '$IDLE_OUT')"
-# ...and once the work is done, it should actually idle out (registry removed).
+# Registry removal proves the same timeout still applies after work completes.
 sleep 4
 STATUS9=$(AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" daemon --status)
 echo "$STATUS9" | grep -qE "no daemon|alive=false" && check PASS "daemon idles out once work is done" || check FAIL "daemon didn't idle out ($STATUS9)"

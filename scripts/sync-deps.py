@@ -22,9 +22,10 @@ import sys
 import tomllib
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent  # repo root (scripts/ -> ..)
+ROOT = Path(__file__).resolve().parent.parent
 
-# Dependencies to drop entirely (feature-gated, feature not enabled in wrapper).
+# These optional dependencies would add unused code because the wrappers do not
+# enable their owning features.
 # rg KEEPS tikv-jemallocator: its `#[global_allocator]` is active on musl
 # (cfg matches the dependency's cfg), so the crate must be linked there.
 # fd drops it: fd's allocator block is gated on the `use-jemalloc` feature,
@@ -65,7 +66,8 @@ def render_dep(name, spec):
         parts.append("default-features = false")
     if "features" in spec:
         parts.append(f"features = {fmt_features(spec['features'])}")
-    # `path` and `optional` are intentionally dropped.
+    # Wrapper manifests must resolve independently of the upstream workspace;
+    # optional dependencies were already filtered by the owning feature.
     return f'{name} = {{ {", ".join(parts)} }}'
 
 
@@ -111,7 +113,6 @@ def generate(key, check):
     ]
     out += render_deps(manifest.get("dependencies", {}), drop)
 
-    # Per-target dependency tables (e.g. cfg(unix)).
     for tname, tbody in manifest.get("target", {}).items():
         tdeps = tbody.get("dependencies", {})
         if not tdeps:

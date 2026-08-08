@@ -1,4 +1,5 @@
-//! Current-user service installation for the edge runtime.
+//! Uses current-user service managers so installing an Edge never requires
+//! Administrator, root, or machine-wide credentials.
 
 use anyhow::Result;
 

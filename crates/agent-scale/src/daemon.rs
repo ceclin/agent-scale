@@ -1,7 +1,5 @@
-//! The center daemon: one warm iroh endpoint multiplexing all edges, a private
-//! local byte stream for clients, a verbatim frame relay for exec, and iroh-blobs file
-//! transfer. Gradle-style: auto-spawned, registry-advertised, long idle,
-//! version-guarded.
+//! A background process owns warm network state so individual CLI invocations
+//! stay fast and do not each create an iroh endpoint.
 
 mod connection_pool;
 
@@ -157,7 +155,6 @@ pub async fn run() -> Result<()> {
         known_relays,
     };
 
-    // Accept loop: serve blobs to known edges (upload direction).
     spawn_blobs_acceptor(endpoint.clone(), edges.clone(), store.clone());
     if controlled {
         spawn_control_watcher(ctx.clone());
@@ -288,8 +285,6 @@ async fn reload_edges(ctx: &Ctx) {
         }
     }
     let new: HashMap<String, EdgeCfg> = cfg.edges.into_iter().map(|e| (e.name.clone(), e)).collect();
-    // Evict cached connections for edges that are gone or now point at a
-    // different id; keep the rest warm.
     let n = new.len();
     {
         // Keep the policy swap and cache eviction in one critical section.
@@ -458,8 +453,6 @@ async fn relay_mcp_control(
     io_wire::write_frame(&mut cw, T_RESULT, &payload).await
 }
 
-/// Transparent bidirectional MCP pipe: relay T_DATA frames between the client
-/// (local IPC) and the edge's spawned MCP server (iroh).
 async fn relay_mcp(
     ctx: &Ctx,
     edge: &EdgeCfg,
@@ -569,9 +562,7 @@ async fn relay_exec(
     Ok(())
 }
 
-/// Pull a remote file from the edge into a local path. Returns bytes written.
 async fn do_download(ctx: &Ctx, edge: &EdgeCfg, remote: &str, local: &str) -> Result<u64> {
-    // 1. Ask the edge to stage the file and report its hash.
     let conn = get_conn(ctx, edge).await?;
     let (mut es, mut er) = conn.open_bi().await.map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
     let req = EdgeReq::PrepareDownload {
@@ -586,13 +577,11 @@ async fn do_download(ctx: &Ctx, edge: &EdgeCfg, remote: &str, local: &str) -> Re
     };
     let hash: iroh_blobs::Hash = hash.parse().map_err(|e| anyhow::anyhow!("bad hash: {e}"))?;
 
-    // 2. Stream the blob from the edge straight to the local file (bounded mem).
     let n = scale_transport::blobs::fetch_to_file(&ctx.endpoint, edge_addr(edge)?, hash, local).await?;
     let _ = es.finish(); // tell the edge it can GC the staged blob
     Ok(n)
 }
 
-/// Push a local file to a remote path on the edge. Returns bytes written.
 async fn do_upload(ctx: &Ctx, edge: &EdgeCfg, local: &str, remote: &str) -> Result<u64> {
     let abs = std::path::absolute(local).with_context(|| format!("resolve {local}"))?;
     anyhow::ensure!(abs.is_file(), "no such file: {local}");
@@ -600,7 +589,6 @@ async fn do_upload(ctx: &Ctx, edge: &EdgeCfg, local: &str, remote: &str) -> Resu
     let tt = ctx.store.blobs().add_path(abs).temp_tag().await.context("add_path")?;
     let hash = tt.hash().to_string();
 
-    // The edge fetches from us on the same relay it already uses.
     let conn = get_conn(ctx, edge).await?;
     let (mut es, mut er) = conn.open_bi().await.map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
     let req = EdgeReq::ReceiveUpload {

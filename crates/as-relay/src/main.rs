@@ -1,4 +1,5 @@
-//! Private iroh relay with a center-managed dynamic EndpointId allowlist.
+//! Pulls complete Control-signed membership so the public Relay API never needs
+//! a remote mutation endpoint.
 
 use std::{
     collections::HashSet,

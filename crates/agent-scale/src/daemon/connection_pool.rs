@@ -1,4 +1,5 @@
-//! Warm edge connections with per-edge dial singleflight and revocation checks.
+//! Singleflight prevents concurrent CLI requests from multiplying expensive
+//! edge dials, while publication under policy locks closes revocation races.
 
 use std::sync::Arc;
 

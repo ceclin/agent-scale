@@ -25,7 +25,7 @@ fn main() {
     let mut in_block_doc = false;
 
     for line in src.lines() {
-        // Strip /*! ... */ inner doc comments
+        // Upstream inner docs are invalid once main.rs is included as a module.
         if !in_block_doc && line.starts_with("/*!") {
             in_block_doc = true;
             continue;
@@ -36,7 +36,6 @@ fn main() {
             }
             continue;
         }
-        // Strip //! inner doc comments
         if line.starts_with("//!") {
             continue;
         }

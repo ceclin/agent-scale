@@ -73,7 +73,7 @@ until output=$(AGENT_SCALE_HOME="$CENTER_HOME" AGENT_SCALE_DIAL_SECS=2 \
     sleep 0.1
 done
 
-# Restart from the last verified snapshot while Control is unavailable.
+# Control downtime must not prevent a Relay restart from its last verified snapshot.
 kill "$control_pid"; wait "$control_pid" >/dev/null 2>&1 || true; control_pid=
 kill "$relay_pid"; wait "$relay_pid" >/dev/null 2>&1 || true; relay_pid=
 "$BIN/as-relay" run --relay-bind 127.0.0.1:35340 --admin-bind 127.0.0.1:35341 \
@@ -96,7 +96,7 @@ until curl -fsS "$CONTROL_URL/healthz" >/dev/null 2>&1; do
     sleep 0.05
 done
 
-# An enrolled Relay may explicitly report a changed public QAD port.
+# A signed port report must update Control without replacing the Relay identity.
 kill "$relay_pid"; wait "$relay_pid" >/dev/null 2>&1 || true; relay_pid=
 "$BIN/as-relay" run --relay-bind 127.0.0.1:35340 --admin-bind 127.0.0.1:35341 \
     --qad-bind "127.0.0.1:$UPDATED_RELAY_QAD_PORT" \

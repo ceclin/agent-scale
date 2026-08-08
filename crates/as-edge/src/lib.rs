@@ -1,5 +1,5 @@
-//! Edge-agent library: command execution + the iroh edge transport and MCP
-//! bridge used by the `as-edge` binary.
+//! Exposes the agent runtime separately from CLI dispatch so built-ins can
+//! re-exec the same binary without coupling to argument parsing.
 
 pub mod exec;
 pub mod iroh_edge;

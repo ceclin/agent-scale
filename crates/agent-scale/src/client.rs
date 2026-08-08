@@ -1,5 +1,4 @@
-//! Thin client: find-or-spawn the daemon, send one exec, stream output live to
-//! our own stdout/stderr, exit with the remote exit code.
+//! Keeps CLI processes disposable while the daemon retains warm network state.
 
 use std::time::Duration;
 
@@ -133,8 +132,8 @@ pub async fn mcp_run(edge: String, name: String) -> Result<()> {
     loop {
         tokio::select! {
             n = stdin.read(&mut buf), if stdin_open => match n {
-                // Claude Code closed stdin: half-close to the daemon but keep
-                // reading responses until the server side closes.
+                // EOF is only half of an MCP session; the server may still have
+                // final responses to deliver.
                 Ok(0) | Err(_) => { let _ = w.shutdown().await; stdin_open = false; }
                 Ok(n) => io_wire::write_frame(&mut w, T_DATA, &buf[..n]).await?,
             },

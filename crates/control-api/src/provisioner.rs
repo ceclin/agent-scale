@@ -1,4 +1,5 @@
-//! Signed requests used by external topology reconcilers.
+//! Keeps scheduler-specific reconciliation outside Control while binding every
+//! mutation to a Provisioner identity and idempotency key.
 
 use anyhow::{Context, Result};
 use iroh_base::{EndpointId, SecretKey, Signature};

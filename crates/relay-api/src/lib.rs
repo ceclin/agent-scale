@@ -1,4 +1,5 @@
-//! Signed desired-state protocol between `agent-scale` and `as-relay`.
+//! Canonical Control-to-Relay desired state; complete snapshots make offline
+//! verification and revocation ordering explicit.
 
 use anyhow::{Context, Result};
 use iroh_base::{EndpointId, SecretKey, Signature};

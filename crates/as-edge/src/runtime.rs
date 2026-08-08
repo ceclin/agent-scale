@@ -1,4 +1,5 @@
-//! Child-process lifecycle for remote exec and stdio MCP sessions.
+//! Centralizes cancellation so closing a transport stream reliably terminates
+//! its remote child on every supported platform.
 
 use std::process::Stdio;
 

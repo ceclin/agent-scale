@@ -1,7 +1,5 @@
-//! Edge-side bridge between an HTTP-transport MCP server (Streamable HTTP or
-//! legacy HTTP+SSE) and the newline-delimited JSON-RPC byte stream carried over
-//! the iroh connection (as `T_DATA` frames). The center/daemon stay dumb pipes;
-//! Claude Code sees an ordinary stdio MCP server.
+//! Normalizes edge-local HTTP transports here so the Center remains a blind
+//! byte pipe and MCP clients need only one stdio-facing integration.
 
 use anyhow::{Context, Result};
 use eventsource_stream::Eventsource;
@@ -33,8 +31,6 @@ pub async fn bridge(mut send: SendStream, recv: RecvStream, url: String, kind: K
         .build()
         .context("build http client")?;
     iroh_wire::write_frame(&mut send, T_RESULT, &serde_json::to_vec(&RpcResult::Ok(()))?).await?;
-    // Server -> client messages funnel through this channel to the writer task,
-    // which frames each line onto the iroh stream.
     let (raw_tx, mut rx) = mpsc::channel::<Output>(OUTPUT_QUEUE_ITEMS);
     let tx = OutputSender {
         tx: raw_tx,
@@ -60,7 +56,6 @@ pub async fn bridge(mut send: SendStream, recv: RecvStream, url: String, kind: K
     if let Err(error) = &res {
         let _ = tx.push_error(format!("MCP HTTP bridge: {error:#}")).await;
     }
-    // tx (and any clones held by reader tasks) are dropped by now -> writer ends.
     let _ = writer.await;
     res
 }
@@ -71,7 +66,7 @@ async fn read_message(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<Option
     loop {
         if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let mut line: Vec<u8> = buf.drain(..=pos).collect();
-            line.pop(); // drop '\n'
+            line.pop();
             if line.last() == Some(&b'\r') {
                 line.pop();
             }
@@ -167,8 +162,8 @@ async fn read_bounded_body(response: reqwest::Response) -> Result<Vec<u8>> {
 async fn streamable(client: &reqwest::Client, url: &str, mut recv: RecvStream, tx: OutputSender) -> Result<()> {
     let endpoint = reqwest::Url::parse(url).context("parse mcp url")?;
     let mut session: Option<String> = None;
-    // Standalone GET-SSE stream for server-initiated messages (started once,
-    // after the first POST so the session id — if any — is known).
+    // Delay GET-SSE until a POST can establish the session id required by some
+    // servers; opening it earlier silently loses server-initiated messages.
     let mut sse_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut buf = Vec::new();
 
@@ -222,7 +217,7 @@ async fn streamable(client: &reqwest::Client, url: &str, mut recv: RecvStream, t
         } else {
             match read_bounded_body(resp).await {
                 Ok(body) if !body.is_empty() => tx.push_line(String::from_utf8_lossy(&body).into_owned()).await?,
-                Ok(_) => {} // 202 Accepted, no body (e.g. a notification)
+                Ok(_) => {}
                 Err(e) => {
                     let _ = tx.push_error(format!("MCP response body error: {e}")).await;
                     warn!("mcp body error: {e}");
@@ -236,8 +231,8 @@ async fn streamable(client: &reqwest::Client, url: &str, mut recv: RecvStream, t
     Ok(())
 }
 
-/// Open the standalone server->client SSE stream (Streamable HTTP GET). Tolerates
-/// servers that don't support it (e.g. 405). Each event is relayed to the client.
+/// Call only after the first POST establishes any MCP session id. Servers that
+/// reject the optional GET channel are intentionally tolerated.
 fn spawn_get_sse(
     client: reqwest::Client,
     endpoint: reqwest::Url,
@@ -283,8 +278,6 @@ async fn legacy_sse(client: &reqwest::Client, url: &str, mut recv: RecvStream, t
         .await
         .context("open sse stream")?;
 
-    // The SSE reader announces the POST endpoint (the `endpoint` event) and
-    // relays every other event's data back to the client.
     let (ep_tx, ep_rx) = tokio::sync::oneshot::channel::<reqwest::Url>();
     let reader_tx = tx.clone();
     let reader = tokio::spawn(async move {

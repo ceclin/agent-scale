@@ -1,7 +1,8 @@
 // Copyright 2026 agent-scale contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Repository task runner used by developers and CI.
+//! Gives developers and CI one implementation of release and quality gates so
+//! local verification cannot silently diverge from automation.
 
 use std::ffi::OsStr;
 use std::fs;

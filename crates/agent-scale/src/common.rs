@@ -1,4 +1,5 @@
-//! Shared paths, config, identity, and small process helpers.
+//! Centralizes local state conventions so every Center process resolves the
+//! same identity and IPC namespace.
 
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
@@ -60,7 +61,7 @@ pub fn daemon_lock_path() -> PathBuf {
     daemon_dir().join("instance.lock")
 }
 
-/// The center's persistent identity. Generated on first use.
+/// Use this whenever a caller may initialize the Center identity on demand.
 pub fn load_or_create_key() -> Result<SecretKey> {
     scale_core::load_or_create_secret(&key_path())
 }
@@ -70,7 +71,7 @@ pub struct Config {
     pub schema_version: u32,
     #[serde(default)]
     pub edges: Vec<EdgeCfg>,
-    /// Optional multi-center control enrollment and last verified node map.
+    /// Present only in managed mode; verify its cached signature before use.
     #[serde(default)]
     pub control: Option<ControlCfg>,
 }
@@ -98,9 +99,9 @@ pub struct ControlCfg {
 pub struct EdgeCfg {
     pub name: String,
     pub endpoint_id: String,
-    /// Relay URLs the edge is reachable on (one or more).
+    /// Ordered candidates used when direct discovery is unavailable.
     pub relays: Vec<String>,
-    /// True when identity and relay addresses are sourced from as-control.
+    /// Prevents simple-mode edits from overriding Control-owned state.
     #[serde(default)]
     pub managed: bool,
 }
@@ -167,7 +168,7 @@ fn parse_config(data: &[u8]) -> Result<Config> {
     Ok(config)
 }
 
-/// Daemon registry written by a live daemon; read by clients to find it.
+/// Treat this as discovery metadata only; lifecycle control stays on private IPC.
 #[derive(Serialize, Deserialize)]
 pub struct Registry {
     pub pid: u32,
@@ -175,7 +176,7 @@ pub struct Registry {
     pub version: String,
 }
 
-/// Client -> daemon request: which edge + what operation.
+/// The local IPC request envelope shared by short-lived clients and the daemon.
 #[derive(Serialize, Deserialize)]
 pub struct ClientReq {
     pub edge: String,

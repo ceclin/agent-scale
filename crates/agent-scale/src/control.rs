@@ -1,4 +1,4 @@
-//! as-control enrollment and local verified-map cache.
+//! Keeps Control-signed topology separate from user-edited simple-mode config.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

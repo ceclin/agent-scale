@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run from the workspace root regardless of where invoked (scripts live in scripts/).
+# Relative Cargo and output paths must not depend on the caller's directory.
 cd "$(dirname "$0")/.."
 
 PROFILE="${PROFILE:-release}"

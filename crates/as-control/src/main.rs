@@ -1,4 +1,5 @@
-//! Single-instance coordination server for centers, edges, and private relays.
+//! Serializes authorization changes through one signed revision stream; the
+//! single-instance lock keeps SQLite state and in-memory snapshots coherent.
 
 mod db;
 

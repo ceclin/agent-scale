@@ -1,5 +1,5 @@
-//! agent-scale: the center CLI. Thin client + auto-spawned daemon, talking to
-//! test machines (edges) over iroh. See the per-module docs.
+//! The CLI remains a thin frontend so command lifetimes do not own network
+//! connections or remote execution state.
 
 mod client;
 mod common;

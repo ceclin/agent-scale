@@ -110,9 +110,8 @@ struct RunArgs {
 }
 
 fn main() -> std::process::ExitCode {
-    // Built-in dispatch: the edge sets AS_EDGE_BUILTIN when re-execing for fd/rg
-    // (portable, no argv[0] tricks); a matching argv[0] — installed/symlinked as
-    // `fd` or `rg` — also works as a fallback.
+    // The environment marker is portable; argv[0] support preserves normal
+    // multicall usage for users who install fd/rg links themselves.
     let arg0 = std::env::args().next().unwrap_or_default();
     let basename = Path::new(&arg0)
         .file_stem()
@@ -406,8 +405,6 @@ async fn run_iroh_edge(args: &RunArgs) -> Result<()> {
         )
     };
 
-    // --center => strict pinning; otherwise trust-on-first-use, remembered
-    // alongside the key file.
     let pin = if let Some(profile) = &profile {
         verify_profile(profile, key.public())?;
         let allowed = profile

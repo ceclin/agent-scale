@@ -1,4 +1,5 @@
-//! Security-sensitive local identity and durable-state primitives.
+//! Concentrates file-permission and durability invariants so callers cannot
+//! accidentally create weaker identity or state files.
 
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};

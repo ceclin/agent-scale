@@ -1,6 +1,4 @@
-//! Wire types shared between the center (`agent-scale`) and the edge
-//! (`as-edge`): the per-stream request (`EdgeReq`), the file-transfer control
-//! responses (`RpcResult`), and the exec params (`ExecParams`).
+//! A shared schema keeps Center and Edge framing changes compile-time coupled.
 
 use std::collections::BTreeMap;
 

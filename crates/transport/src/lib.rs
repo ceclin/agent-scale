@@ -1,8 +1,7 @@
-//! Shared iroh transport for agent-scale: endpoint construction + a tiny
-//! length-prefixed frame protocol used on both the iroh bi-streams (center
-//! <-> edge) and local IPC (client <-> daemon).
+//! Reusing one framing contract across local IPC and iroh keeps the daemon a
+//! byte-forwarder instead of a second protocol translation layer.
 //!
-//! Frame = `[tag: u8][len: u32 LE][payload: len bytes]`.
+//! Use `[tag: u8][len: u32 LE][payload: len bytes]` on both transports.
 //!   START  payload = JSON (ExecParams on the iroh side; {edge, params} on the
 //!          unix side)
 //!   STDOUT payload = raw stdout bytes

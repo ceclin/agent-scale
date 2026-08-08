@@ -1,8 +1,5 @@
-//! Edge-side iroh transport: accept connections from the trusted center and
-//! serve, on two ALPNs:
-//!   - `scale_transport::ALPN` — streaming `exec` and file-transfer control
-//!     (PrepareDownload / ReceiveUpload), one request per QUIC bi-stream
-//!   - `iroh_blobs::ALPN` — serve blobs from the local store (download path)
+//! Separate ALPNs keep authorization and lifecycle control in the RPC protocol
+//! while allowing iroh-blobs to retain its native verified transfer protocol.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -143,7 +140,6 @@ impl CenterPin {
     }
 }
 
-/// Accept loop. `store` backs both the blobs provider and the download path.
 pub async fn serve(endpoint: Endpoint, pin: CenterPin, store: FsStore, mcp_registry: RegistryStore) -> Result<()> {
     info!("edge listening");
     while let Some(incoming) = endpoint.accept().await {
@@ -177,7 +173,6 @@ async fn handle_conn(
     let stable_id = conn.stable_id();
 
     let result = if conn.alpn() == iroh_blobs::ALPN {
-        // Serve blobs the edge has staged (download direction).
         let blobs = BlobsProtocol::new(&store, None);
         blobs
             .accept(conn)
@@ -264,9 +259,8 @@ async fn serve_request(
             }
         }
         EdgeReq::PrepareDownload { path } => {
-            // Stage the file in the disk store with a temp-tag (auto-GC), report
-            // its hash, then hold the tag until the center finishes fetching
-            // (it closes this control stream when done).
+            // The control stream owns the temp tag so disconnecting either peer
+            // cannot leak staged content indefinitely.
             match store.blobs().add_path(PathBuf::from(&path)).temp_tag().await {
                 Ok(tt) => {
                     let resp = RpcResult::Ok(TransferResult::DownloadReady {
