@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
@@ -446,7 +446,7 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
 
 #[cfg(unix)]
 fn sync_dir(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
+    std::fs::File::open(path)?.sync_all()?;
     Ok(())
 }
 
