@@ -63,24 +63,32 @@ deployments.
 
 ### Manual Deployment
 
+Choose one state directory for the service and every local administration
+command:
+
+```sh
+export AS_CONTROL_STATE_DIR=/var/lib/agent-scale-control
+```
+
+When the variable is unset, it defaults to `~/.agent-scale-control`. The
+administration socket is always `$AS_CONTROL_STATE_DIR/admin.sock` and has
+no independent option. This keeps the identity, durable state, instance lock,
+and local administration endpoint in one instance directory.
+
 Initialize the durable identity once:
 
 ```sh
 as-control init \
   --public-url https://control.example.com \
-  --audience prod \
-  --state-dir /var/lib/agent-scale-control
+  --audience prod
 ```
 
 Create the first Center invitation while the service is stopped, then start it:
 
 ```sh
-as-control bootstrap center main \
-  --state-dir /var/lib/agent-scale-control
+as-control bootstrap center main
 
-as-control --admin-socket /run/agent-scale-control/admin.sock run \
-  --bind 127.0.0.1:3350 \
-  --state-dir /var/lib/agent-scale-control
+as-control run --bind 127.0.0.1:3350
 ```
 
 Put TLS in front of port 3350. Plain HTTP is accepted only for loopback URLs.

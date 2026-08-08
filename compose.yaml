@@ -9,6 +9,7 @@ x-environment: &environment
   CONTROL_AUDIENCE: ${CONTROL_AUDIENCE:-agent-scale-local}
   CONTROL_CENTER_NAME: ${CONTROL_CENTER_NAME:-main}
   CONTROL_CENTER_TTL_SECS: ${CONTROL_CENTER_TTL_SECS:-604800}
+  AS_CONTROL_STATE_DIR: /control
   RELAY_NAME: ${RELAY_NAME:-relay-a}
   RELAY_PUBLIC_URL: ${RELAY_PUBLIC_URL:-http://localhost:3340}
   RELAY_INVITE_TTL_SECS: ${RELAY_INVITE_TTL_SECS:-900}
@@ -26,9 +27,8 @@ services:
 
   control:
     <<: *image
-    command: as-control run --bind 0.0.0.0:3350 --state-dir /control
-    environment:
-      AGENT_SCALE_CONTROL_ADMIN_SOCKET: /run/agent-scale-control/admin.sock
+    command: as-control run --bind 0.0.0.0:3350
+    environment: *environment
     depends_on:
       bootstrap:
         condition: service_completed_successfully

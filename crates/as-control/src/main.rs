@@ -39,11 +39,13 @@ const CLOCK_SKEW_SECS: i64 = 300;
 const DEFAULT_TTL_SECS: u64 = 15 * 60;
 
 #[derive(Parser)]
-#[command(name = "as-control", about = "agent-scale multi-center control plane")]
+#[command(
+    name = "as-control",
+    about = "agent-scale multi-center control plane",
+    after_help = "AS_CONTROL_STATE_DIR defaults to ~/.agent-scale-control; the administration \
+                  socket is always $AS_CONTROL_STATE_DIR/admin.sock."
+)]
 struct Cli {
-    /// Local administration socket. It is never exposed over HTTP.
-    #[arg(long, global = true, env = "AGENT_SCALE_CONTROL_ADMIN_SOCKET")]
-    admin_socket: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -56,8 +58,6 @@ enum Command {
         public_url: String,
         #[arg(long)]
         audience: String,
-        #[arg(long)]
-        state_dir: Option<PathBuf>,
     },
     /// Create initial invitations before the first server start.
     Bootstrap {
@@ -68,8 +68,6 @@ enum Command {
     Run {
         #[arg(long, default_value = "127.0.0.1:3350")]
         bind: SocketAddr,
-        #[arg(long)]
-        state_dir: Option<PathBuf>,
     },
     /// Show all registered nodes and the current revision.
     Status,
@@ -106,8 +104,6 @@ enum BootstrapCommand {
         name: String,
         #[arg(long, default_value_t = DEFAULT_TTL_SECS)]
         ttl_secs: u64,
-        #[arg(long)]
-        state_dir: Option<PathBuf>,
     },
     /// Create the initial relay invitation. The server must be stopped.
     Relay {
@@ -115,8 +111,6 @@ enum BootstrapCommand {
         url: String,
         #[arg(long, default_value_t = DEFAULT_TTL_SECS)]
         ttl_secs: u64,
-        #[arg(long)]
-        state_dir: Option<PathBuf>,
     },
 }
 
@@ -345,27 +339,15 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    let admin_socket = cli.admin_socket.unwrap_or_else(default_admin_socket);
+    let state_dir = control_state_dir();
+    let admin_socket = state_dir.join("admin.sock");
     match cli.command {
-        Command::Init {
-            public_url,
-            audience,
-            state_dir,
-        } => init(state_dir, public_url, audience),
+        Command::Init { public_url, audience } => init(state_dir, public_url, audience),
         Command::Bootstrap { command } => match command {
-            BootstrapCommand::Center {
-                name,
-                ttl_secs,
-                state_dir,
-            } => bootstrap_center(state_dir, name, ttl_secs),
-            BootstrapCommand::Relay {
-                name,
-                url,
-                ttl_secs,
-                state_dir,
-            } => bootstrap_relay(state_dir, name, url, ttl_secs),
+            BootstrapCommand::Center { name, ttl_secs } => bootstrap_center(state_dir, name, ttl_secs),
+            BootstrapCommand::Relay { name, url, ttl_secs } => bootstrap_relay(state_dir, name, url, ttl_secs),
         },
-        Command::Run { bind, state_dir } => run(state_dir, bind, admin_socket).await,
+        Command::Run { bind } => run(state_dir, bind, admin_socket).await,
         Command::Status => print_admin_response(admin_call(&admin_socket, LocalAdminRequest::Overview).await?),
         Command::Center { command } => {
             let request = match command {
@@ -414,19 +396,14 @@ async fn main() -> Result<()> {
     }
 }
 
-fn default_state_dir() -> PathBuf {
-    std::env::var_os("AGENT_SCALE_CONTROL_HOME")
+fn control_state_dir() -> PathBuf {
+    std::env::var_os("AS_CONTROL_STATE_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::home_dir().map(|home| home.join(".agent-scale-control")))
         .unwrap_or_else(|| PathBuf::from(".agent-scale-control"))
 }
 
-fn default_admin_socket() -> PathBuf {
-    default_state_dir().join("admin.sock")
-}
-
-fn init(state_dir: Option<PathBuf>, public_url: String, audience: String) -> Result<()> {
-    let dir = state_dir.unwrap_or_else(default_state_dir);
+fn init(dir: PathBuf, public_url: String, audience: String) -> Result<()> {
     anyhow::ensure!(!audience.trim().is_empty(), "--audience must not be empty");
     let public_url = normalize_public_url(&public_url)?;
     scale_core::ensure_private_dir(&dir)?;
@@ -448,13 +425,12 @@ fn init(state_dir: Option<PathBuf>, public_url: String, audience: String) -> Res
     };
     persist_state(&dir, &state)?;
     println!("initialized control {}", key.public());
-    println!("next: as-control bootstrap center <name> --state-dir {}", dir.display());
+    println!("next: as-control bootstrap center <name>");
     Ok(())
 }
 
-fn bootstrap_center(state_dir: Option<PathBuf>, name: String, ttl_secs: u64) -> Result<()> {
+fn bootstrap_center(dir: PathBuf, name: String, ttl_secs: u64) -> Result<()> {
     validate_name(&name)?;
-    let dir = state_dir.unwrap_or_else(default_state_dir);
     let (_lock, key, mut state) = open_exclusive(&dir)?;
     anyhow::ensure!(
         state.centers.is_empty(),
@@ -469,10 +445,9 @@ fn bootstrap_center(state_dir: Option<PathBuf>, name: String, ttl_secs: u64) -> 
     Ok(())
 }
 
-fn bootstrap_relay(state_dir: Option<PathBuf>, name: String, url: String, ttl_secs: u64) -> Result<()> {
+fn bootstrap_relay(dir: PathBuf, name: String, url: String, ttl_secs: u64) -> Result<()> {
     validate_name(&name)?;
     let url = normalize_relay_url(&url)?;
-    let dir = state_dir.unwrap_or_else(default_state_dir);
     let (_lock, key, mut state) = open_exclusive(&dir)?;
     anyhow::ensure!(
         state.relays.is_empty(),
@@ -487,8 +462,7 @@ fn bootstrap_relay(state_dir: Option<PathBuf>, name: String, url: String, ttl_se
     Ok(())
 }
 
-async fn run(state_dir: Option<PathBuf>, bind: SocketAddr, admin_socket: PathBuf) -> Result<()> {
-    let dir = state_dir.unwrap_or_else(default_state_dir);
+async fn run(dir: PathBuf, bind: SocketAddr, admin_socket: PathBuf) -> Result<()> {
     let (lock, key, state) = open_exclusive(&dir)?;
     anyhow::ensure!(
         state.schema == STATE_SCHEMA,
@@ -1825,10 +1799,16 @@ mod tests {
     }
 
     #[test]
+    fn state_directory_and_admin_socket_are_not_cli_options() {
+        assert!(Cli::try_parse_from(["as-control", "--admin-socket", "/tmp/admin.sock", "status"]).is_err());
+        assert!(Cli::try_parse_from(["as-control", "--state-dir", "/tmp/control", "status"]).is_err());
+    }
+
+    #[test]
     fn bootstrap_is_single_center_and_persistent() {
         let dir = tempfile::tempdir().unwrap();
-        init(Some(dir.path().into()), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
-        bootstrap_center(Some(dir.path().into()), "main".into(), 900).unwrap();
+        init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
+        bootstrap_center(dir.path().into(), "main".into(), 900).unwrap();
         let (_, key, state) = open_exclusive(dir.path()).unwrap();
         assert_eq!(state.invites.len(), 1);
         assert_eq!(state.invites[0].invite.control_id, key.public().to_string());
@@ -1838,21 +1818,9 @@ mod tests {
     #[test]
     fn bootstrap_relay_is_signed_and_replaces_pending_invite() {
         let dir = tempfile::tempdir().unwrap();
-        init(Some(dir.path().into()), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
-        bootstrap_relay(
-            Some(dir.path().into()),
-            "relay-a".into(),
-            "http://localhost:3340".into(),
-            900,
-        )
-        .unwrap();
-        bootstrap_relay(
-            Some(dir.path().into()),
-            "relay-a".into(),
-            "http://localhost:3340".into(),
-            900,
-        )
-        .unwrap();
+        init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
+        bootstrap_relay(dir.path().into(), "relay-a".into(), "http://localhost:3340".into(), 900).unwrap();
+        bootstrap_relay(dir.path().into(), "relay-a".into(), "http://localhost:3340".into(), 900).unwrap();
         let (_, key, state) = open_exclusive(dir.path()).unwrap();
         assert_eq!(state.invites.len(), 1);
         assert_eq!(state.invites[0].invite.control_id, key.public().to_string());
@@ -1867,10 +1835,10 @@ mod tests {
     #[test]
     fn bootstrap_relay_validates_input() {
         let dir = tempfile::tempdir().unwrap();
-        init(Some(dir.path().into()), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
+        init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
         assert!(
             bootstrap_relay(
-                Some(dir.path().into()),
+                dir.path().into(),
                 "bad name".into(),
                 "https://relay.example.com".into(),
                 900,
@@ -1879,7 +1847,7 @@ mod tests {
         );
         assert!(
             bootstrap_relay(
-                Some(dir.path().into()),
+                dir.path().into(),
                 "relay-a".into(),
                 "http://relay.example.com".into(),
                 900,
@@ -1888,7 +1856,7 @@ mod tests {
         );
         assert!(
             bootstrap_relay(
-                Some(dir.path().into()),
+                dir.path().into(),
                 "relay-a".into(),
                 "https://relay.example.com".into(),
                 0,
@@ -1969,7 +1937,7 @@ mod tests {
     #[tokio::test]
     async fn center_edge_invites_are_self_owned_and_replay_protected() {
         let dir = tempfile::tempdir().unwrap();
-        init(Some(dir.path().into()), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
+        init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
         let (lock, control_key, mut state) = open_exclusive(dir.path()).unwrap();
         let center = SecretKey::generate();
         state.centers.push(CenterRecord {
@@ -2032,7 +2000,7 @@ mod tests {
     #[tokio::test]
     async fn provisioner_requests_are_scoped_authenticated_and_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        init(Some(dir.path().into()), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
+        init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
         let (lock, control_key, mut state) = open_exclusive(dir.path()).unwrap();
         let provisioner = SecretKey::generate();
         let other_provisioner = SecretKey::generate();
@@ -2164,7 +2132,7 @@ mod tests {
     #[tokio::test]
     async fn provisioner_enrollment_persists_center_edge_grouping() {
         let dir = tempfile::tempdir().unwrap();
-        init(Some(dir.path().into()), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
+        init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
         let (lock, control_key, mut state) = open_exclusive(dir.path()).unwrap();
         let provisioner = SecretKey::generate();
         state.provisioners.push(ProvisionerRecord {

@@ -21,17 +21,18 @@ cargo build -q -p as-control -p as-relay -p as-edge -p agent-scale
 control_port=34350
 relay_port=34340
 relay_admin_port=34341
-admin_socket="$work/control-admin.sock"
+admin_socket="$work/control/admin.sock"
 control_url="http://127.0.0.1:$control_port"
 relay_url="http://127.0.0.1:$relay_port"
+export AS_CONTROL_STATE_DIR="$work/control"
+control=(target/debug/as-control)
 
-target/debug/as-control init \
+"${control[@]}" init \
   --public-url "$control_url" \
-  --audience e2e \
-  --state-dir "$work/control" >/dev/null
-center_a_url=$(target/debug/as-control bootstrap center center-a --state-dir "$work/control")
-target/debug/as-control --admin-socket "$admin_socket" run \
-  --bind "127.0.0.1:$control_port" --state-dir "$work/control" \
+  --audience e2e >/dev/null
+center_a_url=$("${control[@]}" bootstrap center center-a)
+"${control[@]}" run \
+  --bind "127.0.0.1:$control_port" \
   >"$work/control.log" 2>&1 &
 control_pid=$!
 
@@ -41,7 +42,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 
 AGENT_SCALE_HOME="$work/center-a" target/debug/agent-scale control join "$center_a_url" >/dev/null
-relay_join=$(target/debug/as-control --admin-socket "$admin_socket" relay invite relay-a "$relay_url")
+relay_join=$("${control[@]}" relay invite relay-a "$relay_url")
 target/debug/as-relay join "$relay_join" --state-dir "$work/relay" >/dev/null
 target/debug/as-relay run \
   --relay-bind "127.0.0.1:$relay_port" \
@@ -64,9 +65,9 @@ done
 [[ "${output:-}" == "first-center" ]]
 AGENT_SCALE_HOME="$work/center-a" target/debug/agent-scale -e box mcp add echo -- cat
 
-center_b_join=$(target/debug/as-control --admin-socket "$admin_socket" center invite center-b)
+center_b_join=$("${control[@]}" center invite center-b)
 AGENT_SCALE_HOME="$work/center-b" target/debug/agent-scale control join "$center_b_join" >/dev/null
-target/debug/as-control --admin-socket "$admin_socket" edge transfer center-a/box center-b
+"${control[@]}" edge transfer center-a/box center-b
 
 output=$(AGENT_SCALE_HOME="$work/center-b" target/debug/agent-scale -e box exec -- sh -c 'printf transferred')
 [[ "$output" == "transferred" ]]
@@ -84,6 +85,6 @@ members=$(curl -fsS "http://127.0.0.1:$relay_admin_port/v1/status")
 status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$control_url/v1/admin/overview")
 [[ "$status" == "404" ]]
 [[ "$(stat -c '%a' "$admin_socket")" == "600" ]]
-target/debug/as-control --admin-socket "$admin_socket" status | grep -q '^centers:  2$'
+"${control[@]}" status | grep -q '^centers:  2$'
 
 echo "local-admin multi-center control e2e passed"
