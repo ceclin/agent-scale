@@ -1,7 +1,7 @@
 //! `agent-scale edge add/ls/rm` — manage the edge registry in config.json.
 
 use crate::common::{self, EdgeCfg};
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 /// Add a new edge, or update an existing one with the same name.
 pub async fn add(name: String, endpoint_id: String, relays: Vec<String>) -> Result<()> {
@@ -18,9 +18,7 @@ pub async fn add(name: String, endpoint_id: String, relays: Vec<String>) -> Resu
         cfg.control.is_none(),
         "manual edges cannot be changed in a control-managed profile"
     );
-    let mut affected_relays = relays.clone();
     let action = if let Some(existing) = cfg.edges.iter_mut().find(|e| e.name == name) {
-        affected_relays.extend(existing.relays.iter().cloned());
         existing.endpoint_id = endpoint_id;
         existing.relays = relays;
         "updated"
@@ -33,9 +31,6 @@ pub async fn add(name: String, endpoint_id: String, relays: Vec<String>) -> Resu
         });
         "added"
     };
-    // Reconcile before committing locally so revocation cannot look complete
-    // while an affected private relay still authorizes the old identity.
-    crate::relay::sync_urls(&cfg, &affected_relays).await?;
     cfg.commit()?;
     println!("{action} edge '{name}'");
     if using_official_relays {
@@ -72,16 +67,10 @@ pub async fn rm(name: String) -> Result<()> {
             edge.name
         );
     }
-    let affected_relays = cfg
-        .edges
-        .iter()
-        .find(|e| e.name == name)
-        .map(|e| e.relays.clone())
-        .with_context(|| format!("no edge named '{name}'"))?;
+    anyhow::ensure!(cfg.edges.iter().any(|e| e.name == name), "no edge named '{name}'");
     let before = cfg.edges.len();
     cfg.edges.retain(|e| e.name != name);
     debug_assert!(cfg.edges.len() < before);
-    crate::relay::sync_urls(&cfg, &affected_relays).await?;
     cfg.commit()?;
     println!("removed edge '{name}'");
     refresh_daemon().await?;

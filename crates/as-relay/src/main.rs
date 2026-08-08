@@ -15,13 +15,13 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::get,
 };
 use clap::{Parser, Subcommand};
 use control_api::{ClaimRequest, InviteKind, JoinResult, JoinToken, WatchRequest};
 use iroh_base::{EndpointId, SecretKey};
 use iroh_relay::server::{Access, AccessControl, ClientRequest, RelayConfig, Server, ServerConfig, clients::Clients};
-use relay_api::{MembershipSnapshot, RELAY_PROTOCOL_VERSION, RelayMember, RelayStatus, SignedSnapshot};
+use relay_api::{MembershipSnapshot, RELAY_PROTOCOL_VERSION, RelayStatus, SignedSnapshot};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -55,12 +55,6 @@ enum Command {
         /// Management API listen address. Expose only behind HTTPS in production.
         #[arg(long, default_value = "127.0.0.1:3341")]
         admin_bind: SocketAddr,
-        /// The only center identity allowed to update membership.
-        #[arg(long, requires = "audience")]
-        center: Option<EndpointId>,
-        /// Stable name signed into every update to prevent cross-relay replay.
-        #[arg(long, requires = "center")]
-        audience: Option<String>,
         /// Directory containing the durable membership snapshot.
         #[arg(long)]
         state_dir: Option<PathBuf>,
@@ -89,7 +83,6 @@ impl AccessControl for DynamicAccess {
 struct AdminState {
     audience: Arc<str>,
     authority_id: EndpointId,
-    required_member: Option<EndpointId>,
     state_path: Arc<PathBuf>,
     current: Arc<Mutex<MembershipSnapshot>>,
     allowed: Arc<ArcSwap<HashSet<EndpointId>>>,
@@ -154,44 +147,23 @@ async fn main() -> Result<()> {
         Command::Run {
             relay_bind,
             admin_bind,
-            center,
-            audience,
             state_dir,
-        } => run(relay_bind, admin_bind, center, audience, state_dir).await,
+        } => run(relay_bind, admin_bind, state_dir).await,
     }
 }
 
-async fn run(
-    relay_bind: SocketAddr,
-    admin_bind: SocketAddr,
-    center_id: Option<EndpointId>,
-    audience: Option<String>,
-    state_dir: Option<PathBuf>,
-) -> Result<()> {
+async fn run(relay_bind: SocketAddr, admin_bind: SocketAddr, state_dir: Option<PathBuf>) -> Result<()> {
     let state_dir = state_dir.unwrap_or_else(default_state_dir);
     tokio::fs::create_dir_all(&state_dir)
         .await
         .with_context(|| format!("create {}", state_dir.display()))?;
-    let managed_profile = if center_id.is_none() {
-        Some(load_profile(&state_dir)?)
-    } else {
-        None
-    };
-    let (authority_id, audience, required_member) = match (&managed_profile, center_id, audience) {
-        (Some(profile), None, None) => (
-            profile.control_id.parse().context("invalid profile control id")?,
-            profile.audience.clone(),
-            None,
-        ),
-        (None, Some(center), Some(audience)) => (center, audience, Some(center)),
-        _ => {
-            anyhow::bail!("use a control-enrolled --state-dir, or specify both --center and --audience for legacy mode")
-        }
-    };
+    let profile = load_profile(&state_dir)?;
+    let authority_id = profile.control_id.parse().context("invalid profile control id")?;
+    let audience = profile.audience.clone();
     anyhow::ensure!(!audience.trim().is_empty(), "audience must not be empty");
     let state_path = state_dir.join("membership.json");
-    let snapshot = load_or_initialize(&state_path, &audience, required_member).await?;
-    let ids = validate_snapshot(&snapshot, &audience, required_member)?;
+    let snapshot = load_or_initialize(&state_path, &audience).await?;
+    let ids = validate_snapshot(&snapshot, &audience)?;
     let allowed = Arc::new(ArcSwap::from_pointee(ids));
     let access = DynamicAccess {
         allowed: allowed.clone(),
@@ -211,7 +183,6 @@ async fn run(
     let admin_state = AdminState {
         audience: audience.clone().into(),
         authority_id,
-        required_member,
         state_path: Arc::new(state_path),
         current: Arc::new(Mutex::new(snapshot)),
         allowed,
@@ -220,7 +191,6 @@ async fn run(
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/v1/status", get(status))
-        .route("/v1/snapshot", post(update_snapshot))
         .with_state(admin_state.clone());
     let listener = tokio::net::TcpListener::bind(admin_bind)
         .await
@@ -235,11 +205,9 @@ async fn run(
     info!(relay = %actual_relay, admin = %actual_admin, "private relay started");
 
     let admin = tokio::spawn(async move { axum::serve(listener, app).await });
-    let control_poll = managed_profile.map(|profile| {
-        let state = admin_state.clone();
-        let state_dir = state_dir.clone();
-        tokio::spawn(async move { poll_control(profile, state_dir, state).await })
-    });
+    let state = admin_state.clone();
+    let poll_state_dir = state_dir.clone();
+    let control_poll = tokio::spawn(async move { poll_control(profile, poll_state_dir, state).await });
     tokio::select! {
         result = relay.join() => {
             admin.abort();
@@ -250,9 +218,7 @@ async fn run(
             relay.shutdown().await.context("stop relay")?;
         }
     }
-    if let Some(task) = control_poll {
-        task.abort();
-    }
+    control_poll.abort();
     Ok(())
 }
 
@@ -263,27 +229,16 @@ fn default_state_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".agent-scale-relay"))
 }
 
-async fn load_or_initialize(
-    path: &Path,
-    audience: &str,
-    required_member: Option<EndpointId>,
-) -> Result<MembershipSnapshot> {
+async fn load_or_initialize(path: &Path, audience: &str) -> Result<MembershipSnapshot> {
     match tokio::fs::read(path).await {
         Ok(data) => serde_json::from_slice(&data).with_context(|| format!("parse {}", path.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let members = required_member
-                .into_iter()
-                .map(|id| RelayMember {
-                    name: "center".into(),
-                    endpoint_id: id.to_string(),
-                })
-                .collect();
             let snapshot = MembershipSnapshot {
                 protocol_version: RELAY_PROTOCOL_VERSION,
                 audience: audience.into(),
                 version: 0,
                 issued_at: unix_timestamp(),
-                members,
+                members: Vec::new(),
             };
             persist_snapshot(path, &snapshot).await?;
             Ok(snapshot)
@@ -292,20 +247,13 @@ async fn load_or_initialize(
     }
 }
 
-fn validate_snapshot(
-    snapshot: &MembershipSnapshot,
-    audience: &str,
-    required_member: Option<EndpointId>,
-) -> Result<HashSet<EndpointId>> {
+fn validate_snapshot(snapshot: &MembershipSnapshot, audience: &str) -> Result<HashSet<EndpointId>> {
     anyhow::ensure!(snapshot.audience == audience, "snapshot audience mismatch");
     let ids: HashSet<_> = snapshot.endpoint_ids()?.into_iter().collect();
     anyhow::ensure!(
         ids.len() == snapshot.members.len(),
         "snapshot contains duplicate endpoint ids"
     );
-    if let Some(required_member) = required_member {
-        anyhow::ensure!(ids.contains(&required_member), "snapshot must authorize its center");
-    }
     Ok(ids)
 }
 
@@ -344,8 +292,7 @@ async fn update_snapshot(
     Json(signed): Json<SignedSnapshot>,
 ) -> Result<Json<RelayStatus>, ApiError> {
     signed.verify(state.authority_id).map_err(ApiError::unauthorized)?;
-    let next_ids =
-        validate_snapshot(&signed.snapshot, &state.audience, state.required_member).map_err(ApiError::bad_request)?;
+    let next_ids = validate_snapshot(&signed.snapshot, &state.audience).map_err(ApiError::bad_request)?;
     let mut current = state.current.lock().await;
 
     if signed.snapshot.version < current.version {
@@ -495,7 +442,7 @@ async fn poll_control(profile: ControlProfile, state_dir: PathBuf, state: AdminS
                 Ok(signed) => {
                     let valid = signed
                         .verify(control_id)
-                        .and_then(|()| validate_snapshot(&signed.snapshot, &profile.audience, None).map(|_| ()));
+                        .and_then(|()| validate_snapshot(&signed.snapshot, &profile.audience).map(|_| ()));
                     if let Err(error) = valid {
                         warn!("control returned invalid relay membership: {error:#}");
                     } else if let Err(error) = update_snapshot(State(state.clone()), Json(signed)).await {
@@ -587,7 +534,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validation_requires_center_and_unique_members() {
+    fn validation_requires_unique_members() {
         let center = iroh_base::SecretKey::generate().public();
         let edge = iroh_base::SecretKey::generate().public();
         let mut snapshot = MembershipSnapshot {
@@ -595,22 +542,22 @@ mod tests {
             audience: "test".into(),
             version: 1,
             issued_at: unix_timestamp(),
-            members: vec![RelayMember {
+            members: vec![relay_api::RelayMember {
                 name: "edge".into(),
                 endpoint_id: edge.to_string(),
             }],
         };
-        assert!(validate_snapshot(&snapshot, "test", Some(center)).is_err());
-        snapshot.members.push(RelayMember {
+        assert!(validate_snapshot(&snapshot, "test").is_ok());
+        snapshot.members.push(relay_api::RelayMember {
             name: "center".into(),
             endpoint_id: center.to_string(),
         });
-        assert!(validate_snapshot(&snapshot, "test", Some(center)).is_ok());
-        snapshot.members.push(RelayMember {
+        assert!(validate_snapshot(&snapshot, "test").is_ok());
+        snapshot.members.push(relay_api::RelayMember {
             name: "duplicate".into(),
             endpoint_id: edge.to_string(),
         });
-        assert!(validate_snapshot(&snapshot, "test", Some(center)).is_err());
+        assert!(validate_snapshot(&snapshot, "test").is_err());
     }
 
     #[tokio::test]
@@ -622,7 +569,7 @@ mod tests {
             audience: "test".into(),
             version: 0,
             issued_at: unix_timestamp(),
-            members: vec![RelayMember {
+            members: vec![relay_api::RelayMember {
                 name: "center".into(),
                 endpoint_id: center_id.to_string(),
             }],
@@ -630,13 +577,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("membership.json");
         persist_snapshot(&path, &initial).await.unwrap();
-        let allowed = Arc::new(ArcSwap::from_pointee(
-            validate_snapshot(&initial, "test", Some(center_id)).unwrap(),
-        ));
+        let allowed = Arc::new(ArcSwap::from_pointee(validate_snapshot(&initial, "test").unwrap()));
         let state = AdminState {
             audience: Arc::from("test"),
             authority_id: center_id,
-            required_member: Some(center_id),
             state_path: Arc::new(path.clone()),
             current: Arc::new(Mutex::new(initial)),
             allowed,
@@ -649,11 +593,11 @@ mod tests {
             version: 1,
             issued_at: unix_timestamp(),
             members: vec![
-                RelayMember {
+                relay_api::RelayMember {
                     name: "center".into(),
                     endpoint_id: center_id.to_string(),
                 },
-                RelayMember {
+                relay_api::RelayMember {
                     name: "edge".into(),
                     endpoint_id: edge_id.to_string(),
                 },

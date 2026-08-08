@@ -18,8 +18,8 @@ pub async fn join(join_url: String) -> Result<()> {
     let mut config = common::config_transaction()?;
     anyhow::ensure!(config.control.is_none(), "this center is already enrolled in control");
     anyhow::ensure!(
-        config.edges.is_empty() && config.relays.is_empty(),
-        "remove standalone edges and relays before joining control"
+        config.edges.is_empty(),
+        "remove standalone edges before joining control"
     );
     let parsed = Url::parse(&join_url).context("invalid join URL")?;
     let token = JoinToken::decode(parsed.fragment().context("join URL is missing its token fragment")?)?;

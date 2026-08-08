@@ -56,9 +56,6 @@ pub struct Config {
     pub schema_version: u32,
     #[serde(default)]
     pub edges: Vec<EdgeCfg>,
-    /// Private relays whose membership is managed by this center.
-    #[serde(default)]
-    pub relays: Vec<RelayCfg>,
     /// Optional multi-center control enrollment and last verified node map.
     #[serde(default)]
     pub control: Option<ControlCfg>,
@@ -69,7 +66,6 @@ impl Default for Config {
         Self {
             schema_version: CONFIG_SCHEMA,
             edges: Vec::new(),
-            relays: Vec::new(),
             control: None,
         }
     }
@@ -82,17 +78,6 @@ pub struct ControlCfg {
     pub control_id: String,
     pub audience: String,
     pub map: control_api::SignedNodeMap,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct RelayCfg {
-    pub name: String,
-    /// Public iroh relay URL used by center and edges.
-    pub url: String,
-    /// HTTPS management base URL exposed by `as-relay`.
-    pub admin_url: String,
-    /// Stable signature audience configured on `as-relay`.
-    pub audience: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

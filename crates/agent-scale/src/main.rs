@@ -7,7 +7,6 @@ mod control;
 mod daemon;
 mod edge;
 mod mcp_sync;
-mod relay;
 
 use std::process::ExitCode;
 
@@ -52,11 +51,6 @@ enum Cmd {
     Edge {
         #[command(subcommand)]
         cmd: EdgeCmd,
-    },
-    /// Manage private relays and synchronize their endpoint allowlists.
-    Relay {
-        #[command(subcommand)]
-        cmd: RelayCmd,
     },
     /// Ensure the center identity exists and print its EndpointId.
     Keygen,
@@ -147,30 +141,6 @@ enum ControlCmd {
     Sync,
 }
 
-#[derive(Subcommand)]
-enum RelayCmd {
-    /// Register a relay manually for a legacy standalone deployment.
-    Add {
-        name: String,
-        /// Public iroh relay URL, for example <https://relay.example.com>.
-        url: String,
-        /// Base URL of the signed management API.
-        #[arg(long)]
-        admin_url: String,
-        /// Signature audience configured on as-relay (defaults to NAME).
-        #[arg(long)]
-        audience: Option<String>,
-    },
-    /// List managed relays.
-    Ls,
-    /// Show the relay's live membership version and member count.
-    Status { name: String },
-    /// Fetch current control state, or reconcile a legacy relay by name.
-    Sync { name: String },
-    /// Remove a control-managed or legacy relay.
-    Rm { name: String },
-}
-
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -209,21 +179,6 @@ fn main() -> ExitCode {
                     } => edge::add(name, endpoint_id, relays).await,
                     EdgeCmd::Ls => control::refresh_cache().await.and_then(|()| edge::ls()),
                     EdgeCmd::Rm { name } => edge::rm(name).await,
-                };
-                report(r, |()| ExitCode::SUCCESS)
-            }
-            Cmd::Relay { cmd } => {
-                let r = match cmd {
-                    RelayCmd::Add {
-                        name,
-                        url,
-                        admin_url,
-                        audience,
-                    } => relay::add(name, url, admin_url, audience).await,
-                    RelayCmd::Ls => relay::ls(),
-                    RelayCmd::Status { name } => relay::status(&name).await,
-                    RelayCmd::Sync { name } => relay::sync(&name).await,
-                    RelayCmd::Rm { name } => relay::rm(&name).await,
                 };
                 report(r, |()| ExitCode::SUCCESS)
             }

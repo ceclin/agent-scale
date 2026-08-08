@@ -7,101 +7,93 @@ TMP=$(mktemp -d)
 CENTER_HOME="$TMP/center"
 EDGE_HOME="$TMP/edge"
 RELAY_STATE="$TMP/relay"
-RELAY_LOG="$TMP/relay.out"
-EDGE_LOG="$TMP/edge.out"
+CONTROL_URL=http://127.0.0.1:35350
+RELAY_URL=http://127.0.0.1:35340
+RELAY_ADMIN_URL=http://127.0.0.1:35341
+control_pid=
 relay_pid=
 edge_pid=
 
 cleanup() {
     AGENT_SCALE_HOME="$CENTER_HOME" "$BIN/agent-scale" daemon --stop >/dev/null 2>&1 || true
-    if [ -n "$edge_pid" ]; then kill "$edge_pid" >/dev/null 2>&1 || true; fi
-    if [ -n "$relay_pid" ]; then kill "$relay_pid" >/dev/null 2>&1 || true; fi
-    if [ -n "$edge_pid" ]; then wait "$edge_pid" >/dev/null 2>&1 || true; fi
-    if [ -n "$relay_pid" ]; then wait "$relay_pid" >/dev/null 2>&1 || true; fi
+    for pid in "$edge_pid" "$relay_pid" "$control_pid"; do
+        if [ -n "$pid" ]; then kill "$pid" >/dev/null 2>&1 || true; fi
+    done
+    for pid in "$edge_pid" "$relay_pid" "$control_pid"; do
+        if [ -n "$pid" ]; then wait "$pid" >/dev/null 2>&1 || true; fi
+    done
     rm -r -- "$TMP"
 }
 trap cleanup EXIT INT TERM
 
-cargo build --manifest-path "$ROOT/Cargo.toml" -p agent-scale -p as-edge -p as-relay
+cd "$ROOT"
+cargo build -q -p agent-scale -p as-control -p as-edge -p as-relay
 
-center_id=$(AGENT_SCALE_HOME="$CENTER_HOME" "$BIN/agent-scale" keygen)
-"$BIN/as-relay" run \
-    --relay-bind 127.0.0.1:0 \
-    --admin-bind 127.0.0.1:0 \
-    --center "$center_id" \
-    --audience e2e \
-    --state-dir "$RELAY_STATE" >"$RELAY_LOG" 2>&1 &
+export AS_CONTROL_STATE_DIR="$TMP/control"
+"$BIN/as-control" init --public-url "$CONTROL_URL" --audience e2e >/dev/null
+center_join=$("$BIN/as-control" bootstrap center center)
+"$BIN/as-control" run --bind 127.0.0.1:35350 >"$TMP/control.out" 2>&1 &
+control_pid=$!
+
+i=0
+until curl -fsS "$CONTROL_URL/healthz" >/dev/null 2>&1; do
+    i=$((i + 1)); [ "$i" -lt 100 ] || { echo "as-control did not start" >&2; exit 1; }
+    sleep 0.05
+done
+
+AGENT_SCALE_HOME="$CENTER_HOME" "$BIN/agent-scale" control join "$center_join" >/dev/null
+relay_join=$("$BIN/as-control" relay invite relay-a "$RELAY_URL")
+"$BIN/as-relay" join "$relay_join" --state-dir "$RELAY_STATE" >/dev/null
+"$BIN/as-relay" run --relay-bind 127.0.0.1:35340 --admin-bind 127.0.0.1:35341 \
+    --state-dir "$RELAY_STATE" >"$TMP/relay.out" 2>&1 &
 relay_pid=$!
 
 i=0
-while [ "$(wc -l <"$RELAY_LOG")" -lt 3 ]; do
-    i=$((i + 1))
-    if [ "$i" -ge 200 ]; then
-        echo "as-relay did not start" >&2
-        exit 1
-    fi
+until curl -fsS "$RELAY_ADMIN_URL/healthz" >/dev/null 2>&1; do
+    i=$((i + 1)); [ "$i" -lt 100 ] || { echo "as-relay did not start" >&2; exit 1; }
     sleep 0.05
 done
-relay_url=$(sed -n 's/^relay=//p' "$RELAY_LOG")
-admin_url=$(sed -n 's/^admin=//p' "$RELAY_LOG")
+status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$RELAY_ADMIN_URL/v1/snapshot")
+[ "$status" = 404 ]
 
-AGENT_SCALE_HOME="$CENTER_HOME" "$BIN/agent-scale" relay add e2e "$relay_url" \
-    --admin-url "$admin_url" --audience e2e
-edge_id=$(AGENT_SCALE_HOME="$EDGE_HOME" "$BIN/as-edge" id test)
-AGENT_SCALE_HOME="$CENTER_HOME" "$BIN/agent-scale" edge add test "$edge_id" \
-    --relay "$relay_url"
-
-AGENT_SCALE_HOME="$EDGE_HOME" "$BIN/as-edge" run test \
-    --relay "$relay_url" --center "$center_id" >"$EDGE_LOG" 2>&1 &
+edge_join=$(AGENT_SCALE_HOME="$CENTER_HOME" "$BIN/agent-scale" edge invite test)
+AGENT_SCALE_HOME="$EDGE_HOME" "$BIN/as-edge" join "$edge_join" --foreground >"$TMP/edge.out" 2>&1 &
 edge_pid=$!
 
 i=0
-while :; do
-    if output=$(AGENT_SCALE_HOME="$CENTER_HOME" AGENT_SCALE_DIAL_SECS=2 \
-        "$BIN/agent-scale" -e test exec -- sh -c 'printf relay-e2e-ok' 2>/dev/null); then
-        [ "$output" = "relay-e2e-ok" ]
-        break
-    fi
-    i=$((i + 1))
-    if [ "$i" -ge 15 ]; then
-        echo "edge did not become reachable" >&2
-        exit 1
-    fi
+until output=$(AGENT_SCALE_HOME="$CENTER_HOME" AGENT_SCALE_DIAL_SECS=2 \
+    "$BIN/agent-scale" -e test exec -- sh -c 'printf relay-e2e-ok' 2>/dev/null) && \
+    [ "$output" = relay-e2e-ok ]; do
+    i=$((i + 1)); [ "$i" -lt 40 ] || { echo "edge did not become reachable" >&2; exit 1; }
+    sleep 0.1
 done
 
-# Revocation is fail-closed: an unavailable relay makes edge removal fail and
-# leaves the local desired state intact. Restarting with the durable snapshot
-# lets the exact same command complete.
-kill "$relay_pid"
-wait "$relay_pid" >/dev/null 2>&1 || true
-relay_pid=
-if AGENT_SCALE_HOME="$CENTER_HOME" "$BIN/agent-scale" edge rm test >/dev/null 2>&1; then
-    echo "edge removal unexpectedly succeeded while relay was offline" >&2
-    exit 1
-fi
-AGENT_SCALE_HOME="$CENTER_HOME" "$BIN/agent-scale" edge ls | grep '^test$' >/dev/null
-
-: >"$RELAY_LOG"
-"$BIN/as-relay" run \
-    --relay-bind "${relay_url#http://}" \
-    --admin-bind "${admin_url#http://}" \
-    --center "$center_id" \
-    --audience e2e \
-    --state-dir "$RELAY_STATE" >"$RELAY_LOG" 2>&1 &
+# Restart from the last verified snapshot while Control is unavailable.
+kill "$control_pid"; wait "$control_pid" >/dev/null 2>&1 || true; control_pid=
+kill "$relay_pid"; wait "$relay_pid" >/dev/null 2>&1 || true; relay_pid=
+"$BIN/as-relay" run --relay-bind 127.0.0.1:35340 --admin-bind 127.0.0.1:35341 \
+    --state-dir "$RELAY_STATE" >"$TMP/relay.out" 2>&1 &
 relay_pid=$!
+
 i=0
-while [ "$(wc -l <"$RELAY_LOG")" -lt 3 ]; do
-    i=$((i + 1))
-    if [ "$i" -ge 200 ]; then
-        echo "as-relay did not restart" >&2
-        exit 1
-    fi
+until curl -fsS "$RELAY_ADMIN_URL/v1/status" 2>/dev/null | grep '"members":2' >/dev/null; do
+    i=$((i + 1)); [ "$i" -lt 100 ] || { echo "relay did not restore its snapshot" >&2; exit 1; }
     sleep 0.05
 done
 
-AGENT_SCALE_HOME="$CENTER_HOME" "$BIN/agent-scale" edge rm test
-status=$(curl --fail --silent "$admin_url/v1/status")
-echo "$status" | grep '"version":3' >/dev/null
-echo "$status" | grep '"members":1' >/dev/null
+"$BIN/as-control" run --bind 127.0.0.1:35350 >"$TMP/control.out" 2>&1 &
+control_pid=$!
+i=0
+until curl -fsS "$CONTROL_URL/healthz" >/dev/null 2>&1; do
+    i=$((i + 1)); [ "$i" -lt 100 ] || { echo "as-control did not restart" >&2; exit 1; }
+    sleep 0.05
+done
 
-echo "private relay e2e: ok"
+"$BIN/as-control" edge rm center/test >/dev/null
+i=0
+until curl -fsS "$RELAY_ADMIN_URL/v1/status" 2>/dev/null | grep '"members":1' >/dev/null; do
+    i=$((i + 1)); [ "$i" -lt 100 ] || { echo "relay did not apply revocation" >&2; exit 1; }
+    sleep 0.05
+done
+
+echo "control-managed private relay e2e: ok"

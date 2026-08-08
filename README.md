@@ -60,7 +60,7 @@ See [simple mode](docs/simple-mode.md) and the
 - content-addressed, verified, disk-backed upload and download;
 - built-in full `fd` and `rg` CLIs in the single `as-edge` multicall binary;
 - transparent stdio, Streamable HTTP, and legacy SSE MCP proxying;
-- private relay membership snapshots signed by the center;
+- Control-signed private relay membership with offline snapshot recovery;
 - optional multi-center enrollment and hot-reloaded desired state;
 - scheduler-neutral Provisioner API for isolated Center-to-Edge reconciliation.
 
