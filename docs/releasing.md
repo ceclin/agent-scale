@@ -59,6 +59,14 @@ from the directory containing both files with:
 sha256sum --check --ignore-missing SHA256SUMS
 ```
 
+Every archive contains the project `LICENSE` and a generated
+`THIRD_PARTY_LICENSES.html` covering the binary's complete non-development Rust
+dependency graph. The Control and Relay container images carry the same files
+under `/usr/share/licenses/agent-scale`. Regenerate the committed dependency
+license bundles after dependency changes with `./scripts/generate-licenses.sh`;
+`cargo x lint` rejects stale bundles using committed input/output checksums
+without rerunning the comparatively expensive generator.
+
 The same workflow publishes separate Control and Relay images for `linux/amd64`
 and `linux/arm64` to `ghcr.io/ceclin/agent-scale-control:<version>` and
 `ghcr.io/ceclin/agent-scale-relay:<version>`, then advances `preview` or `latest`
@@ -72,4 +80,6 @@ preferred. Center is distributed only as an `agent-scale` binary archive.
 `as-edge` embeds pinned fd and ripgrep sources. Binary distributions select the
 MIT option offered by both projects and include their copyright and full MIT
 license texts. The alternative Apache-2.0 and Unlicense texts are included for
-completeness. Other agent-scale binaries do not embed those upstream sources.
+completeness. The ripgrep bundle also reproduces the BSD-3-Clause notice for
+zsh-users code in its embedded zsh completion. Other agent-scale binaries do
+not embed those upstream sources.

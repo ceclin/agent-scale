@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>agent-scale third-party licenses</title>
+  <style>
+    body { font-family: sans-serif; margin: 2rem auto; max-width: 72rem; padding: 0 1rem; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #bbb; padding: .35rem .5rem; text-align: left; }
+    pre { border: 1px solid #bbb; padding: 1rem; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>agent-scale third-party licenses</h1>
+  <p>This file is generated from the locked Rust dependency graph. Do not edit it manually.</p>
+  <h2>Components</h2>
+  <table>
+    <thead><tr><th>Component</th><th>Version</th><th>License</th></tr></thead>
+    <tbody>
+    {{#each crates}}
+      <tr>
+        <td><a href="{{#if package.repository}}{{package.repository}}{{else}}https://crates.io/crates/{{package.name}}{{/if}}">{{package.name}}</a></td>
+        <td>{{package.version}}</td>
+        <td>{{license}}</td>
+      </tr>
+    {{/each}}
+    </tbody>
+  </table>
+  <h2>License texts and notices</h2>
+  {{#each overview}}
+    <h3 id="{{id}}">{{name}}</h3>
+    <pre>{{text}}</pre>
+  {{/each}}
+</body>
+</html>
+

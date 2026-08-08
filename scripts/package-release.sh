@@ -45,12 +45,18 @@ for target_dir in "$input_root"/*; do
   mkdir -p "$staging/$bundle"
   cp "$target_dir/$executable" "$staging/$bundle/"
   cp "$target_dir/LICENSE" "$staging/$bundle/"
+  if [ ! -f "$target_dir/THIRD_PARTY_LICENSES.html" ]; then
+    echo "$binary release input is missing THIRD_PARTY_LICENSES.html" >&2
+    exit 1
+  fi
+  cp "$target_dir/THIRD_PARTY_LICENSES.html" "$staging/$bundle/"
 
   if [ "$binary" = "as-edge" ]; then
     for required in \
       THIRD_PARTY.md \
       licenses/fd/LICENSE-APACHE \
       licenses/fd/LICENSE-MIT \
+      licenses/ripgrep/LICENSE-BSD-3-Clause-zsh-users \
       licenses/ripgrep/LICENSE-MIT \
       licenses/ripgrep/UNLICENSE; do
       if [ ! -f "$target_dir/$required" ]; then

@@ -134,8 +134,14 @@ jobs:
         run: |
           set -euo pipefail
           for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-            mkdir -p "target/container-root/$target/release"
-            cp "target/zigbuild-dist/$target/${{ matrix.package }}" "target/container-root/$target/release/"
+            case "$target" in
+              x86_64-unknown-linux-musl) arch=amd64 ;;
+              aarch64-unknown-linux-musl) arch=arm64 ;;
+              *) echo "unsupported container target: $target" >&2; exit 1 ;;
+            esac
+            mkdir -p target/container-root/bin
+            cp "target/zigbuild-dist/$target/${{ matrix.package }}" \
+              "target/container-root/bin/${{ matrix.package }}-$arch"
           done
       - uses: actions/upload-artifact@v4
         if: matrix.package == 'as-control' || matrix.package == 'as-relay'
@@ -171,6 +177,7 @@ jobs:
           mkdir -p "$input"
           cp "target/${{ matrix.target }}/dist/agent-scale" "$input/"
           cp LICENSE "$input/"
+          cp licenses/dependencies/agent-scale.html "$input/THIRD_PARTY_LICENSES.html"
           ./scripts/package-release.sh \
             target/macos-dist \
             agent-scale \
@@ -200,7 +207,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: container-*
-          path: target
+          path: target/container-root
           merge-multiple: true
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3

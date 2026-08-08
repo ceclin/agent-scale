@@ -26,7 +26,7 @@ The project uses semantic versioning after its first public release. Before
   invitations and explicit Center/Edge lifecycle management.
 - Added repeatable snapshot distributions plus tag-driven prereleases and
   releases, with versioned binary archives, multi-architecture Control and
-  Relay images, and SHA-256 checksums.
+  Relay images, SHA-256 checksums, and complete third-party license bundles.
 - Reorganized the workspace around explicit core, protocol, transport, and
   runtime responsibilities.
 - Added typed protocol v3 framing and explicit signed protocol versions.

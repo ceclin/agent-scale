@@ -1,22 +1,24 @@
 ARG TARGETARCH
 
 FROM scratch AS control-amd64
-COPY target/x86_64-unknown-linux-musl/release/as-control /as-control
+COPY target/container-root/bin/as-control-amd64 /as-control
 
 FROM scratch AS control-arm64
-COPY target/aarch64-unknown-linux-musl/release/as-control /as-control
+COPY target/container-root/bin/as-control-arm64 /as-control
 
 FROM scratch AS relay-amd64
-COPY target/x86_64-unknown-linux-musl/release/as-relay /as-relay
+COPY target/container-root/bin/as-relay-amd64 /as-relay
 
 FROM scratch AS relay-arm64
-COPY target/aarch64-unknown-linux-musl/release/as-relay /as-relay
+COPY target/container-root/bin/as-relay-arm64 /as-relay
 
 FROM control-${TARGETARCH} AS control-binary
 
 FROM alpine:3.22 AS control
 RUN apk add --no-cache ca-certificates curl
 COPY --from=control-binary /as-control /usr/local/bin/as-control
+COPY LICENSE /usr/share/licenses/agent-scale/LICENSE
+COPY licenses/dependencies/as-control.html /usr/share/licenses/agent-scale/THIRD_PARTY_LICENSES.html
 LABEL org.opencontainers.image.title="agent-scale control"
 
 FROM relay-${TARGETARCH} AS relay-binary
@@ -24,4 +26,6 @@ FROM relay-${TARGETARCH} AS relay-binary
 FROM alpine:3.22 AS relay
 RUN apk add --no-cache ca-certificates curl
 COPY --from=relay-binary /as-relay /usr/local/bin/as-relay
+COPY LICENSE /usr/share/licenses/agent-scale/LICENSE
+COPY licenses/dependencies/as-relay.html /usr/share/licenses/agent-scale/THIRD_PARTY_LICENSES.html
 LABEL org.opencontainers.image.title="agent-scale relay"

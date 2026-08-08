@@ -234,6 +234,10 @@ fn lint() -> Result<()> {
     sync.arg("--check");
     run(sync)?;
 
+    let mut licenses = command("./scripts/generate-licenses.sh");
+    licenses.arg("--check");
+    run(licenses)?;
+
     ensure("taplo", TAPLO_PACKAGE)?;
     let mut taplo = command("taplo");
     taplo.args(["format", "--check"]);

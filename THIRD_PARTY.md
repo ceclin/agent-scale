@@ -16,5 +16,13 @@ notices.
 Their complete license texts and attribution files are read from the ignored
 `.upstreams/fd/` and `.upstreams/ripgrep/` build-input cache and copied into
 distribution artifacts. The pinned revisions live in `scripts/upstreams.lock`.
-Rust dependency license metadata is checked by `cargo deny check` as part of
-`cargo x lint`.
+The ripgrep zsh completion also contains code from zsh-users under the
+BSD-3-Clause license; its complete notice is included in
+`licenses/ripgrep/LICENSE-BSD-3-Clause-zsh-users`.
+
+Each release archive also contains a generated `THIRD_PARTY_LICENSES.html` for
+the binary's complete non-development Rust dependency graph. Regenerate the
+committed bundles with `./scripts/generate-licenses.sh`; `cargo x lint` checks
+their input/output checksums against `Cargo.lock` and the package manifests
+without rerunning the generator. Rust dependency license policy is independently
+checked by `cargo deny check`.

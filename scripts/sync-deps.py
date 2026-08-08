@@ -39,13 +39,13 @@ TARGETS = {
         "manifest": ROOT / ".upstreams/fd/Cargo.toml",
         "out": ROOT / "crates/fd-lib/Cargo.toml",
         "name": "fd-lib",
-        "license": "MIT OR Apache-2.0",
+        "license": "Apache-2.0 AND MIT",
     },
     "rg": {
         "manifest": ROOT / ".upstreams/ripgrep/Cargo.toml",
         "out": ROOT / "crates/rg-lib/Cargo.toml",
         "name": "rg-lib",
-        "license": "MIT OR Unlicense",
+        "license": "Apache-2.0 AND MIT AND BSD-3-Clause",
     },
 }
 
