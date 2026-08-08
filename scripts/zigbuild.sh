@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 PROFILE="${PROFILE:-release}"
 PACKAGE="${PACKAGE:-as-edge}"
 BIN_NAME="${BIN_NAME:-as-edge}"
-DOCKER_IMAGE="${DOCKER_IMAGE:-ghcr.io/rust-cross/cargo-zigbuild}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-ghcr.io/rust-cross/cargo-zigbuild@sha256:b8364c2c60cdcc9b95c402d17654bff517410926a35678bd89dd924b8158d6ae}"
 CACHE_ROOT="${CACHE_ROOT:-${PWD}/target/zigbuild-cache}"
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-${PWD}/target/zigbuild-${PROFILE}}"
 # rustc passes `-Wl,-O1` to GNU-style linkers. Zig 0.16 accepts it but emits a
