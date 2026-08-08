@@ -27,12 +27,16 @@ struct Command {
 enum Task {
     /// Build all workspace targets without changing Cargo.lock.
     Build,
+    /// Run compiler-backed checks before tests so both reuse one target directory.
+    Check,
     /// Run the complete end-to-end suite.
     E2e,
     /// Initialize the pinned fd and ripgrep source checkouts.
     Init,
     /// Run formatting, lint, docs, metadata, spelling, and dependency checks.
     Lint,
+    /// Run repository policy checks independently from compiler-backed checks.
+    Quality,
     /// Build cross-platform edge artifacts for a release.
     Dist,
     /// Run all workspace tests.
@@ -192,11 +196,7 @@ fn ensure(binary: &str, package: &str) -> Result<()> {
     Ok(())
 }
 
-fn lint() -> Result<()> {
-    let mut fmt = command("cargo");
-    fmt.args(["fmt", "--all", "--", "--check"]);
-    run(fmt)?;
-
+fn rust_checks() -> Result<()> {
     let mut clippy = command("cargo");
     clippy.args([
         "clippy",
@@ -229,7 +229,13 @@ fn lint() -> Result<()> {
         "--all-features",
         "--no-deps",
     ]);
-    run(docs)?;
+    run(docs)
+}
+
+fn repository_quality() -> Result<()> {
+    let mut fmt = command("cargo");
+    fmt.args(["fmt", "--all", "--", "--check"]);
+    run(fmt)?;
 
     let mut sync = command("./scripts/sync-deps.py");
     sync.arg("--check");
@@ -253,6 +259,11 @@ fn lint() -> Result<()> {
     run(deny)
 }
 
+fn lint() -> Result<()> {
+    repository_quality()?;
+    rust_checks()
+}
+
 fn main() -> Result<()> {
     let task = Command::parse().task;
     if !matches!(task, Task::Init) {
@@ -264,6 +275,7 @@ fn main() -> Result<()> {
             build.args(["build", "--workspace", "--all-targets", "--locked"]);
             run(build)
         }
+        Task::Check => rust_checks(),
         Task::E2e => {
             for script in [
                 "./scripts/e2e-2b.sh",
@@ -276,6 +288,7 @@ fn main() -> Result<()> {
         }
         Task::Init => init_upstreams(),
         Task::Lint => lint(),
+        Task::Quality => repository_quality(),
         Task::Dist => {
             let mut dist = command("./scripts/zigbuild.sh");
             dist.env("PROFILE", "dist");
