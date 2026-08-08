@@ -45,23 +45,34 @@ AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" edge ls | grep -q "$EDGE_ID" \
 # Omitting --center exercises TOFU rather than strict pre-pinning.
 AGENT_SCALE_HOME="$EDGE_HOME" "$AGENT" run test --relay "$URL" >"$EDGE_LOG" 2>&1 &
 EDGE_PID=$!
-sleep 3
 
 echo "--- tests ---"
 
-# Warm up: the first exec auto-spawns the daemon and dials the edge. Do it
-# synchronously so the streaming check below races only the command, not the
-# daemon cold-start.
-AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test exec -- true >/dev/null 2>&1
-check $([ $? -eq 0 ] && echo PASS || echo FAIL) "warmup exec (auto-spawn daemon + dial edge)"
+READY=FAIL
+for _ in $(seq 1 100); do
+  if AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test exec -- true >/dev/null 2>&1; then
+    READY=PASS
+    break
+  fi
+  sleep 0.1
+done
+check "$READY" "warmup exec (auto-spawn daemon + dial edge)"
 [ -f "$EDGE_HOME/test/trusted_center" ] && check PASS "TOFU: edge pinned center on first connect" || check FAIL "TOFU pin"
 
-# At t=1s FIRST must already be visible and SECOND must not be, proving output
-# arrives before process exit.
+# Observe FIRST while the remote process is still sleeping to prove output
+# arrives before process exit without depending on local startup speed.
 AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test exec -- sh -c 'echo FIRST; sleep 2; echo SECOND' >"$OUT" 2>/dev/null &
 CPID=$!
-sleep 1
-if grep -q FIRST "$OUT" && ! grep -q SECOND "$OUT"; then check PASS "streaming: FIRST arrived ~1s before process exit"; else check FAIL "streaming"; fi
+STREAMING=FAIL
+for _ in $(seq 1 100); do
+  if grep -q FIRST "$OUT"; then
+    ! grep -q SECOND "$OUT" && STREAMING=PASS
+    break
+  fi
+  kill -0 "$CPID" 2>/dev/null || break
+  sleep 0.05
+done
+check "$STREAMING" "streaming output arrived before process exit"
 wait "$CPID"
 grep -q SECOND "$OUT" && check PASS "full output received after exit" || check FAIL "missing SECOND"
 

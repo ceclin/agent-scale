@@ -8,6 +8,9 @@ relay_pid=
 edge_pid=
 
 cleanup() {
+  for center_home in "$work/center-a" "$work/center-b"; do
+    AGENT_SCALE_HOME="$center_home" target/debug/agent-scale daemon --stop >/dev/null 2>&1 || true
+  done
   for pid in "$edge_pid" "$relay_pid" "$control_pid"; do
     if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; fi
   done
