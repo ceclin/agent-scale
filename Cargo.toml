@@ -1,0 +1,59 @@
+[workspace]
+members = ["crates/*", "xtask"]
+resolver = "3"
+# Product crates: a bare `cargo build`/`cargo test` skips the dev-only relay-dev
+# (and its iroh-relay server deps). Build it explicitly with `-p relay-dev`.
+default-members = [
+  "crates/as-edge",
+  "crates/as-control",
+  "crates/as-relay",
+  "crates/agent-scale",
+  "crates/control-api",
+  "crates/transport",
+  "crates/protocol",
+  "crates/relay-api",
+  "crates/fd-lib",
+  "crates/rg-lib",
+]
+
+[workspace.package]
+edition = "2024"
+homepage = "https://github.com/ceclin/agent-scale"
+license = "Apache-2.0"
+repository = "https://github.com/ceclin/agent-scale"
+version = "0.3.0-dev"
+
+[workspace.lints.rust]
+unknown_lints = "deny"
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+
+[workspace.dependencies]
+fd-lib = { path = "crates/fd-lib" }
+rg-lib = { path = "crates/rg-lib" }
+scale-core = { path = "crates/core" }
+scale-protocol = { path = "crates/protocol" }
+
+anyhow = "1"
+base64 = "0.23"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+hex = "0.4"
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = { version = "2", features = ["serde"] }
+which = "8"
+
+[profile.dist]
+codegen-units = 1
+inherits = "release"
+lto = true
+strip = true

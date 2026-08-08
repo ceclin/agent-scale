@@ -1,0 +1,19 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "relay-dev"
+publish = false
+repository.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "relay-dev"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+iroh-relay = { version = "1.0.3", features = ["server"] }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+x-local-image: &local-image
+  image: agent-scale-infrastructure:local
+
+services:
+  bootstrap:
+    <<: *local-image
+    build:
+      context: .
+      args:
+        RUST_TARGET: ${RUST_TARGET:-x86_64-unknown-linux-musl}
+  control: *local-image
+  relay-init: *local-image
+  relay: *local-image
+  center-invite: *local-image

@@ -1,0 +1,37 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "as-relay"
+publish = false
+repository.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "as-relay"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+arc-swap = "1"
+axum = "0.8"
+base64 = { workspace = true }
+clap = { workspace = true }
+control-api = { path = "../control-api" }
+iroh-base = { version = "1.0.3", features = ["key"] }
+iroh-relay = { version = "1.0.3", features = ["server"] }
+rand = { workspace = true }
+relay-api = { path = "../relay-api" }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+scale-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,236 @@
+//! Shared paths, config, identity, and small process helpers.
+
+use std::ops::{Deref, DerefMut};
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use iroh::SecretKey;
+use protocol::{ExecParams, McpTransport};
+use serde::{Deserialize, Serialize};
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+const CONFIG_SCHEMA: u32 = 1;
+
+/// Center home: $AGENT_SCALE_HOME or ~/.agent-scale.
+pub fn home() -> PathBuf {
+    if let Ok(h) = std::env::var("AGENT_SCALE_HOME") {
+        return PathBuf::from(h);
+    }
+    // home_dir() is correct cross-platform (USERPROFILE on Windows, $HOME with a
+    // passwd-db fallback on Unix). Fail loudly rather than scatter center keys
+    // and config into the cwd when there's genuinely no home.
+    std::env::home_dir()
+        .expect("no home directory found; set $AGENT_SCALE_HOME (or $HOME / %USERPROFILE%)")
+        .join(".agent-scale")
+}
+
+pub fn key_path() -> PathBuf {
+    home().join("center.key")
+}
+pub fn config_path() -> PathBuf {
+    home().join("config.json")
+}
+pub fn daemon_dir() -> PathBuf {
+    home().join("daemon")
+}
+pub fn socket_path() -> PathBuf {
+    daemon_dir().join("sock")
+}
+pub fn registry_path() -> PathBuf {
+    daemon_dir().join("registry.json")
+}
+pub fn log_path() -> PathBuf {
+    daemon_dir().join("log")
+}
+pub fn daemon_lock_path() -> PathBuf {
+    daemon_dir().join("instance.lock")
+}
+
+/// The center's persistent identity. Generated on first use.
+pub fn load_or_create_key() -> Result<SecretKey> {
+    scale_core::load_or_create_secret(&key_path())
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Config {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub edges: Vec<EdgeCfg>,
+    /// Private relays whose membership is managed by this center.
+    #[serde(default)]
+    pub relays: Vec<RelayCfg>,
+    /// Optional multi-center control enrollment and last verified node map.
+    #[serde(default)]
+    pub control: Option<ControlCfg>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            schema_version: CONFIG_SCHEMA,
+            edges: Vec::new(),
+            relays: Vec::new(),
+            control: None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ControlCfg {
+    pub name: String,
+    pub url: String,
+    pub control_id: String,
+    pub audience: String,
+    pub map: control_api::SignedNodeMap,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct RelayCfg {
+    pub name: String,
+    /// Public iroh relay URL used by center and edges.
+    pub url: String,
+    /// HTTPS management base URL exposed by `as-relay`.
+    pub admin_url: String,
+    /// Stable signature audience configured on `as-relay`.
+    pub audience: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct EdgeCfg {
+    pub name: String,
+    pub endpoint_id: String,
+    /// Relay URLs the edge is reachable on (one or more).
+    pub relays: Vec<String>,
+    /// True when identity and relay addresses are sourced from as-control.
+    #[serde(default)]
+    pub managed: bool,
+}
+
+pub fn load_config() -> Result<Config> {
+    let p = config_path();
+    let data =
+        std::fs::read(&p).with_context(|| format!("read config {} (run `keygen` + `edge add` first)", p.display()))?;
+    parse_config(&data)
+}
+
+/// Like `load_config`, but a missing file yields an empty config.
+pub fn load_config_or_default() -> Result<Config> {
+    let p = config_path();
+    match std::fs::read(&p) {
+        Ok(data) => parse_config(&data),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+        Err(e) => Err(e).with_context(|| format!("read {}", p.display())),
+    }
+}
+
+pub fn save_config(cfg: &Config) -> Result<()> {
+    scale_core::write_json(&config_path(), cfg)
+}
+
+pub struct ConfigTransaction {
+    config: Config,
+    _lock: scale_core::FileLock,
+}
+
+impl ConfigTransaction {
+    pub fn commit(self) -> Result<()> {
+        save_config(&self.config)
+    }
+}
+
+impl Deref for ConfigTransaction {
+    type Target = Config;
+
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
+}
+
+impl DerefMut for ConfigTransaction {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.config
+    }
+}
+
+pub fn config_transaction() -> Result<ConfigTransaction> {
+    let lock = scale_core::FileLock::acquire(&home().join("config.transaction.lock"))?;
+    let config = load_config_or_default()?;
+    Ok(ConfigTransaction { config, _lock: lock })
+}
+
+fn parse_config(data: &[u8]) -> Result<Config> {
+    let config: Config = serde_json::from_slice(data).context("parse config.json")?;
+    anyhow::ensure!(
+        config.schema_version == CONFIG_SCHEMA,
+        "unsupported config schema {}; remove config.json and enroll again",
+        config.schema_version
+    );
+    Ok(config)
+}
+
+/// Daemon registry written by a live daemon; read by clients to find it.
+#[derive(Serialize, Deserialize)]
+pub struct Registry {
+    pub pid: u32,
+    pub socket: String,
+    pub version: String,
+}
+
+/// Client -> daemon request: which edge + what operation.
+#[derive(Serialize, Deserialize)]
+pub struct ClientReq {
+    pub edge: String,
+    pub op: ClientOp,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct LocalRequest {
+    pub version: String,
+    pub command: LocalCommand,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum LocalCommand {
+    Work(ClientReq),
+    Admin(DaemonAdmin),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum DaemonAdmin {
+    Status,
+    Reload,
+    Shutdown,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DaemonStatus {
+    pub pid: u32,
+    pub version: String,
+    pub active_requests: usize,
+    pub configured_edges: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum ClientOp {
+    Exec(ExecParams),
+    Upload {
+        local: String,
+        remote: String,
+    },
+    Download {
+        remote: String,
+        local: String,
+    },
+    McpList,
+    McpUpsert {
+        name: String,
+        transport: McpTransport,
+    },
+    McpRemove {
+        name: String,
+    },
+    /// Open a transparent MCP pipe to the edge's named MCP server.
+    McpConnect {
+        name: String,
+    },
+}

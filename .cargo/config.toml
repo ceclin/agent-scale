@@ -1,0 +1,8 @@
+# Copyright 2026 agent-scale contributors
+# SPDX-License-Identifier: Apache-2.0
+
+[alias]
+x = "run --package xtask --"
+
+[env]
+AGENT_SCALE_WORKSPACE_DIR = { value = "", relative = true }

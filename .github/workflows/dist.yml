@@ -1,0 +1,21 @@
+name: Release edge distribution artifacts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  edge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo x dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: as-edge
+          path: target/zigbuild-dist
+          if-no-files-found: error

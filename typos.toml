@@ -1,0 +1,11 @@
+# Copyright 2026 agent-scale contributors
+# SPDX-License-Identifier: Apache-2.0
+
+[default.extend-words]
+iroh = "iroh"
+
+[default.extend-identifiers]
+MPORT = "MPORT"
+
+[files]
+extend-exclude = [".upstreams/**", "submodules/**", "target/**"]

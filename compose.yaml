@@ -1,0 +1,95 @@
+name: agent-scale
+
+x-image: &image
+  image: ${AGENT_SCALE_INFRA_IMAGE:-ghcr.io/agent-scale/agent-scale-infrastructure:latest}
+
+x-environment: &environment
+  CONTROL_PUBLIC_URL: ${CONTROL_PUBLIC_URL:-http://localhost:3350}
+  CONTROL_INTERNAL_URL: http://control:3350
+  CONTROL_AUDIENCE: ${CONTROL_AUDIENCE:-agent-scale-local}
+  CONTROL_CENTER_NAME: ${CONTROL_CENTER_NAME:-main}
+  CONTROL_CENTER_TTL_SECS: ${CONTROL_CENTER_TTL_SECS:-604800}
+  RELAY_NAME: ${RELAY_NAME:-relay-a}
+  RELAY_PUBLIC_URL: ${RELAY_PUBLIC_URL:-http://localhost:3340}
+  RELAY_INVITE_TTL_SECS: ${RELAY_INVITE_TTL_SECS:-900}
+
+services:
+  bootstrap:
+    <<: *image
+    command: compose-bootstrap
+    environment: *environment
+    volumes:
+      - control-state:/control
+      - relay-state:/relay
+      - bootstrap-data:/bootstrap
+    restart: "no"
+
+  control:
+    <<: *image
+    command: as-control run --bind 0.0.0.0:3350 --state-dir /control
+    environment:
+      AGENT_SCALE_CONTROL_ADMIN_SOCKET: /run/agent-scale-control/admin.sock
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    ports:
+      - "${CONTROL_PORT:-3350}:3350"
+    volumes:
+      - control-state:/control
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:3350/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    restart: unless-stopped
+
+  relay-init:
+    <<: *image
+    command: compose-relay-init
+    environment: *environment
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      control:
+        condition: service_healthy
+    volumes:
+      - relay-state:/relay
+      - bootstrap-data:/bootstrap:ro
+    restart: "no"
+
+  relay:
+    <<: *image
+    command: >-
+      as-relay run
+      --relay-bind 0.0.0.0:3340
+      --admin-bind 0.0.0.0:3341
+      --state-dir /relay
+    depends_on:
+      relay-init:
+        condition: service_completed_successfully
+    ports:
+      - "${RELAY_PORT:-3340}:3340"
+      - "127.0.0.1:${RELAY_ADMIN_PORT:-3341}:3341"
+    volumes:
+      - relay-state:/relay
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:3341/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    restart: unless-stopped
+
+  center-invite:
+    <<: *image
+    profiles: [tools]
+    command: cat /bootstrap/center.join
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    volumes:
+      - bootstrap-data:/bootstrap:ro
+
+volumes:
+  control-state:
+  relay-state:
+  bootstrap-data:

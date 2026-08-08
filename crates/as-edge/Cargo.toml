@@ -1,0 +1,44 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "as-edge"
+publish = false
+repository.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "as-edge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true }
+control-api = { path = "../control-api" }
+eventsource-stream = "0.2"
+fd-lib = { workspace = true }
+fs2 = "0.4"
+futures-util = { workspace = true }
+iroh = "1.0.3"
+iroh-blobs = "0.103"
+protocol = { package = "scale-protocol", path = "../protocol" }
+rand = { workspace = true }
+reqwest = { version = "0.13", default-features = false, features = [
+  "stream",
+  "http2",
+  "json",
+  "rustls-no-provider",
+] }
+rg-lib = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+scale-core = { workspace = true }
+scale-transport = { path = "../transport" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

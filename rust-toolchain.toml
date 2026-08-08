@@ -1,0 +1,7 @@
+# Copyright 2026 agent-scale contributors
+# SPDX-License-Identifier: Apache-2.0
+
+[toolchain]
+channel = "stable"
+components = ["cargo", "clippy", "rust-analyzer", "rustfmt"]
+profile = "minimal"
