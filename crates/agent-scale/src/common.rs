@@ -7,6 +7,8 @@ use anyhow::{Context, Result};
 use iroh::SecretKey;
 use protocol::{ExecParams, McpTransport};
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use sha2::{Digest, Sha256};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const CONFIG_SCHEMA: u32 = 1;
@@ -33,8 +35,20 @@ pub fn config_path() -> PathBuf {
 pub fn daemon_dir() -> PathBuf {
     home().join("daemon")
 }
-pub fn socket_path() -> PathBuf {
-    daemon_dir().join("sock")
+pub fn local_endpoint() -> String {
+    #[cfg(unix)]
+    {
+        daemon_dir().join("sock").to_string_lossy().into_owned()
+    }
+    #[cfg(windows)]
+    {
+        // Named pipes live in a machine-wide namespace. Key the name by the
+        // configured Center home so independent profiles owned by one user can
+        // run concurrently without exposing the path itself in the pipe name.
+        let normalized = home().to_string_lossy().replace('/', "\\").to_lowercase();
+        let digest = hex::encode(Sha256::digest(normalized.as_bytes()));
+        format!(r"\\.\pipe\agent-scale-{}", &digest[..24])
+    }
 }
 pub fn registry_path() -> PathBuf {
     daemon_dir().join("registry.json")
@@ -157,7 +171,7 @@ fn parse_config(data: &[u8]) -> Result<Config> {
 #[derive(Serialize, Deserialize)]
 pub struct Registry {
     pub pid: u32,
-    pub socket: String,
+    pub endpoint: String,
     pub version: String,
 }
 

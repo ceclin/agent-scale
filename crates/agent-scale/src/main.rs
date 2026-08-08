@@ -6,6 +6,7 @@ mod common;
 mod control;
 mod daemon;
 mod edge;
+mod local_ipc;
 mod mcp_sync;
 
 use std::process::ExitCode;

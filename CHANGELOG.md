@@ -12,6 +12,8 @@ The project uses semantic versioning after its first public release. Before
 - Added the `agent-scale` Center, `as-edge`, `as-control`, and `as-relay`
   binaries with authenticated iroh transport, streaming command execution,
   content-addressed file transfer, and transparent MCP proxying.
+- Supported Windows x86-64 development hosts for the Center CLI and daemon
+  through private local Named Pipe IPC.
 - Added simple mode for zero-infrastructure trials and Control-managed mode for
   private Relay and multi-Center deployments.
 - Persisted Control state in a versioned SQLite database with WAL, atomic

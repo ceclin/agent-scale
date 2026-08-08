@@ -11,7 +11,7 @@ change incompatibly before 1.0.
 
 | Binary | Runs on | Purpose |
 | --- | --- | --- |
-| `agent-scale` | Linux or macOS developer machine | CLI and auto-started local daemon |
+| `agent-scale` | Linux, macOS, or Windows x86-64 developer machine | CLI and auto-started local daemon |
 | `as-edge` | Linux x86-64/ARM64 or Windows x86-64 | Authenticated command, transfer, and MCP endpoint |
 | `as-relay` | Linux relay host | Private iroh relay with signed dynamic membership |
 | `as-control` | Linux control host | Multi-center enrollment and signed desired state |
@@ -53,6 +53,15 @@ Register it and execute a command:
 agent-scale edge add test EDGE_ID --relay https://your-relay.example
 agent-scale -e test exec -- cargo test
 ```
+
+On a Windows development machine, download the Windows x86-64 `agent-scale`
+archive, place `agent-scale.exe` on `PATH`, and run the same Center commands
+from PowerShell. The background daemon is auto-started without a console window
+and communicates through a current-user-local Named Pipe; it does not install a
+service, require Administrator privileges, or open a listening network port.
+Windows Center support is currently experimental: its build and local IPC tests
+are wired into CI, but the complete Center-to-Edge workflow has not yet been
+validated on a real Windows development host.
 
 Without `--center`, an edge uses trust on first use and durably pins the first
 center before authorizing it. Pass `--center ENDPOINT_ID` for an explicit pin.

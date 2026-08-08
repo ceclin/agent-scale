@@ -1,6 +1,6 @@
 //! Shared iroh transport for agent-scale: endpoint construction + a tiny
 //! length-prefixed frame protocol used on both the iroh bi-streams (center
-//! <-> edge) and the local unix socket (client <-> daemon).
+//! <-> edge) and local IPC (client <-> daemon).
 //!
 //! Frame = `[tag: u8][len: u32 LE][payload: len bytes]`.
 //!   START  payload = JSON (ExecParams on the iroh side; {edge, params} on the
@@ -302,7 +302,7 @@ pub mod blobs {
     }
 }
 
-/// Framing over any tokio byte stream (client <-> daemon unix socket).
+/// Framing over any Tokio byte stream (client <-> daemon local IPC).
 pub mod io_wire {
     use super::*;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};

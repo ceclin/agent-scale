@@ -1,12 +1,11 @@
-//! The center daemon: one warm iroh endpoint multiplexing all edges, a unix
-//! socket for clients, a verbatim frame relay for exec, and iroh-blobs file
+//! The center daemon: one warm iroh endpoint multiplexing all edges, a private
+//! local byte stream for clients, a verbatim frame relay for exec, and iroh-blobs file
 //! transfer. Gradle-style: auto-spawned, registry-advertised, long idle,
 //! version-guarded.
 
 mod connection_pool;
 
 use std::collections::{HashMap, HashSet};
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -20,7 +19,6 @@ use iroh_blobs::store::fs::FsStore;
 use protocol::{EdgeReq, ExecParams, RemoteError, RpcResult, TransferResult};
 use scale_transport::{Frame, T_DATA, T_EXIT, T_RESULT, T_START, T_STDERR, build_endpoint, io_wire, iroh_wire};
 use tokio::io::AsyncReadExt;
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
@@ -108,18 +106,19 @@ pub async fn run() -> Result<()> {
     let endpoint = build_endpoint(key, &relays, vec![iroh_blobs::ALPN.to_vec()]).await?;
     let store = scale_transport::blobs::open_store(common::daemon_dir().join("blobs")).await?;
 
-    let sock = common::socket_path();
-    let _ = std::fs::remove_file(&sock);
-    let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
-    let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
+    let mut listener =
+        crate::local_ipc::Listener::bind().with_context(|| format!("bind {}", common::local_endpoint()))?;
 
     let reg = Registry {
         pid: std::process::id(),
-        socket: sock.to_string_lossy().into_owned(),
+        endpoint: common::local_endpoint(),
         version: VERSION.into(),
     };
     scale_core::write_json(&common::registry_path(), &reg)?;
-    info!("daemon up pid={} socket={} version={}", reg.pid, reg.socket, VERSION);
+    info!(
+        "daemon up pid={} endpoint={} version={}",
+        reg.pid, reg.endpoint, VERSION
+    );
 
     let edges: Arc<Mutex<HashMap<String, EdgeCfg>>> =
         Arc::new(Mutex::new(cfg.edges.into_iter().map(|e| (e.name.clone(), e)).collect()));
@@ -150,7 +149,7 @@ pub async fn run() -> Result<()> {
                 Some(DaemonAdmin::Status) => {}
             },
             accepted = tokio::time::timeout(idle, listener.accept()) => match accepted {
-                Ok(Ok((stream, _))) => {
+                Ok(Ok(stream)) => {
                     let ctx = ctx.clone();
                     let admin_tx = admin_tx.clone();
                     tokio::spawn(async move {
@@ -174,7 +173,6 @@ pub async fn run() -> Result<()> {
     }
 
     let _ = std::fs::remove_file(common::registry_path());
-    let _ = std::fs::remove_file(&sock);
     endpoint.close().await;
     Ok(())
 }
@@ -315,9 +313,13 @@ fn spawn_control_watcher(ctx: Ctx) {
     });
 }
 
-async fn handle_client(stream: UnixStream, ctx: Ctx, admin_tx: mpsc::UnboundedSender<DaemonAdmin>) -> Result<()> {
+async fn handle_client(
+    stream: crate::local_ipc::Stream,
+    ctx: Ctx,
+    admin_tx: mpsc::UnboundedSender<DaemonAdmin>,
+) -> Result<()> {
     let _active = ActiveGuard::new(&ctx.active);
-    let (mut cr, mut cw) = stream.into_split();
+    let (mut cr, mut cw) = tokio::io::split(stream);
     let Frame { tag, payload } = match io_wire::read_frame(&mut cr).await? {
         Some(f) => f,
         None => return Ok(()),
@@ -363,7 +365,7 @@ async fn handle_admin(
     client_version: String,
     ctx: &Ctx,
     admin_tx: &mpsc::UnboundedSender<DaemonAdmin>,
-    send: &mut tokio::net::unix::OwnedWriteHalf,
+    send: &mut crate::local_ipc::WriteHalf,
 ) -> Result<()> {
     let status = DaemonStatus {
         pid: std::process::id(),
@@ -390,7 +392,7 @@ async fn relay_mcp_control(
     ctx: &Ctx,
     edge: &EdgeCfg,
     request: EdgeReq,
-    mut cw: tokio::net::unix::OwnedWriteHalf,
+    mut cw: crate::local_ipc::WriteHalf,
 ) -> Result<()> {
     let result: Result<Vec<u8>> = async {
         let conn = get_conn(ctx, edge).await?;
@@ -412,13 +414,13 @@ async fn relay_mcp_control(
 }
 
 /// Transparent bidirectional MCP pipe: relay T_DATA frames between the client
-/// (unix) and the edge's spawned MCP server (iroh).
+/// (local IPC) and the edge's spawned MCP server (iroh).
 async fn relay_mcp(
     ctx: &Ctx,
     edge: &EdgeCfg,
     name: String,
-    mut cr: tokio::net::unix::OwnedReadHalf,
-    mut cw: tokio::net::unix::OwnedWriteHalf,
+    mut cr: crate::local_ipc::ReadHalf,
+    mut cw: crate::local_ipc::WriteHalf,
 ) -> Result<()> {
     let opened = async {
         let conn = get_conn(ctx, edge).await?;
@@ -476,8 +478,8 @@ async fn relay_exec(
     ctx: &Ctx,
     edge: &EdgeCfg,
     params: ExecParams,
-    mut cr: tokio::net::unix::OwnedReadHalf,
-    mut cw: tokio::net::unix::OwnedWriteHalf,
+    mut cr: crate::local_ipc::ReadHalf,
+    mut cw: crate::local_ipc::WriteHalf,
 ) -> Result<()> {
     // Dial + open the exec stream. On failure, report it to the client as a
     // STDERR line + nonzero EXIT (both of which `exec()` already renders) rather
@@ -609,12 +611,12 @@ pub async fn control(_status: bool, stop: bool) -> Result<()> {
     }
     match crate::client::daemon_admin(DaemonAdmin::Status).await? {
         Some(status) => println!(
-            "daemon pid={} version={} active={} edges={} socket={}",
+            "daemon pid={} version={} active={} edges={} endpoint={}",
             status.pid,
             status.version,
             status.active_requests,
             status.configured_edges,
-            common::socket_path().display()
+            common::local_endpoint()
         ),
         None => println!("no daemon running"),
     }

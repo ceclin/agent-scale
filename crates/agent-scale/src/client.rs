@@ -1,15 +1,18 @@
 //! Thin client: find-or-spawn the daemon, send one exec, stream output live to
 //! our own stdout/stderr, exit with the remote exit code.
 
-use std::os::unix::process::CommandExt;
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 use anyhow::{Context, Result};
 use protocol::{ExecParams, McpCatalog, McpTransport, RpcResult, TransferResult};
 use rmcp::{ServiceExt, transport::TokioChildProcess};
 use scale_transport::{Frame, T_DATA, T_EXIT, T_RESULT, T_START, T_STDERR, T_STDOUT, io_wire};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 
 use crate::common::{self, ClientOp, ClientReq, LocalCommand, LocalRequest, VERSION};
 use crate::common::{DaemonAdmin, DaemonStatus};
@@ -42,8 +45,8 @@ pub async fn exec(edge: String, argv: Vec<String>) -> Result<i32> {
         cwd: None,
     };
 
-    let mut stream = ensure_daemon().await?;
-    let (mut r, mut w) = stream.split();
+    let stream = ensure_daemon().await?;
+    let (mut r, mut w) = tokio::io::split(stream);
 
     let payload = work_request(edge, ClientOp::Exec(params))?;
     io_wire::write_frame(&mut w, T_START, &payload).await?;
@@ -86,8 +89,8 @@ pub async fn exec(edge: String, argv: Vec<String>) -> Result<i32> {
 /// and reports the result. Returns 0 on success.
 pub async fn transfer(edge: String, op: ClientOp) -> Result<i32> {
     check_edge(&edge).await?;
-    let mut stream = ensure_daemon().await?;
-    let (mut r, mut w) = stream.split();
+    let stream = ensure_daemon().await?;
+    let (mut r, mut w) = tokio::io::split(stream);
     io_wire::write_frame(&mut w, T_START, &work_request(edge, op)?).await?;
     match io_wire::read_frame(&mut r).await? {
         Some(Frame {
@@ -113,8 +116,8 @@ pub async fn transfer(edge: String, op: ClientOp) -> Result<i32> {
 pub async fn mcp_run(edge: String, name: String) -> Result<()> {
     check_edge(&edge).await?;
 
-    let mut stream = ensure_daemon().await?;
-    let (mut r, mut w) = stream.split();
+    let stream = ensure_daemon().await?;
+    let (mut r, mut w) = tokio::io::split(stream);
     io_wire::write_frame(&mut w, T_START, &work_request(edge, ClientOp::McpConnect { name })?).await?;
 
     match io_wire::read_frame(&mut r).await? {
@@ -185,8 +188,8 @@ pub async fn mcp_check(edge: String, name: String) -> Result<()> {
 
 async fn mcp_control(edge: String, op: ClientOp) -> Result<Vec<u8>> {
     check_edge(&edge).await?;
-    let mut stream = ensure_daemon().await?;
-    let (mut r, mut w) = stream.split();
+    let stream = ensure_daemon().await?;
+    let (mut r, mut w) = tokio::io::split(stream);
     io_wire::write_frame(&mut w, T_START, &work_request(edge, op)?).await?;
     match io_wire::read_frame(&mut r).await? {
         Some(Frame { tag: T_RESULT, payload }) => Ok(payload),
@@ -203,16 +206,16 @@ fn ensure_ok(payload: &[u8]) -> Result<()> {
 }
 
 /// Connect to a live, version-matched daemon, spawning one if needed.
-async fn ensure_daemon() -> Result<UnixStream> {
+async fn ensure_daemon() -> Result<crate::local_ipc::Stream> {
     if let Some(status) = daemon_admin(DaemonAdmin::Status).await? {
         if status.version == VERSION {
-            return UnixStream::connect(common::socket_path())
+            return crate::local_ipc::connect()
                 .await
                 .context("reconnect to daemon after status check");
         }
         let _ = daemon_admin(DaemonAdmin::Shutdown).await?;
         for _ in 0..100 {
-            if UnixStream::connect(common::socket_path()).await.is_err() {
+            if crate::local_ipc::connect().await.is_err() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -223,7 +226,7 @@ async fn ensure_daemon() -> Result<UnixStream> {
         if let Some(status) = daemon_admin(DaemonAdmin::Status).await?
             && status.version == VERSION
         {
-            return UnixStream::connect(common::socket_path())
+            return crate::local_ipc::connect()
                 .await
                 .context("connect to newly started daemon");
         }
@@ -233,7 +236,7 @@ async fn ensure_daemon() -> Result<UnixStream> {
 }
 
 pub async fn daemon_admin(command: DaemonAdmin) -> Result<Option<DaemonStatus>> {
-    let mut stream = match UnixStream::connect(common::socket_path()).await {
+    let mut stream = match crate::local_ipc::connect().await {
         Ok(stream) => stream,
         Err(error)
             if matches!(
@@ -273,9 +276,16 @@ fn spawn_daemon() -> Result<()> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(log2));
-    // Detach from the controlling terminal's process group so the daemon
-    // outlives this client and isn't hit by terminal signals.
+    // Detach from the controlling terminal so the daemon outlives this client
+    // and is not hit by terminal control events.
+    #[cfg(unix)]
     cmd.process_group(0);
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
     cmd.spawn().context("spawn daemon")?;
     Ok(())
 }

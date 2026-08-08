@@ -80,7 +80,7 @@ grep -q to-out "$OUT" && check PASS "stdout captured" || check FAIL "stdout"
 # T4: daemon was auto-spawned and is registered/alive
 STATUS=$(AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" daemon --status)
 echo "  $STATUS"
-echo "$STATUS" | grep -qE '^daemon pid=[0-9]+ version=[^ ]+ active=[0-9]+ edges=[0-9]+ socket=' \
+echo "$STATUS" | grep -qE '^daemon pid=[0-9]+ version=[^ ]+ active=[0-9]+ edges=[0-9]+ endpoint=' \
   && check PASS "daemon auto-spawned and alive" || check FAIL "daemon status"
 
 # T5: iroh-blobs file transfer round-trip (upload then download back)

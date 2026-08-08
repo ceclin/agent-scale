@@ -47,7 +47,8 @@ prereleases never advance `latest`, and stable releases never advance `preview`.
 The workflow creates versioned archives for:
 
 - `as-edge`: Linux x86-64, Linux ARM64, and Windows x86-64;
-- `agent-scale`: Linux x86-64, Linux ARM64, macOS ARM64, and macOS x86-64;
+- `agent-scale`: Linux x86-64, Linux ARM64, Windows x86-64, macOS ARM64,
+  and macOS x86-64;
 - `as-control`: Linux x86-64 and Linux ARM64;
 - `as-relay`: Linux x86-64 and Linux ARM64.
 

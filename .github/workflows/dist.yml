@@ -98,7 +98,7 @@ jobs:
           - package: as-edge
             targets: x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-pc-windows-gnu
           - package: agent-scale
-            targets: x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+            targets: x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-pc-windows-gnu
           - package: as-control
             targets: x86_64-unknown-linux-musl aarch64-unknown-linux-musl
           - package: as-relay
