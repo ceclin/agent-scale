@@ -55,3 +55,6 @@ cross-compiles the documented edge artifacts with `cargo-zigbuild`.
 
 The repository uses Jujutsu locally, but pull requests are ordinary GitHub pull
 requests and do not require contributors to use a particular VCS client.
+
+Maintainers preparing a version tag should follow the
+[release checklist](docs/releasing.md).

@@ -7,6 +7,24 @@ The project uses semantic versioning after its first public release. Before
 
 ## Unreleased
 
+## 0.5.0 - 2026-08-07
+
+- Added the `agent-scale` Center, `as-edge`, `as-control`, and `as-relay`
+  binaries with authenticated iroh transport, streaming command execution,
+  content-addressed file transfer, and transparent MCP proxying.
+- Added simple mode for zero-infrastructure trials and Control-managed mode for
+  private Relay and multi-Center deployments.
+- Persisted Control state in a versioned SQLite database with WAL, atomic
+  topology revisions, restart recovery, and bounded invitation history.
+- Made private Relay enrollment Control-only, with signed membership snapshots,
+  offline recovery, revocation, and immediate disconnection of removed members.
+- Added idempotent native Compose bootstrap through `as-control prepare` and
+  `as-relay run --join-if-needed`, removing the shell initialization services.
+- Added signed Provisioner reconciliation scoped by owner, including idempotent
+  invitations and explicit Center/Edge lifecycle management.
+- Added repeatable snapshot distributions plus tag-driven prereleases and
+  releases, with versioned binary archives, multi-architecture Control and
+  Relay images, and SHA-256 checksums.
 - Reorganized the workspace around explicit core, protocol, transport, and
   runtime responsibilities.
 - Added typed protocol v3 framing and explicit signed protocol versions.

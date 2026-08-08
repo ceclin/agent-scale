@@ -1,0 +1,74 @@
+# Distributing agent-scale
+
+Distribution has three channels. Snapshots are repeatable builds of any ref and
+do not create a Git tag or GitHub Release. Prereleases and releases are immutable
+builds driven by version tags. All workspace crates use the version in
+`Cargo.toml`; product crates are not published to crates.io.
+
+## Snapshot
+
+Run the `Distribution` workflow manually and optionally enter a branch, tag, or
+commit in `ref`. Leaving it empty snapshots the ref selected in the workflow UI.
+No version or changelog edit is required.
+
+Snapshot archives use a version such as `0.5.0-snapshot.42.0123456789ab`, are
+available as a single GitHub Actions artifact for 14 days, and include a
+consolidated `SHA256SUMS`. Build jobs retain their internal transfer artifacts
+for one day only. Control and Relay images receive three tags:
+
+- the complete snapshot version;
+- commit-addressed `snapshot-<12-character-commit>`;
+- mutable `snapshot`, which always identifies the most recently completed push.
+
+Snapshot publication never creates a GitHub Release and never advances
+`preview` or `latest`.
+
+## Prepare a prerelease or release
+
+1. Set `[workspace.package].version` to an unprefixed semantic version such as
+   `0.5.0-preview.1` or `0.5.0`, then refresh `Cargo.lock`.
+2. Move the completed entries from `Unreleased` into a dated heading with the
+   exact form `## 0.5.0 - YYYY-MM-DD` in `CHANGELOG.md`.
+3. Run `cargo x lint`, `cargo x test`, and the relevant end-to-end tests.
+4. Land the release change on `main`, then create and push the matching tag,
+   such as `v0.5.0-preview.1` or `v0.5.0`.
+
+The release workflow rejects malformed tags, tags that do not match the
+workspace version, and versions without a dated changelog heading. Do not reuse
+or move a published release tag.
+
+A SemVer prerelease tag creates a GitHub Prerelease and advances the mutable
+`preview` image tag. A stable tag creates a normal GitHub Release and advances
+`latest`. Both channels also publish images under their exact immutable version;
+prereleases never advance `latest`, and stable releases never advance `preview`.
+
+## Published artifacts
+
+The workflow creates versioned archives for:
+
+- `as-edge`: Linux x86-64, Linux ARM64, and Windows x86-64;
+- `agent-scale`: Linux x86-64, Linux ARM64, macOS ARM64, and macOS x86-64;
+- `as-control`: Linux x86-64 and Linux ARM64;
+- `as-relay`: Linux x86-64 and Linux ARM64.
+
+Every archive has an entry in the distribution's `SHA256SUMS`. Verify a download
+from the directory containing both files with:
+
+```console
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+The same workflow publishes separate Control and Relay images for `linux/amd64`
+and `linux/arm64` to `ghcr.io/ceclin/agent-scale-control:<version>` and
+`ghcr.io/ceclin/agent-scale-relay:<version>`, then advances `preview` or `latest`
+according to the channel.
+The Compose file accepts `AGENT_SCALE_CONTROL_IMAGE` and
+`AGENT_SCALE_RELAY_IMAGE` when immutable digests or private registry mirrors are
+preferred. Center is distributed only as an `agent-scale` binary archive.
+
+## Embedded upstream licenses
+
+`as-edge` embeds pinned fd and ripgrep sources. Binary distributions select the
+MIT option offered by both projects and include their copyright and full MIT
+license texts. The alternative Apache-2.0 and Unlicense texts are included for
+completeness. Other agent-scale binaries do not embed those upstream sources.

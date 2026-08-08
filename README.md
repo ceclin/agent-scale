@@ -16,6 +16,11 @@ change incompatibly before 1.0.
 | `as-relay` | Linux relay host | Private iroh relay with signed dynamic membership |
 | `as-control` | Linux control host | Multi-center enrollment and signed desired state |
 
+Versioned archives for all four binaries and the multi-architecture Control and
+Relay images are published by GitHub Releases. Each release includes
+a consolidated `SHA256SUMS`; see the [release guide](docs/releasing.md) for the
+target matrix and verification command.
+
 The center and edge pin each other's Ed25519 `EndpointId`. QUIC provides mutual
 transport authentication; relay membership and control-plane maps are signed.
 If Control is temporarily unavailable, enrolled nodes continue with their last

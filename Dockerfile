@@ -1,8 +1,27 @@
-FROM alpine:3.22
+ARG TARGETARCH
 
-ARG RUST_TARGET=x86_64-unknown-linux-musl
+FROM scratch AS control-amd64
+COPY target/x86_64-unknown-linux-musl/release/as-control /as-control
+
+FROM scratch AS control-arm64
+COPY target/aarch64-unknown-linux-musl/release/as-control /as-control
+
+FROM scratch AS relay-amd64
+COPY target/x86_64-unknown-linux-musl/release/as-relay /as-relay
+
+FROM scratch AS relay-arm64
+COPY target/aarch64-unknown-linux-musl/release/as-relay /as-relay
+
+FROM control-${TARGETARCH} AS control-binary
+
+FROM alpine:3.22 AS control
 RUN apk add --no-cache ca-certificates curl
-COPY target/${RUST_TARGET}/release/as-control /usr/local/bin/as-control
-COPY target/${RUST_TARGET}/release/as-relay /usr/local/bin/as-relay
+COPY --from=control-binary /as-control /usr/local/bin/as-control
+LABEL org.opencontainers.image.title="agent-scale control"
 
-LABEL org.opencontainers.image.title="agent-scale control and relay"
+FROM relay-${TARGETARCH} AS relay-binary
+
+FROM alpine:3.22 AS relay
+RUN apk add --no-cache ca-certificates curl
+COPY --from=relay-binary /as-relay /usr/local/bin/as-relay
+LABEL org.opencontainers.image.title="agent-scale relay"

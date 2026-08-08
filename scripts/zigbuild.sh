@@ -65,9 +65,12 @@ for target in "${targets[@]}"; do
   collected_dir="${ARTIFACT_ROOT}/${target}"
   mkdir -p "${collected_dir}"
   cp -f "${built_artifact}" "${collected_dir}/${artifact_name}"
-  cp -f LICENSE THIRD_PARTY.md "${collected_dir}/"
-  mkdir -p "${collected_dir}/licenses/fd" "${collected_dir}/licenses/ripgrep"
-  cp -f .upstreams/fd/LICENSE-APACHE .upstreams/fd/LICENSE-MIT "${collected_dir}/licenses/fd/"
-  cp -f .upstreams/ripgrep/LICENSE-MIT .upstreams/ripgrep/UNLICENSE "${collected_dir}/licenses/ripgrep/"
+  cp -f LICENSE "${collected_dir}/"
+  if [ "${PACKAGE}" = "as-edge" ]; then
+    cp -f THIRD_PARTY.md "${collected_dir}/"
+    mkdir -p "${collected_dir}/licenses/fd" "${collected_dir}/licenses/ripgrep"
+    cp -f .upstreams/fd/LICENSE-APACHE .upstreams/fd/LICENSE-MIT "${collected_dir}/licenses/fd/"
+    cp -f .upstreams/ripgrep/LICENSE-MIT .upstreams/ripgrep/UNLICENSE "${collected_dir}/licenses/ripgrep/"
+  fi
   echo "    collected ${collected_dir}/${artifact_name}"
 done

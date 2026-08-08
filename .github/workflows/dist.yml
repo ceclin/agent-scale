@@ -1,21 +1,295 @@
-name: Release edge distribution artifacts
+name: Distribution
 
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or commit to snapshot (defaults to the selected workflow ref)
+        required: false
+        type: string
+  push:
+    tags: ["v*"]
 
 permissions:
   contents: read
 
+concurrency:
+  group: distribution-${{ github.ref }}-${{ inputs.ref }}
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/agent-scale
+
 jobs:
-  edge:
+  validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    outputs:
+      channel: ${{ steps.version.outputs.channel }}
+      source_sha: ${{ steps.version.outputs.source_sha }}
+      short_sha: ${{ steps.version.outputs.short_sha }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo x dist
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse HEAD)"
+          short_sha="${source_sha:0:12}"
+          workspace_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "agent-scale") | .version')"
+
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            base_version="${workspace_version%%-*}"
+            version="${base_version}-snapshot.${GITHUB_RUN_NUMBER}.${short_sha}"
+            channel=snapshot
+          else
+            if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+              echo "release tag must be a semantic version prefixed with v" >&2
+              exit 1
+            fi
+            version="$workspace_version"
+            if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+              echo "tag $GITHUB_REF_NAME does not match workspace version $version" >&2
+              exit 1
+            fi
+            grep -Eq "^## ${version} - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md || {
+              echo "CHANGELOG.md needs a dated $version release heading" >&2
+              exit 1
+            }
+            if [[ "$version" == *-* ]]; then
+              channel=prerelease
+            else
+              channel=release
+            fi
+          fi
+
+          {
+            echo "channel=$channel"
+            echo "source_sha=$source_sha"
+            echo "short_sha=$short_sha"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo x lint
+      - run: cargo x test
+
+  linux-binaries:
+    needs: [validate, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: as-edge
+            targets: x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-pc-windows-gnu
+          - package: agent-scale
+            targets: x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          - package: as-control
+            targets: x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          - package: as-relay
+            targets: x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo x init
+      - name: Build static distribution binaries
+        env:
+          BIN_NAME: ${{ matrix.package }}
+          PACKAGE: ${{ matrix.package }}
+          PROFILE: dist
+        run: ./scripts/zigbuild.sh ${{ matrix.targets }}
+      - name: Package versioned archives
+        run: >-
+          ./scripts/package-release.sh
+          target/zigbuild-dist
+          ${{ matrix.package }}
+          ${{ needs.validate.outputs.version }}
+          target/release-artifacts
       - uses: actions/upload-artifact@v4
         with:
-          name: as-edge
-          path: target/zigbuild-dist
+          name: release-${{ matrix.package }}-cross
+          path: target/release-artifacts/*
           if-no-files-found: error
+          retention-days: 1
+      - name: Stage Control image binaries
+        if: matrix.package == 'as-control' || matrix.package == 'as-relay'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            mkdir -p "target/container-root/$target/release"
+            cp "target/zigbuild-dist/$target/${{ matrix.package }}" "target/container-root/$target/release/"
+          done
+      - uses: actions/upload-artifact@v4
+        if: matrix.package == 'as-control' || matrix.package == 'as-relay'
+        with:
+          name: container-${{ matrix.package }}
+          path: target/container-root
+          if-no-files-found: error
+          retention-days: 1
+
+  macos-center:
+    needs: [validate, verify]
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - run: cargo build --locked --profile dist -p agent-scale --target ${{ matrix.target }}
+      - name: Stage and package binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          input="target/macos-dist/${{ matrix.target }}"
+          mkdir -p "$input"
+          cp "target/${{ matrix.target }}/dist/agent-scale" "$input/"
+          cp LICENSE "$input/"
+          ./scripts/package-release.sh \
+            target/macos-dist \
+            agent-scale \
+            "${{ needs.validate.outputs.version }}" \
+            target/release-artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-agent-scale-${{ matrix.target }}
+          path: target/release-artifacts/*
+          if-no-files-found: error
+          retention-days: 1
+
+  container:
+    needs: [validate, linux-binaries]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [control, relay]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: container-*
+          path: target
+          merge-multiple: true
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}-${{ matrix.image }}
+          tags: |
+            type=raw,value=${{ needs.validate.outputs.version }}
+            type=raw,value=snapshot-${{ needs.validate.outputs.short_sha }},enable=${{ needs.validate.outputs.channel == 'snapshot' }}
+            type=raw,value=snapshot,enable=${{ needs.validate.outputs.channel == 'snapshot' }}
+            type=raw,value=preview,enable=${{ needs.validate.outputs.channel == 'prerelease' }}
+            type=raw,value=latest,enable=${{ needs.validate.outputs.channel == 'release' }}
+          labels: |
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.image }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  snapshot:
+    needs: [validate, linux-binaries, macos-center, container]
+    if: needs.validate.outputs.channel == 'snapshot'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: snapshot-artifacts
+          merge-multiple: true
+      - name: Verify and consolidate SHA-256 checksums
+        shell: bash
+        working-directory: snapshot-artifacts
+        run: |
+          set -euo pipefail
+          find . -maxdepth 1 -name '*.sha256' -print0 \
+            | sort -z \
+            | xargs -0 cat > SHA256SUMS
+          test -s SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-scale-${{ needs.validate.outputs.version }}
+          path: |
+            snapshot-artifacts/*.tar.gz
+            snapshot-artifacts/*.zip
+            snapshot-artifacts/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs: [validate, linux-binaries, macos-center, container]
+    if: needs.validate.outputs.channel != 'snapshot'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-artifacts
+          merge-multiple: true
+      - name: Verify and consolidate SHA-256 checksums
+        shell: bash
+        working-directory: release-artifacts
+        run: |
+          set -euo pipefail
+          find . -maxdepth 1 -name '*.sha256' -print0 \
+            | sort -z \
+            | xargs -0 cat > SHA256SUMS
+          test -s SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ needs.validate.outputs.channel == 'prerelease' }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release-artifacts/*.tar.gz
+            release-artifacts/*.zip
+            release-artifacts/SHA256SUMS

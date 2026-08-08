@@ -25,9 +25,9 @@ state and atomically write first-enrollment invitations. The Relay runs
 starts directly from its persisted profile and membership snapshot, without a
 shell init script or a Control-health dependency.
 
-Released deployments pull
-`ghcr.io/agent-scale/agent-scale-infrastructure:latest` by default. During local
-development, build the static binaries on the host and use the local override:
+Released deployments pull `ghcr.io/ceclin/agent-scale-control:latest` and
+`ghcr.io/ceclin/agent-scale-relay:latest` by default. During local development,
+build the static binaries on the host and use the local override:
 
 ```sh
 scripts/build-compose-image.sh

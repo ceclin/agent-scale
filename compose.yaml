@@ -1,14 +1,17 @@
 name: agent-scale
 
-x-image: &image
-  image: ${AGENT_SCALE_INFRA_IMAGE:-ghcr.io/agent-scale/agent-scale-infrastructure:latest}
+x-control-image: &control-image
+  image: ${AGENT_SCALE_CONTROL_IMAGE:-ghcr.io/ceclin/agent-scale-control:latest}
+
+x-relay-image: &relay-image
+  image: ${AGENT_SCALE_RELAY_IMAGE:-ghcr.io/ceclin/agent-scale-relay:latest}
 
 x-environment: &environment
   AS_CONTROL_STATE_DIR: /control
 
 services:
   bootstrap:
-    <<: *image
+    <<: *control-image
     command:
       - as-control
       - prepare
@@ -37,7 +40,7 @@ services:
     restart: "no"
 
   control:
-    <<: *image
+    <<: *control-image
     command: as-control run --bind 0.0.0.0:3350
     environment: *environment
     depends_on:
@@ -55,7 +58,7 @@ services:
     restart: unless-stopped
 
   relay:
-    <<: *image
+    <<: *relay-image
     command: >-
       as-relay run
       --relay-bind 0.0.0.0:3340
@@ -80,7 +83,7 @@ services:
     restart: unless-stopped
 
   center-invite:
-    <<: *image
+    <<: *control-image
     profiles: [tools]
     command: cat /bootstrap/center.join
     depends_on:
