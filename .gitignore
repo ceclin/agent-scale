@@ -1,4 +1,7 @@
-node_modules/
 /.upstreams/
 /submodules/
 /target
+/.env
+/.env.*
+!/.env.example
+.DS_Store

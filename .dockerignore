@@ -1,6 +1,9 @@
 .git
 .jj
+.upstreams
+submodules
 target/*
 !target/container-root/
 target-*
 .env
+.env.*
