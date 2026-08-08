@@ -30,7 +30,6 @@ control=(target/debug/as-control)
 "${control[@]}" init \
   --public-url "$control_url" \
   --audience e2e >/dev/null
-center_a_url=$("${control[@]}" bootstrap center center-a)
 "${control[@]}" run \
   --bind "127.0.0.1:$control_port" \
   >"$work/control.log" 2>&1 &
@@ -41,6 +40,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
   sleep 0.1
 done
 
+center_a_url=$("${control[@]}" center invite center-a)
 AGENT_SCALE_HOME="$work/center-a" target/debug/agent-scale control join "$center_a_url" >/dev/null
 relay_join=$("${control[@]}" relay invite relay-a "$relay_url")
 printf '%s\n' "$relay_join" >"$work/relay.join"

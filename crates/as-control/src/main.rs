@@ -66,18 +66,12 @@ enum Command {
         #[arg(long)]
         audience: String,
     },
-    /// Idempotently initialize a deployment and write its first enrollment invitations.
-    Prepare {
+    /// Idempotently initialize a deployment and write its Relay enrollment invitation.
+    Bootstrap {
         #[arg(long)]
         public_url: String,
         #[arg(long)]
         audience: String,
-        #[arg(long)]
-        center: String,
-        #[arg(long, default_value_t = 7 * 24 * 60 * 60)]
-        center_ttl_secs: u64,
-        #[arg(long)]
-        center_invite_out: PathBuf,
         #[arg(long)]
         relay_name: String,
         #[arg(long)]
@@ -86,11 +80,6 @@ enum Command {
         relay_ttl_secs: u64,
         #[arg(long)]
         relay_invite_out: PathBuf,
-    },
-    /// Create initial invitations before the first server start.
-    Bootstrap {
-        #[command(subcommand)]
-        command: BootstrapCommand,
     },
     /// Run the public control API.
     Run {
@@ -123,22 +112,6 @@ enum Command {
     Invite {
         #[command(subcommand)]
         command: InviteCommand,
-    },
-}
-
-#[derive(Subcommand)]
-enum BootstrapCommand {
-    Center {
-        name: String,
-        #[arg(long, default_value_t = DEFAULT_TTL_SECS)]
-        ttl_secs: u64,
-    },
-    /// Create the initial relay invitation. The server must be stopped.
-    Relay {
-        name: String,
-        url: String,
-        #[arg(long, default_value_t = DEFAULT_TTL_SECS)]
-        ttl_secs: u64,
     },
 }
 
@@ -365,32 +338,22 @@ async fn main() -> Result<()> {
     let admin_socket = state_dir.join("admin.sock");
     match cli.command {
         Command::Init { public_url, audience } => init(state_dir, public_url, audience),
-        Command::Prepare {
+        Command::Bootstrap {
             public_url,
             audience,
-            center,
-            center_ttl_secs,
-            center_invite_out,
             relay_name,
             relay_url,
             relay_ttl_secs,
             relay_invite_out,
-        } => prepare(
+        } => bootstrap(
             state_dir,
             public_url,
             audience,
-            center,
-            center_ttl_secs,
-            center_invite_out,
             relay_name,
             relay_url,
             relay_ttl_secs,
             relay_invite_out,
         ),
-        Command::Bootstrap { command } => match command {
-            BootstrapCommand::Center { name, ttl_secs } => bootstrap_center(state_dir, name, ttl_secs),
-            BootstrapCommand::Relay { name, url, ttl_secs } => bootstrap_relay(state_dir, name, url, ttl_secs),
-        },
         Command::Run { bind } => run(state_dir, bind, admin_socket).await,
         Command::Status => print_admin_response(admin_call(&admin_socket, LocalAdminRequest::Overview).await?),
         Command::Center { command } => {
@@ -471,24 +434,19 @@ fn init(dir: PathBuf, public_url: String, audience: String) -> Result<()> {
     };
     db::Database::create(&database_path(&dir), &state)?;
     println!("initialized control {}", key.public());
-    println!("next: as-control bootstrap center <name>");
+    println!("next: as-control run, then as-control center invite <name>");
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn prepare(
+fn bootstrap(
     dir: PathBuf,
     public_url: String,
     audience: String,
-    center: String,
-    center_ttl_secs: u64,
-    center_invite_out: PathBuf,
     relay_name: String,
     relay_url: String,
     relay_ttl_secs: u64,
     relay_invite_out: PathBuf,
 ) -> Result<()> {
-    validate_name(&center)?;
     validate_name(&relay_name)?;
     anyhow::ensure!(!audience.trim().is_empty(), "--audience must not be empty");
     let public_url = normalize_public_url(&public_url)?;
@@ -498,18 +456,9 @@ fn prepare(
         && database_path(&dir).exists()
         && relay_ca_key_path(&dir).exists()
         && relay_ca_cert_path(&dir).exists()
-        && center_invite_out.exists()
         && relay_invite_out.exists()
     {
         let key = scale_core::read_secret(&key_path(&dir))?;
-        validate_prepared_invitation(
-            &center_invite_out,
-            key.public(),
-            &audience,
-            &public_url,
-            &center,
-            &InviteKind::Center,
-        )?;
         validate_prepared_invitation(
             &relay_invite_out,
             key.public(),
@@ -522,7 +471,7 @@ fn prepare(
         return Ok(());
     }
     let _lock = scale_core::FileLock::try_acquire(&lock_path(&dir))
-        .context("control state is already in use; prepare must run before as-control run")?;
+        .context("control state is already in use; bootstrap must run before as-control run")?;
 
     let key_exists = key_path(&dir).exists();
     let database_exists = database_path(&dir).exists();
@@ -563,20 +512,6 @@ fn prepare(
         "configured Control public URL does not match durable state"
     );
 
-    let center_invite = if state.centers.is_empty() {
-        state
-            .invites
-            .retain(|invite| !matches!(invite.invite.kind, InviteKind::Center) || invite.state != InviteState::Pending);
-        Some(create_invite(
-            &key,
-            &mut state,
-            center,
-            InviteKind::Center,
-            center_ttl_secs,
-        )?)
-    } else {
-        None
-    };
     let relay_invite = if state.relays.is_empty() {
         state.invites.retain(|invite| {
             !matches!(invite.invite.kind, InviteKind::Relay { .. }) || invite.state != InviteState::Pending
@@ -599,9 +534,6 @@ fn prepare(
         None
     };
     database.replace_sync(&state)?;
-    if let Some(invite) = center_invite {
-        write_invitation(&center_invite_out, &invite.join_url)?;
-    }
     if let Some(invite) = relay_invite {
         write_invitation(&relay_invite_out, &invite.join_url)?;
     }
@@ -646,39 +578,6 @@ fn write_invitation(path: &Path, join_url: &str) -> Result<()> {
     let mut contents = join_url.as_bytes().to_vec();
     contents.push(b'\n');
     scale_core::atomic_write(path, &contents).with_context(|| format!("write invitation {}", path.display()))
-}
-
-fn bootstrap_center(dir: PathBuf, name: String, ttl_secs: u64) -> Result<()> {
-    validate_name(&name)?;
-    let (_lock, key, database, mut state) = open_exclusive(&dir)?;
-    anyhow::ensure!(
-        state.centers.is_empty(),
-        "a Center already exists; use `as-control center invite`"
-    );
-    state
-        .invites
-        .retain(|invite| !matches!(invite.invite.kind, InviteKind::Center));
-    let result = create_invite(&key, &mut state, name, InviteKind::Center, ttl_secs)?;
-    database.replace_sync(&state)?;
-    println!("{}", result.join_url);
-    Ok(())
-}
-
-fn bootstrap_relay(dir: PathBuf, name: String, url: String, ttl_secs: u64) -> Result<()> {
-    validate_name(&name)?;
-    let url = normalize_relay_url(&url)?;
-    let (_lock, key, database, mut state) = open_exclusive(&dir)?;
-    anyhow::ensure!(
-        state.relays.is_empty(),
-        "a Relay already exists; use `as-control relay invite`"
-    );
-    state.invites.retain(|invite| {
-        !matches!(invite.invite.kind, InviteKind::Relay { .. }) || invite.state == InviteState::Claimed
-    });
-    let result = create_invite(&key, &mut state, name, InviteKind::Relay { url }, ttl_secs)?;
-    database.replace_sync(&state)?;
-    println!("{}", result.join_url);
-    Ok(())
 }
 
 async fn run(dir: PathBuf, bind: SocketAddr, admin_socket: PathBuf) -> Result<()> {
@@ -2252,6 +2151,29 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_is_a_single_top_level_command() {
+        assert!(
+            Cli::try_parse_from([
+                "as-control",
+                "bootstrap",
+                "--public-url",
+                "http://127.0.0.1:3350",
+                "--audience",
+                "test",
+                "--relay-name",
+                "primary",
+                "--relay-url",
+                "http://127.0.0.1:3340",
+                "--relay-invite-out",
+                "/tmp/relay.join",
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["as-control", "bootstrap", "center", "main"]).is_err());
+        assert!(Cli::try_parse_from(["as-control", "prepare"]).is_err());
+    }
+
+    #[test]
     fn control_ca_signs_only_the_invited_relay_host() {
         let dir = tempfile::tempdir().unwrap();
         let (ca_der, issuer) = load_or_create_relay_ca(dir.path()).unwrap();
@@ -2290,30 +2212,21 @@ mod tests {
     }
 
     #[test]
-    fn prepare_is_idempotent_and_does_not_require_invitation_artifacts_after_enrollment() {
+    fn bootstrap_is_idempotent_and_does_not_require_invitation_artifacts_after_enrollment() {
         let dir = tempfile::tempdir().unwrap();
-        let center_out = dir.path().join("bootstrap/center.join");
         let relay_out = dir.path().join("bootstrap/relay.join");
-        let run_prepare = || {
-            prepare(
+        let run_bootstrap = || {
+            bootstrap(
                 dir.path().join("control"),
                 "http://127.0.0.1:3350".into(),
                 "test".into(),
-                "main".into(),
-                900,
-                center_out.clone(),
                 "relay-a".into(),
                 "http://127.0.0.1:3340".into(),
                 900,
                 relay_out.clone(),
             )
         };
-        run_prepare().unwrap();
-        assert!(
-            std::fs::read_to_string(&center_out)
-                .unwrap()
-                .starts_with("http://127.0.0.1:3350/join#")
-        );
+        run_bootstrap().unwrap();
         assert!(
             std::fs::read_to_string(&relay_out)
                 .unwrap()
@@ -2322,14 +2235,15 @@ mod tests {
 
         let control_dir = dir.path().join("control");
         let (lock, _key, database, mut state) = open_exclusive(&control_dir).unwrap();
-        run_prepare().unwrap();
-        let center_id = SecretKey::generate().public().to_string();
+        assert!(state.centers.is_empty());
+        assert!(
+            state
+                .invites
+                .iter()
+                .all(|invite| !matches!(invite.invite.kind, InviteKind::Center))
+        );
+        run_bootstrap().unwrap();
         let relay_id = SecretKey::generate().public().to_string();
-        state.centers.push(CenterRecord {
-            name: "main".into(),
-            endpoint_id: center_id.clone(),
-            managed_by: None,
-        });
         state.relays.push(RelayRecord {
             name: "relay-a".into(),
             endpoint_id: relay_id.clone(),
@@ -2339,93 +2253,24 @@ mod tests {
         for invite in &mut state.invites {
             invite.state = InviteState::Claimed;
             invite.terminal_at = Some(unix_timestamp());
-            invite.claimed_by = Some(match invite.invite.kind {
-                InviteKind::Center => center_id.clone(),
-                _ => relay_id.clone(),
-            });
+            invite.claimed_by = Some(relay_id.clone());
         }
         database.replace_sync(&state).unwrap();
         drop(database);
         drop(lock);
-        std::fs::remove_file(&center_out).unwrap();
         std::fs::remove_file(&relay_out).unwrap();
 
-        run_prepare().unwrap();
-        assert!(!center_out.exists());
+        run_bootstrap().unwrap();
         assert!(!relay_out.exists());
         assert!(
-            prepare(
+            bootstrap(
                 control_dir,
                 "http://127.0.0.1:9999".into(),
                 "test".into(),
-                "main".into(),
-                900,
-                center_out,
                 "relay-a".into(),
                 "http://127.0.0.1:3340".into(),
                 900,
                 relay_out,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn bootstrap_is_single_center_and_persistent() {
-        let dir = tempfile::tempdir().unwrap();
-        init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
-        bootstrap_center(dir.path().into(), "main".into(), 900).unwrap();
-        let (_, key, _, state) = open_exclusive(dir.path()).unwrap();
-        assert_eq!(state.invites.len(), 1);
-        assert_eq!(state.invites[0].invite.control_id, key.public().to_string());
-        drop(state);
-    }
-
-    #[test]
-    fn bootstrap_relay_is_signed_and_replaces_pending_invite() {
-        let dir = tempfile::tempdir().unwrap();
-        init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
-        bootstrap_relay(dir.path().into(), "relay-a".into(), "http://localhost:3340".into(), 900).unwrap();
-        bootstrap_relay(dir.path().into(), "relay-a".into(), "http://localhost:3340".into(), 900).unwrap();
-        let (_, key, _, state) = open_exclusive(dir.path()).unwrap();
-        assert_eq!(state.invites.len(), 1);
-        assert_eq!(state.invites[0].invite.control_id, key.public().to_string());
-        assert_eq!(
-            state.invites[0].invite.kind,
-            InviteKind::Relay {
-                url: "http://localhost:3340/".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn bootstrap_relay_validates_input() {
-        let dir = tempfile::tempdir().unwrap();
-        init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
-        assert!(
-            bootstrap_relay(
-                dir.path().into(),
-                "bad name".into(),
-                "https://relay.example.com".into(),
-                900,
-            )
-            .is_err()
-        );
-        assert!(
-            bootstrap_relay(
-                dir.path().into(),
-                "relay-a".into(),
-                "http://relay.example.com".into(),
-                900,
-            )
-            .is_err()
-        );
-        assert!(
-            bootstrap_relay(
-                dir.path().into(),
-                "relay-a".into(),
-                "https://relay.example.com".into(),
-                0,
             )
             .is_err()
         );

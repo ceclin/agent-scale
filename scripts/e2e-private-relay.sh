@@ -33,7 +33,6 @@ cargo build -q -p agent-scale -p as-control -p as-edge -p as-relay
 
 export AS_CONTROL_STATE_DIR="$TMP/control"
 "$BIN/as-control" init --public-url "$CONTROL_URL" --audience e2e >/dev/null
-center_join=$("$BIN/as-control" bootstrap center center)
 "$BIN/as-control" run --bind 127.0.0.1:35350 >"$TMP/control.out" 2>&1 &
 control_pid=$!
 
@@ -43,6 +42,7 @@ until curl -fsS "$CONTROL_URL/healthz" >/dev/null 2>&1; do
     sleep 0.05
 done
 
+center_join=$("$BIN/as-control" center invite center)
 AGENT_SCALE_HOME="$CENTER_HOME" "$BIN/agent-scale" control join "$center_join" >/dev/null
 relay_join=$("$BIN/as-control" relay invite relay-a "$RELAY_URL")
 printf '%s\n' "$relay_join" >"$TMP/relay.join"

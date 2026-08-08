@@ -24,8 +24,9 @@ The project uses semantic versioning after its first public release. Before
   topology revisions, restart recovery, and bounded invitation history.
 - Made private Relay enrollment Control-only, with signed membership snapshots,
   offline recovery, revocation, and immediate disconnection of removed members.
-- Added idempotent native Compose bootstrap through `as-control prepare` and
-  `as-relay run --join-if-needed`, removing the shell initialization services.
+- Added idempotent native Compose bootstrap through `as-control bootstrap` and
+  `as-relay run --join-if-needed`, with explicit Center enrollment and no shell
+  initialization services.
 - Added signed Provisioner reconciliation scoped by owner, including idempotent
   invitations and explicit Center/Edge lifecycle management.
 - Added repeatable snapshot distributions plus tag-driven prereleases and

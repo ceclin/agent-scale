@@ -15,13 +15,14 @@ proxy command traffic.
 The repository's `compose.yaml` starts one Control and one enrolled Relay:
 
 ```sh
-docker compose up -d
-agent-scale control join "$(docker compose run --rm --no-deps \
-  bootstrap cat /bootstrap/center.join)"
+docker compose up -d --wait
+agent-scale control join "$(docker compose exec -T \
+  control as-control center invite main)"
 ```
 
-Compose uses the native `as-control prepare` command to initialize durable
-state and atomically write first-enrollment invitations. The Relay runs
+Compose uses the native `as-control bootstrap` command to initialize durable
+state and atomically write the Relay enrollment invitation. Center enrollment
+remains an explicit administration action after Control starts. The Relay runs
 `as-relay run --join-if-needed`; it enrolls itself on the first start and later
 starts directly from its persisted profile and membership snapshot, without a
 shell init script or a Control-health dependency.
@@ -32,10 +33,10 @@ build the static binaries on the host and use the local override:
 
 ```sh
 scripts/build-compose-image.sh
-docker compose -f compose.yaml -f compose.local.yaml up -d
+docker compose -f compose.yaml -f compose.local.yaml up -d --wait
 agent-scale control join "$(docker compose \
-  -f compose.yaml -f compose.local.yaml run --rm --no-deps \
-  bootstrap cat /bootstrap/center.join)"
+  -f compose.yaml -f compose.local.yaml exec -T \
+  control as-control center invite main)"
 ```
 
 The default URLs (`http://localhost:3350` and `http://localhost:3340`) are for a
@@ -51,7 +52,6 @@ For use from other machines, create `.env` with externally reachable URLs:
 CONTROL_PUBLIC_URL=https://control.example.com
 RELAY_PUBLIC_URL=https://relay.example.com
 CONTROL_AUDIENCE=prod
-CONTROL_CENTER_NAME=main
 RELAY_NAME=primary
 RELAY_QAD_PORT=4433
 RELAY_QAD_BIND_PORT=7842
@@ -73,8 +73,8 @@ docker compose logs -f control relay
 docker compose down
 ```
 
-`docker compose down -v` also destroys the Control authority, Relay identity,
-and initial Center invitation. Back up both `control-state` and `relay-state`
+`docker compose down -v` also destroys the Control authority and Relay identity.
+Back up both `control-state` and `relay-state`
 for durable deployments. After Center and Relay enrollment, `bootstrap-data`
 contains only consumed invitation artifacts and is not needed to authorize the
 existing deployment.
@@ -106,12 +106,13 @@ as-control init \
   --audience prod
 ```
 
-Create the first Center invitation while the service is stopped, then start it:
+Start Control, then create the first Center invitation from another shell:
 
 ```sh
-as-control bootstrap center main
-
 as-control run --bind 127.0.0.1:3350
+
+# In another shell on the Control host:
+as-control center invite main
 ```
 
 Put TLS in front of port 3350. Plain HTTP is accepted only for loopback URLs.
@@ -120,7 +121,7 @@ Stop Control and back up the entire state directory, including `control.key`,
 over the entire network. The initial Center URL is single-use and expires after
 15 minutes.
 
-On the first development machine, use the URL printed by `bootstrap`:
+On the first development machine, use the URL printed by `center invite`:
 
 ```sh
 agent-scale control join '<center-url>'

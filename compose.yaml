@@ -30,17 +30,11 @@ services:
     <<: [*control-image, *container-defaults]
     command:
       - as-control
-      - prepare
+      - bootstrap
       - --public-url
       - ${CONTROL_PUBLIC_URL:-http://localhost:3350}
       - --audience
       - ${CONTROL_AUDIENCE:-agent-scale-local}
-      - --center
-      - ${CONTROL_CENTER_NAME:-main}
-      - --center-ttl-secs
-      - ${CONTROL_CENTER_TTL_SECS:-604800}
-      - --center-invite-out
-      - /bootstrap/center.join
       - --relay-name
       - ${RELAY_NAME:-primary}
       - --relay-url
