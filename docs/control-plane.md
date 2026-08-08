@@ -16,7 +16,8 @@ The repository's `compose.yaml` starts one Control and one enrolled Relay:
 
 ```sh
 docker compose up -d
-agent-scale control join "$(docker compose run --rm center-invite)"
+agent-scale control join "$(docker compose run --rm --no-deps \
+  bootstrap cat /bootstrap/center.join)"
 ```
 
 Compose uses the native `as-control prepare` command to initialize durable
@@ -33,7 +34,8 @@ build the static binaries on the host and use the local override:
 scripts/build-compose-image.sh
 docker compose -f compose.yaml -f compose.local.yaml up -d
 agent-scale control join "$(docker compose \
-  -f compose.yaml -f compose.local.yaml run --rm center-invite)"
+  -f compose.yaml -f compose.local.yaml run --rm --no-deps \
+  bootstrap cat /bootstrap/center.join)"
 ```
 
 The default URLs (`http://localhost:3350` and `http://localhost:3340`) are for a

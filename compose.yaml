@@ -82,16 +82,6 @@ services:
       retries: 30
     restart: unless-stopped
 
-  center-invite:
-    <<: *control-image
-    profiles: [tools]
-    command: cat /bootstrap/center.join
-    depends_on:
-      bootstrap:
-        condition: service_completed_successfully
-    volumes:
-      - bootstrap-data:/bootstrap:ro
-
 volumes:
   control-state:
   relay-state:

@@ -16,4 +16,3 @@ services:
     build:
       context: .
       target: relay
-  center-invite: *local-control-image
