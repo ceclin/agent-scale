@@ -212,9 +212,11 @@ as-edge join '<edge-url>' --install
 ```
 
 Linux installation uses a systemd user unit and copies the binary to
-`~/.local/bin/as-edge`. Windows installation uses a current-user logon task and
-copies it to `%LOCALAPPDATA%\AgentScale\bin\as-edge.exe`. Neither mode requests
-root, Administrator, or LocalSystem privileges.
+`~/.local/bin/as-edge`. macOS installation uses a per-user LaunchAgent and
+copies the binary to `~/Library/Application Support/AgentScale/bin/as-edge`.
+Windows installation uses a current-user logon task and copies it to
+`%LOCALAPPDATA%\AgentScale\bin\as-edge.exe`. None of these modes requests root,
+Administrator, or LocalSystem privileges.
 
 ## Add A Private Relay
 

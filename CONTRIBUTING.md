@@ -41,12 +41,12 @@ some end-to-end scenarios.
 - center CLI/daemon: Linux x86-64/ARM64, macOS ARM64/x86-64, and Windows
   x86-64 (experimental);
 - control and private relay: Linux;
-- edge: Linux x86-64, Linux ARM64, and Windows x86-64.
+- edge: Linux and macOS x86-64/ARM64, and Windows x86-64.
 
 Changes to platform-specific code should preserve these targets. CI checks the
-native Linux workspace, macOS Center, and Windows Center and Edge. Distribution
-cross-compiles Linux and Windows binaries with `cargo-zigbuild` and builds the
-macOS Center binaries natively.
+native Linux workspace, macOS Center and Edge, and Windows Center and Edge.
+Distribution cross-compiles Linux and Windows binaries with `cargo-zigbuild`
+and builds the macOS Center and Edge binaries natively.
 
 ## Change discipline
 

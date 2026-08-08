@@ -27,7 +27,7 @@ center's EndpointId. Later connections are strict. To avoid trust-on-first-use,
 run `agent-scale keygen` on the development machine and start the edge with
 `as-edge run test --center <CENTER_ENDPOINT_ID>`.
 
-For a persistent current-user service on Linux or Windows:
+For a persistent current-user service on Linux, macOS, or Windows:
 
 ```sh
 as-edge service install test

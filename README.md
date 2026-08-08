@@ -1,7 +1,7 @@
 # agent-scale
 
-Run commands, move files, and use MCP servers on remote Linux and Windows test
-machines over authenticated, direct [iroh](https://iroh.computer/) connections.
+Run commands, move files, and use MCP servers on remote Linux, macOS, and
+Windows test machines over authenticated, direct [iroh](https://iroh.computer/) connections.
 There is no shared command server and neither endpoint needs an inbound port.
 
 agent-scale is pre-release software. Its configuration and wire protocols may
@@ -12,7 +12,7 @@ change incompatibly before 1.0.
 | Binary | Runs on | Purpose |
 | --- | --- | --- |
 | `agent-scale` | Linux, macOS, or Windows x86-64 developer machine | CLI and auto-started local daemon |
-| `as-edge` | Linux x86-64/ARM64 or Windows x86-64 | Authenticated command, transfer, and MCP endpoint |
+| `as-edge` | Linux or macOS x86-64/ARM64, or Windows x86-64 | Authenticated command, transfer, and MCP endpoint |
 | `as-relay` | Linux relay host | Private iroh relay with signed dynamic membership |
 | `as-control` | Linux control host | Multi-center enrollment and signed desired state |
 

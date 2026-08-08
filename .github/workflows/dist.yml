@@ -159,13 +159,14 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  macos-center:
-    name: Build Center (${{ matrix.target }})
+  macos-binaries:
+    name: Build ${{ matrix.package }} (${{ matrix.target }})
     needs: [metadata, verify]
     runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
+        package: [agent-scale, as-edge]
         target: [aarch64-apple-darwin, x86_64-apple-darwin]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -176,25 +177,35 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: release-${{ matrix.target }}
-      - run: cargo build --locked --profile dist -p agent-scale --target ${{ matrix.target }}
+          key: release-${{ matrix.package }}-${{ matrix.target }}
+      - if: matrix.package == 'as-edge'
+        run: cargo x init
+      - run: cargo build --locked --profile dist -p ${{ matrix.package }} --target ${{ matrix.target }}
       - name: Stage and package binary
         shell: bash
         run: |
           set -euo pipefail
-          input="target/macos-dist/${{ matrix.target }}"
+          package="${{ matrix.package }}"
+          input="target/macos-dist/$package/${{ matrix.target }}"
           mkdir -p "$input"
-          cp "target/${{ matrix.target }}/dist/agent-scale" "$input/"
+          cp "target/${{ matrix.target }}/dist/$package" "$input/"
           cp LICENSE "$input/"
-          cp licenses/dependencies/agent-scale.html "$input/THIRD_PARTY_LICENSES.html"
+          cp "licenses/dependencies/$package.html" "$input/THIRD_PARTY_LICENSES.html"
+          if [ "$package" = "as-edge" ]; then
+            cp THIRD_PARTY.md "$input/"
+            mkdir -p "$input/licenses/fd" "$input/licenses/ripgrep"
+            cp .upstreams/fd/LICENSE-APACHE .upstreams/fd/LICENSE-MIT "$input/licenses/fd/"
+            cp .upstreams/ripgrep/LICENSE-MIT .upstreams/ripgrep/UNLICENSE "$input/licenses/ripgrep/"
+            cp licenses/ripgrep/LICENSE-BSD-3-Clause-zsh-users "$input/licenses/ripgrep/"
+          fi
           ./scripts/package-release.sh \
-            target/macos-dist \
-            agent-scale \
+            "target/macos-dist/$package" \
+            "$package" \
             "${{ needs.metadata.outputs.version }}" \
             target/release-artifacts
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-agent-scale-${{ matrix.target }}
+          name: release-${{ matrix.package }}-${{ matrix.target }}
           path: target/release-artifacts/*
           if-no-files-found: error
           retention-days: 1
@@ -251,7 +262,7 @@ jobs:
 
   snapshot-bundle:
     name: Assemble snapshot bundle
-    needs: [metadata, cross-binaries, macos-center, container-images]
+    needs: [metadata, cross-binaries, macos-binaries, container-images]
     if: needs.metadata.outputs.channel == 'snapshot'
     runs-on: ubuntu-latest
     steps:
@@ -282,7 +293,7 @@ jobs:
 
   github-release:
     name: Publish GitHub release
-    needs: [metadata, cross-binaries, macos-center, container-images]
+    needs: [metadata, cross-binaries, macos-binaries, container-images]
     if: needs.metadata.outputs.channel != 'snapshot'
     runs-on: ubuntu-latest
     permissions:
