@@ -19,6 +19,7 @@ control-api = { path = "../control-api" }
 iroh-base = { version = "1.0.3", features = ["key"] }
 rand = { workspace = true }
 relay-api = { path = "../relay-api" }
+rusqlite = { version = "0.38", features = ["bundled"] }
 scale-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -29,6 +30,7 @@ url = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+tower = "0.5"
 
 [lints]
 workspace = true

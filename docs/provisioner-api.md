@@ -154,7 +154,10 @@ Use a unique `request_id` for each logical operation. Invitation retries with
 the same request ID and action return the same join URL; reusing the ID for a
 different action is rejected. Deletes are semantically idempotent. Transfers
 include the Edge `endpoint_id` so a retry cannot mistake another same-named Edge
-for the original one.
+for the original one. Invitation request-ID idempotency lasts until the record
+is cleaned up: claimed and revoked records remain for seven days after their
+terminal transition, while expired pending records remain for seven days after
+expiration.
 
 For optimistic concurrency, copy the `revision` returned by `GetTopology` into
 `expected_revision` on a mutation. A stale revision returns HTTP 409. A
@@ -183,6 +186,9 @@ invitation. An expired invitation no longer reserves its name or blocks cleanup.
 
 Invitation TTL is bounded to seven days because an invitation is a bearer
 enrollment capability. Expiration only invalidates that unclaimed capability.
+Pending invitations are retained through expiry. Claimed, revoked, and expired
+records are cleaned up after a further seven days; this history cleanup does not
+remove nodes, advance the authorization revision, or notify NodeMap watchers.
 
 Claimed Centers and Edges have no lease or automatic expiry. A missed heartbeat,
 scheduler outage, or temporarily disconnected node therefore cannot silently

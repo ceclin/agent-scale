@@ -1,5 +1,7 @@
 //! Single-instance coordination server for centers, edges, and private relays.
 
+mod db;
+
 use std::{
     io::Write,
     net::SocketAddr,
@@ -208,29 +210,28 @@ enum LocalAdminResponse {
     Error(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct CenterRecord {
     name: String,
     endpoint_id: String,
-    #[serde(default)]
     managed_by: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct EdgeRecord {
     name: String,
     endpoint_id: String,
     owner_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct RelayRecord {
     name: String,
     endpoint_id: String,
     url: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct ProvisionerRecord {
     name: String,
     endpoint_id: String,
@@ -243,47 +244,39 @@ struct ProvisionerInfo {
     centers: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InviteState {
     Pending,
     Claimed,
     Revoked,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct InviteRecord {
     invite: Invite,
     state: InviteState,
     claimed_by: Option<String>,
-    #[serde(default)]
     request_id: Option<String>,
-    #[serde(default)]
     managed_by: Option<String>,
-    #[serde(default)]
     request_hash: Option<String>,
+    terminal_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct ControlState {
     schema: u32,
     audience: String,
     public_url: String,
     revision: u64,
-    #[serde(default)]
     centers: Vec<CenterRecord>,
-    #[serde(default)]
     edges: Vec<EdgeRecord>,
-    #[serde(default)]
     relays: Vec<RelayRecord>,
-    #[serde(default)]
     invites: Vec<InviteRecord>,
-    #[serde(default)]
     provisioners: Vec<ProvisionerRecord>,
 }
 
 struct Store {
-    dir: PathBuf,
+    database: db::Database,
     key: SecretKey,
     state: Mutex<ControlState>,
     changed: Notify,
@@ -408,7 +401,7 @@ fn init(dir: PathBuf, public_url: String, audience: String) -> Result<()> {
     let public_url = normalize_public_url(&public_url)?;
     scale_core::ensure_private_dir(&dir)?;
     anyhow::ensure!(
-        !key_path(&dir).exists() && !state_path(&dir).exists(),
+        !key_path(&dir).exists() && !database_path(&dir).exists(),
         "control state already exists"
     );
     let key = scale_core::load_or_create_secret(&key_path(&dir))?;
@@ -423,7 +416,7 @@ fn init(dir: PathBuf, public_url: String, audience: String) -> Result<()> {
         invites: vec![],
         provisioners: vec![],
     };
-    persist_state(&dir, &state)?;
+    db::Database::create(&database_path(&dir), &state)?;
     println!("initialized control {}", key.public());
     println!("next: as-control bootstrap center <name>");
     Ok(())
@@ -431,7 +424,7 @@ fn init(dir: PathBuf, public_url: String, audience: String) -> Result<()> {
 
 fn bootstrap_center(dir: PathBuf, name: String, ttl_secs: u64) -> Result<()> {
     validate_name(&name)?;
-    let (_lock, key, mut state) = open_exclusive(&dir)?;
+    let (_lock, key, database, mut state) = open_exclusive(&dir)?;
     anyhow::ensure!(
         state.centers.is_empty(),
         "a Center already exists; use `as-control center invite`"
@@ -440,7 +433,7 @@ fn bootstrap_center(dir: PathBuf, name: String, ttl_secs: u64) -> Result<()> {
         .invites
         .retain(|invite| !matches!(invite.invite.kind, InviteKind::Center));
     let result = create_invite(&key, &mut state, name, InviteKind::Center, ttl_secs)?;
-    persist_state(&dir, &state)?;
+    database.replace_sync(&state)?;
     println!("{}", result.join_url);
     Ok(())
 }
@@ -448,7 +441,7 @@ fn bootstrap_center(dir: PathBuf, name: String, ttl_secs: u64) -> Result<()> {
 fn bootstrap_relay(dir: PathBuf, name: String, url: String, ttl_secs: u64) -> Result<()> {
     validate_name(&name)?;
     let url = normalize_relay_url(&url)?;
-    let (_lock, key, mut state) = open_exclusive(&dir)?;
+    let (_lock, key, database, mut state) = open_exclusive(&dir)?;
     anyhow::ensure!(
         state.relays.is_empty(),
         "a Relay already exists; use `as-control relay invite`"
@@ -457,35 +450,28 @@ fn bootstrap_relay(dir: PathBuf, name: String, url: String, ttl_secs: u64) -> Re
         !matches!(invite.invite.kind, InviteKind::Relay { .. }) || invite.state == InviteState::Claimed
     });
     let result = create_invite(&key, &mut state, name, InviteKind::Relay { url }, ttl_secs)?;
-    persist_state(&dir, &state)?;
+    database.replace_sync(&state)?;
     println!("{}", result.join_url);
     Ok(())
 }
 
 async fn run(dir: PathBuf, bind: SocketAddr, admin_socket: PathBuf) -> Result<()> {
-    let (lock, key, state) = open_exclusive(&dir)?;
+    let (lock, key, database, mut state) = open_exclusive(&dir)?;
     anyhow::ensure!(
         state.schema == STATE_SCHEMA,
         "unsupported state schema {}",
         state.schema
     );
+    cleanup_invitations(&mut state, unix_timestamp());
+    database.replace_sync(&state)?;
     let store = Arc::new(Store {
-        dir,
+        database,
         key,
         state: Mutex::new(state),
         changed: Notify::new(),
         _lock: lock,
     });
-    let app_state = AppState(store.clone());
-    let app = Router::new()
-        .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
-        .route("/v1/status", get(status))
-        .route("/v1/claim", post(claim))
-        .route("/v1/edge/invite", post(center_edge_invite))
-        .route("/v1/provisioner", post(provisioner_request))
-        .route("/v1/watch", post(watch))
-        .route("/v1/relay/watch", post(relay_watch))
-        .with_state(app_state);
+    let app = public_router(store.clone());
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
@@ -497,11 +483,27 @@ async fn run(dir: PathBuf, bind: SocketAddr, admin_socket: PathBuf) -> Result<()
     drop(state);
     std::io::stdout().flush()?;
     info!(bind = %actual, socket = %admin_socket.display(), control_id = %store.key.public(), "control started");
+    let cleanup_store = store.clone();
+    let cleanup = tokio::spawn(async move { invitation_cleanup_loop(cleanup_store).await });
     let admin = tokio::spawn(serve_local_admin(admin_socket, store));
     tokio::select! {
         result = axum::serve(listener, app) => result.context("control server"),
         result = admin => result.context("local administration task")?,
-    }
+    }?;
+    cleanup.abort();
+    Ok(())
+}
+
+fn public_router(store: Arc<Store>) -> Router {
+    Router::new()
+        .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
+        .route("/v1/status", get(status))
+        .route("/v1/claim", post(claim))
+        .route("/v1/edge/invite", post(center_edge_invite))
+        .route("/v1/provisioner", post(provisioner_request))
+        .route("/v1/watch", post(watch))
+        .route("/v1/relay/watch", post(relay_watch))
+        .with_state(AppState(store))
 }
 
 async fn status(State(AppState(store)): State<AppState>) -> Json<ControlStatus> {
@@ -551,12 +553,13 @@ async fn claim(
     add_claimed_node(&mut next, &invite, endpoint_id, managed_by.as_deref())?;
     next.invites[index].state = InviteState::Claimed;
     next.invites[index].claimed_by = Some(endpoint_id.to_string());
+    next.invites[index].terminal_at = Some(now);
     next.revision = next
         .revision
         .checked_add(1)
         .ok_or_else(|| ApiError::internal("revision overflow"))?;
     let map = signed_map(&next, &store.key, endpoint_id).map_err(ApiError::internal)?;
-    persist_candidate(&store, &mut state, next, true)?;
+    persist_candidate(&store, &mut state, next, true).await?;
     Ok(Json(JoinResult {
         name: invite.name,
         kind: invite.kind,
@@ -605,7 +608,7 @@ async fn center_edge_invite(
         .last_mut()
         .expect("create_invite always appends an invitation")
         .managed_by = managed_by;
-    commit_candidate(&store, &mut state, next)?;
+    commit_candidate(&store, &mut state, next).await?;
     Ok(Json(result))
 }
 
@@ -645,11 +648,11 @@ async fn provisioner_request(
         ))));
     }
 
-    let response = dispatch_provisioner_mutation(&store, &mut state, &provisioner_id, &request)?;
+    let response = dispatch_provisioner_mutation(&store, &mut state, &provisioner_id, &request).await?;
     Ok(Json(response))
 }
 
-fn dispatch_provisioner_mutation(
+async fn dispatch_provisioner_mutation(
     store: &Store,
     state: &mut ControlState,
     provisioner_id: &str,
@@ -657,16 +660,19 @@ fn dispatch_provisioner_mutation(
 ) -> Result<ProvisionerResponse, ApiError> {
     match &request.action {
         ProvisionerAction::GetTopology => unreachable!("queries are handled before mutation dispatch"),
-        ProvisionerAction::InviteCenter { name, ttl_secs, secret } => provisioner_invite(
-            store,
-            state,
-            provisioner_id,
-            request,
-            name,
-            InviteKind::Center,
-            *ttl_secs,
-            secret,
-        ),
+        ProvisionerAction::InviteCenter { name, ttl_secs, secret } => {
+            provisioner_invite(
+                store,
+                state,
+                provisioner_id,
+                request,
+                name,
+                InviteKind::Center,
+                *ttl_secs,
+                secret,
+            )
+            .await
+        }
         ProvisionerAction::InviteEdge {
             owner,
             name,
@@ -684,6 +690,7 @@ fn dispatch_provisioner_mutation(
                 *ttl_secs,
                 secret,
             )
+            .await
         }
         ProvisionerAction::RevokeInvite { invite_id } => {
             let Some(index) = state.invites.iter().position(|item| {
@@ -699,7 +706,8 @@ fn dispatch_provisioner_mutation(
             check_expected_revision(state, request.expected_revision)?;
             let mut next = state.clone();
             next.invites[index].state = InviteState::Revoked;
-            commit_candidate(store, state, next)?;
+            next.invites[index].terminal_at = Some(unix_timestamp());
+            commit_candidate(store, state, next).await?;
             provisioner_ok(state)
         }
         ProvisionerAction::RemoveCenter { name } => {
@@ -726,7 +734,7 @@ fn dispatch_provisioner_mutation(
             check_expected_revision(state, request.expected_revision)?;
             let mut next = state.clone();
             next.centers.retain(|item| item.endpoint_id != center.endpoint_id);
-            commit_candidate(store, state, next)?;
+            commit_candidate(store, state, next).await?;
             provisioner_ok(state)
         }
         ProvisionerAction::RemoveEdge { owner, name } => {
@@ -742,7 +750,7 @@ fn dispatch_provisioner_mutation(
             let mut next = state.clone();
             next.edges
                 .retain(|item| !(item.owner_id == owner_id && item.name == *name));
-            commit_candidate(store, state, next)?;
+            commit_candidate(store, state, next).await?;
             provisioner_ok(state)
         }
         ProvisionerAction::TransferEdge {
@@ -785,14 +793,14 @@ fn dispatch_provisioner_mutation(
                 .find(|item| item.owner_id == owner_id && item.name == *name && item.endpoint_id == endpoint_id)
                 .expect("managed edge was checked above")
                 .owner_id = new_owner_id;
-            commit_candidate(store, state, next)?;
+            commit_candidate(store, state, next).await?;
             provisioner_ok(state)
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn provisioner_invite(
+async fn provisioner_invite(
     store: &Store,
     state: &mut ControlState,
     provisioner_id: &str,
@@ -834,7 +842,7 @@ fn provisioner_invite(
     record.request_id = Some(request.request_id.clone());
     record.managed_by = Some(provisioner_id.to_owned());
     record.request_hash = Some(request_hash);
-    commit_candidate(store, state, next)?;
+    commit_candidate(store, state, next).await?;
     Ok(ProvisionerResponse::Invite(result))
 }
 
@@ -1091,11 +1099,14 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
                 .iter_mut()
                 .find(|item| item.invite.invite_id == invite_id)
                 .ok_or_else(|| ApiError::bad("unknown invite"))?;
-            if invite.state == InviteState::Claimed {
-                return Err(ApiError::conflict("claimed invites cannot be revoked"));
+            match invite.state {
+                InviteState::Pending => {}
+                InviteState::Claimed => return Err(ApiError::conflict("claimed invites cannot be revoked")),
+                InviteState::Revoked => return Ok(LocalAdminResponse::Ok),
             }
             invite.state = InviteState::Revoked;
-            commit_candidate(store, &mut state, next)?;
+            invite.terminal_at = Some(unix_timestamp());
+            commit_candidate(store, &mut state, next).await?;
             Ok(LocalAdminResponse::Ok)
         }
         LocalAdminRequest::RemoveCenter { name } => {
@@ -1120,7 +1131,7 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
             }
             let mut next = state.clone();
             next.centers.retain(|item| item.endpoint_id != center.endpoint_id);
-            commit_candidate(store, &mut state, next)?;
+            commit_candidate(store, &mut state, next).await?;
             Ok(LocalAdminResponse::Ok)
         }
         LocalAdminRequest::TransferEdge { edge, new_center } => {
@@ -1142,7 +1153,7 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
                 .find(|item| item.owner_id == old_owner && item.name == edge_name)
                 .ok_or_else(|| ApiError::bad(format!("unknown edge '{edge}'")))?;
             record.owner_id = new_owner;
-            commit_candidate(store, &mut state, next)?;
+            commit_candidate(store, &mut state, next).await?;
             Ok(LocalAdminResponse::Ok)
         }
         LocalAdminRequest::RemoveEdge { edge } => {
@@ -1156,7 +1167,7 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
             if next.edges.len() == before {
                 return Err(ApiError::bad(format!("unknown edge '{edge}'")));
             }
-            commit_candidate(store, &mut state, next)?;
+            commit_candidate(store, &mut state, next).await?;
             Ok(LocalAdminResponse::Ok)
         }
         LocalAdminRequest::RemoveRelay { name } => {
@@ -1167,7 +1178,7 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
             if next.relays.len() == before {
                 return Err(ApiError::bad(format!("unknown relay '{name}'")));
             }
-            commit_candidate(store, &mut state, next)?;
+            commit_candidate(store, &mut state, next).await?;
             Ok(LocalAdminResponse::Ok)
         }
         LocalAdminRequest::AddProvisioner { name, endpoint_id } => {
@@ -1186,7 +1197,7 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
             }
             let mut next = state.clone();
             next.provisioners.push(ProvisionerRecord { name, endpoint_id });
-            commit_candidate(store, &mut state, next)?;
+            commit_candidate(store, &mut state, next).await?;
             Ok(LocalAdminResponse::Ok)
         }
         LocalAdminRequest::RemoveProvisioner { name } => {
@@ -1209,7 +1220,7 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
             let mut next = state.clone();
             next.provisioners
                 .retain(|item| item.endpoint_id != provisioner.endpoint_id);
-            commit_candidate(store, &mut state, next)?;
+            commit_candidate(store, &mut state, next).await?;
             Ok(LocalAdminResponse::Ok)
         }
     }
@@ -1231,7 +1242,7 @@ async fn local_create_invite(
         .last_mut()
         .expect("create_invite always appends an invitation")
         .managed_by = managed_by;
-    commit_candidate(store, &mut state, next)?;
+    commit_candidate(store, &mut state, next).await?;
     Ok(LocalAdminResponse::Invite(result))
 }
 
@@ -1382,26 +1393,55 @@ fn print_admin_response(response: LocalAdminResponse) -> Result<()> {
     Ok(())
 }
 
-fn commit_candidate(store: &Store, current: &mut ControlState, mut next: ControlState) -> Result<(), ApiError> {
+async fn commit_candidate(store: &Store, current: &mut ControlState, mut next: ControlState) -> Result<(), ApiError> {
     next.revision = next
         .revision
         .checked_add(1)
         .ok_or_else(|| ApiError::internal("revision overflow"))?;
-    persist_candidate(store, current, next, true)
+    persist_candidate(store, current, next, true).await
 }
 
-fn persist_candidate(
+async fn persist_candidate(
     store: &Store,
     current: &mut ControlState,
     next: ControlState,
     notify: bool,
 ) -> Result<(), ApiError> {
-    persist_state(&store.dir, &next).map_err(ApiError::internal)?;
+    store.database.replace(next.clone()).await.map_err(ApiError::internal)?;
     *current = next;
     if notify {
         store.changed.notify_waiters();
     }
     Ok(())
+}
+
+const INVITATION_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+
+fn cleanup_invitations(state: &mut ControlState, now: i64) -> bool {
+    let before = state.invites.len();
+    state.invites.retain(|invite| {
+        let terminal = match invite.state {
+            InviteState::Pending => invite.invite.expires_at,
+            InviteState::Claimed | InviteState::Revoked => invite.terminal_at.unwrap_or(now),
+        };
+        now < terminal.saturating_add(INVITATION_RETENTION_SECS)
+    });
+    state.invites.len() != before
+}
+
+async fn invitation_cleanup_loop(store: Arc<Store>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let mut current = store.state.lock().await;
+        let mut next = current.clone();
+        if cleanup_invitations(&mut next, unix_timestamp())
+            && let Err(error) = persist_candidate(&store, &mut current, next, false).await
+        {
+            tracing::warn!(message = %error.message, "invitation cleanup failed");
+        }
+    }
 }
 
 fn add_claimed_node(
@@ -1554,6 +1594,7 @@ fn create_invite_with_secret(
         request_id: None,
         managed_by: None,
         request_hash: None,
+        terminal_at: None,
     });
     Ok(InviteResult {
         invite_id,
@@ -1756,23 +1797,20 @@ fn random_token(bytes: usize) -> String {
     URL_SAFE_NO_PAD.encode(value)
 }
 
-fn open_exclusive(dir: &Path) -> Result<(scale_core::FileLock, SecretKey, ControlState)> {
+fn open_exclusive(dir: &Path) -> Result<(scale_core::FileLock, SecretKey, db::Database, ControlState)> {
     let lock = scale_core::FileLock::try_acquire(&lock_path(dir))
         .context("control state is already in use (stop as-control before offline bootstrap)")?;
+    let database = db::Database::open(&database_path(dir))?;
     let key = scale_core::read_secret(&key_path(dir))?;
-    let state = scale_core::read_json(&state_path(dir))?;
-    Ok((lock, key, state))
-}
-
-fn persist_state(dir: &Path, state: &ControlState) -> Result<()> {
-    scale_core::write_json(&state_path(dir), state)
+    let state = database.load()?;
+    Ok((lock, key, database, state))
 }
 
 fn key_path(dir: &Path) -> PathBuf {
     dir.join("control.key")
 }
-fn state_path(dir: &Path) -> PathBuf {
-    dir.join("state.json")
+fn database_path(dir: &Path) -> PathBuf {
+    dir.join("control.db")
 }
 fn lock_path(dir: &Path) -> PathBuf {
     dir.join("control.lock")
@@ -1787,7 +1825,9 @@ fn unix_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::Request;
     use control_api::ProvisionerHttpRequest;
+    use tower::ServiceExt;
 
     async fn send_provisioner_request(
         store: Arc<Store>,
@@ -1796,6 +1836,25 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, request.authorization.parse().unwrap());
         provisioner_request(State(AppState(store)), headers, Bytes::from(request.body)).await
+    }
+
+    async fn send_provisioner_http(store: Arc<Store>, request: ProvisionerHttpRequest) -> (StatusCode, Vec<u8>) {
+        let response = public_router(store)
+            .oneshot(
+                Request::post("/v1/provisioner")
+                    .header(AUTHORIZATION, request.authorization)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(request.body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, body)
     }
 
     #[test]
@@ -1809,7 +1868,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
         bootstrap_center(dir.path().into(), "main".into(), 900).unwrap();
-        let (_, key, state) = open_exclusive(dir.path()).unwrap();
+        let (_, key, _, state) = open_exclusive(dir.path()).unwrap();
         assert_eq!(state.invites.len(), 1);
         assert_eq!(state.invites[0].invite.control_id, key.public().to_string());
         drop(state);
@@ -1821,7 +1880,7 @@ mod tests {
         init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
         bootstrap_relay(dir.path().into(), "relay-a".into(), "http://localhost:3340".into(), 900).unwrap();
         bootstrap_relay(dir.path().into(), "relay-a".into(), "http://localhost:3340".into(), 900).unwrap();
-        let (_, key, state) = open_exclusive(dir.path()).unwrap();
+        let (_, key, _, state) = open_exclusive(dir.path()).unwrap();
         assert_eq!(state.invites.len(), 1);
         assert_eq!(state.invites[0].invite.control_id, key.public().to_string());
         assert_eq!(
@@ -1903,51 +1962,51 @@ mod tests {
         assert_eq!(signed_map(&state, &key, b.public()).unwrap().map.edges.len(), 1);
     }
 
-    #[test]
-    fn failed_persistence_does_not_publish_candidate_state() {
+    #[tokio::test]
+    async fn failed_persistence_does_not_publish_candidate_state() {
         let dir = tempfile::tempdir().unwrap();
-        let invalid_dir = dir.path().join("not-a-directory");
-        std::fs::write(&invalid_dir, b"file").unwrap();
+        init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
+        let (lock, _control_key, database, mut current) = open_exclusive(dir.path()).unwrap();
         let key = SecretKey::generate();
-        let mut current = ControlState {
-            schema: STATE_SCHEMA,
-            audience: "test".into(),
-            public_url: "http://127.0.0.1:1".into(),
-            revision: 1,
-            centers: vec![],
-            edges: vec![],
-            relays: vec![],
-            invites: vec![],
-            provisioners: vec![],
-        };
         let mut next = current.clone();
-        next.revision = 2;
+        next.centers = vec![
+            CenterRecord {
+                name: "duplicate".into(),
+                endpoint_id: key.public().to_string(),
+                managed_by: None,
+            },
+            CenterRecord {
+                name: "duplicate".into(),
+                endpoint_id: SecretKey::generate().public().to_string(),
+                managed_by: None,
+            },
+        ];
         let store = Store {
-            dir: invalid_dir,
+            database,
             key,
             state: Mutex::new(current.clone()),
             changed: Notify::new(),
-            _lock: scale_core::FileLock::acquire(&dir.path().join("control.lock")).unwrap(),
+            _lock: lock,
         };
 
-        assert!(persist_candidate(&store, &mut current, next, true).is_err());
-        assert_eq!(current.revision, 1);
+        assert!(persist_candidate(&store, &mut current, next, true).await.is_err());
+        assert_eq!(current.revision, 0);
     }
 
     #[tokio::test]
     async fn center_edge_invites_are_self_owned_and_replay_protected() {
         let dir = tempfile::tempdir().unwrap();
         init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
-        let (lock, control_key, mut state) = open_exclusive(dir.path()).unwrap();
+        let (lock, control_key, database, mut state) = open_exclusive(dir.path()).unwrap();
         let center = SecretKey::generate();
         state.centers.push(CenterRecord {
             name: "main".into(),
             endpoint_id: center.public().to_string(),
             managed_by: None,
         });
-        persist_state(dir.path(), &state).unwrap();
+        database.replace_sync(&state).unwrap();
         let store = Arc::new(Store {
-            dir: dir.path().into(),
+            database,
             key: control_key,
             state: Mutex::new(state),
             changed: Notify::new(),
@@ -2001,7 +2060,7 @@ mod tests {
     async fn provisioner_requests_are_scoped_authenticated_and_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
-        let (lock, control_key, mut state) = open_exclusive(dir.path()).unwrap();
+        let (lock, control_key, database, mut state) = open_exclusive(dir.path()).unwrap();
         let provisioner = SecretKey::generate();
         let other_provisioner = SecretKey::generate();
         let center = SecretKey::generate();
@@ -2028,9 +2087,9 @@ mod tests {
                 managed_by: Some(other_provisioner.public().to_string()),
             },
         ];
-        persist_state(dir.path(), &state).unwrap();
+        database.replace_sync(&state).unwrap();
         let store = Arc::new(Store {
-            dir: dir.path().into(),
+            database,
             key: control_key,
             state: Mutex::new(state),
             changed: Notify::new(),
@@ -2133,15 +2192,15 @@ mod tests {
     async fn provisioner_enrollment_persists_center_edge_grouping() {
         let dir = tempfile::tempdir().unwrap();
         init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
-        let (lock, control_key, mut state) = open_exclusive(dir.path()).unwrap();
+        let (lock, control_key, database, mut state) = open_exclusive(dir.path()).unwrap();
         let provisioner = SecretKey::generate();
         state.provisioners.push(ProvisionerRecord {
             name: "controller".into(),
             endpoint_id: provisioner.public().to_string(),
         });
-        persist_state(dir.path(), &state).unwrap();
+        database.replace_sync(&state).unwrap();
         let store = Arc::new(Store {
-            dir: dir.path().into(),
+            database,
             key: control_key,
             state: Mutex::new(state),
             changed: Notify::new(),
@@ -2223,5 +2282,105 @@ mod tests {
         create_invite(&key, &mut state, "job".into(), InviteKind::Center, 1).unwrap();
         state.invites[0].invite.expires_at = unix_timestamp() - 1;
         assert!(validate_invite_name(&state, "job", &InviteKind::Center).is_ok());
+    }
+
+    #[test]
+    fn invitation_cleanup_retains_terminal_history_for_seven_days_without_revision_change() {
+        let key = SecretKey::generate();
+        let now = unix_timestamp();
+        let mut state = ControlState {
+            schema: STATE_SCHEMA,
+            audience: "test".into(),
+            public_url: "http://127.0.0.1:1".into(),
+            revision: 9,
+            centers: vec![],
+            edges: vec![],
+            relays: vec![],
+            invites: vec![],
+            provisioners: vec![],
+        };
+        for name in ["recent-expired", "old-expired", "recent-claimed", "old-revoked"] {
+            create_invite(&key, &mut state, name.into(), InviteKind::Center, 60).unwrap();
+        }
+        state.invites[0].invite.expires_at = now - 60;
+        state.invites[1].invite.expires_at = now - INVITATION_RETENTION_SECS - 1;
+        state.invites[2].state = InviteState::Claimed;
+        state.invites[2].terminal_at = Some(now - 60);
+        state.invites[3].state = InviteState::Revoked;
+        state.invites[3].terminal_at = Some(now - INVITATION_RETENTION_SECS - 1);
+        assert!(cleanup_invitations(&mut state, now));
+        assert_eq!(
+            state
+                .invites
+                .iter()
+                .map(|item| item.invite.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["recent-expired", "recent-claimed"]
+        );
+        assert_eq!(state.revision, 9);
+    }
+
+    #[tokio::test]
+    async fn provisioner_http_is_idempotent_and_recovers_topology_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
+        let (lock, key, database, mut state) = open_exclusive(dir.path()).unwrap();
+        let provisioner = SecretKey::generate();
+        state.provisioners.push(ProvisionerRecord {
+            name: "controller".into(),
+            endpoint_id: provisioner.public().to_string(),
+        });
+        database.replace_sync(&state).unwrap();
+        let store = Arc::new(Store {
+            database,
+            key,
+            state: Mutex::new(state),
+            changed: Notify::new(),
+            _lock: lock,
+        });
+        let invite = ProvisionerRequest::sign(
+            &provisioner,
+            "test".into(),
+            "http-idempotency".into(),
+            unix_timestamp(),
+            Some(0),
+            ProvisionerAction::InviteCenter {
+                name: "job".into(),
+                ttl_secs: 900,
+                secret: "s".repeat(43),
+            },
+        )
+        .unwrap();
+        let first = send_provisioner_http(store.clone(), invite.clone()).await;
+        let retry = send_provisioner_http(store.clone(), invite).await;
+        assert_eq!(first.0, StatusCode::OK);
+        assert_eq!(first, retry);
+        drop(store);
+
+        let (lock, key, database, state) = open_exclusive(dir.path()).unwrap();
+        let store = Arc::new(Store {
+            database,
+            key,
+            state: Mutex::new(state),
+            changed: Notify::new(),
+            _lock: lock,
+        });
+        let topology = ProvisionerRequest::sign(
+            &provisioner,
+            "test".into(),
+            "topology-after-restart".into(),
+            unix_timestamp(),
+            None,
+            ProvisionerAction::GetTopology,
+        )
+        .unwrap();
+        let (status, body) = send_provisioner_http(store, topology).await;
+        assert_eq!(status, StatusCode::OK);
+        let response: ProvisionerResponse = serde_json::from_slice(&body).unwrap();
+        let ProvisionerResponse::Topology(topology) = response else {
+            panic!("expected topology")
+        };
+        assert_eq!(topology.revision, 1);
+        assert_eq!(topology.invites.len(), 1);
     }
 }

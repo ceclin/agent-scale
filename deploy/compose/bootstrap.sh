@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-if [ ! -f /control/state.json ]; then
+if [ ! -f /control/control.db ]; then
   as-control init \
     --public-url "$CONTROL_PUBLIC_URL" \
     --audience "$CONTROL_AUDIENCE"

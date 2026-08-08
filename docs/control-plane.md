@@ -75,6 +75,11 @@ administration socket is always `$AS_CONTROL_STATE_DIR/admin.sock` and has
 no independent option. This keeps the identity, durable state, instance lock,
 and local administration endpoint in one instance directory.
 
+Durable topology lives in `$AS_CONTROL_STATE_DIR/control.db`. Control uses one
+bundled SQLite connection with foreign keys, WAL, full synchronization, and
+explicit schema migrations. It remains a single-instance service; SQLite is
+not an HA or multi-writer boundary.
+
 Initialize the durable identity once:
 
 ```sh
@@ -92,7 +97,8 @@ as-control run --bind 127.0.0.1:3350
 ```
 
 Put TLS in front of port 3350. Plain HTTP is accepted only for loopback URLs.
-Back up `control.key` and `state.json`; possession of `control.key` is authority
+Stop Control and back up the entire state directory, including `control.key`,
+`control.db`, and its SQLite sidecar files. Possession of `control.key` is authority
 over the entire network. The initial Center URL is single-use and expires after
 15 minutes.
 
@@ -160,6 +166,13 @@ does not create Kubernetes Jobs, Pods, VMs, or processes; the controller owns
 those resources and their lifecycle. Control persists the authoritative
 identity grouping and isolates each Provisioner's partition.
 
+In a hosted deployment, Control remotely manages authorization topology only.
+Allocation, environment metadata, workload lifecycle, and command routing stay
+in the external controller or scheduler. A typical Agent Job creates one
+temporary Center; reallocating a machine destroys and recreates its Edge
+identity instead of transferring it. `edge transfer` remains available for
+manual administration, but is not the recommended hosted lifecycle.
+
 ```sh
 docker compose exec control \
   as-control provisioner add lab-controller <controller-endpoint-id>
@@ -226,6 +239,6 @@ available; an offline node applies revocation when it reconnects. This is the
 same availability tradeoff used by coordination systems that retain their last
 network map.
 
-Legacy `as-edge run --relay ...` and single-center `as-relay run --center ...`
-remain available for standalone deployments and cannot be mixed with a
-control-managed profile.
+Simple `as-edge run --relay ...` remains available with official or ordinary
+open custom relays. Every authorization-enforcing private `as-relay` uses the
+Control-managed flow, including personal single-Center deployments.

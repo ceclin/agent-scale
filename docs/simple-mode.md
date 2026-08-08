@@ -36,8 +36,9 @@ as-edge service status test
 
 ## Custom Relay
 
-Simple mode can use a private or development relay without adding a control
-plane. Pass the same relay URL on both machines:
+Simple mode can use an ordinary custom or development relay without adding a
+control plane. It cannot administer a private relay allowlist. Pass the same
+relay URL on both machines:
 
 ```sh
 as-edge run test --relay https://relay.example.com
