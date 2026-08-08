@@ -9,9 +9,25 @@ x-relay-image: &relay-image
 x-environment: &environment
   AS_CONTROL_STATE_DIR: /control
 
+x-container-defaults: &container-defaults
+  init: true
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+  stop_grace_period: 15s
+
 services:
   bootstrap:
-    <<: *control-image
+    <<: [*control-image, *container-defaults]
     command:
       - as-control
       - prepare
@@ -26,7 +42,7 @@ services:
       - --center-invite-out
       - /bootstrap/center.join
       - --relay-name
-      - ${RELAY_NAME:-relay-a}
+      - ${RELAY_NAME:-primary}
       - --relay-url
       - ${RELAY_PUBLIC_URL:-http://localhost:3340}
       - --relay-ttl-secs
@@ -40,7 +56,7 @@ services:
     restart: "no"
 
   control:
-    <<: *control-image
+    <<: [*control-image, *container-defaults]
     command: as-control run --bind 0.0.0.0:3350
     environment: *environment
     depends_on:
@@ -55,10 +71,11 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
+      start_period: 5s
     restart: unless-stopped
 
   relay:
-    <<: *relay-image
+    <<: [*relay-image, *container-defaults]
     command: >-
       as-relay run
       --relay-bind 0.0.0.0:3340
@@ -83,6 +100,7 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
+      start_period: 5s
     restart: unless-stopped
 
 volumes:

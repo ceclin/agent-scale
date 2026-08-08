@@ -41,6 +41,9 @@ agent-scale control join "$(docker compose \
 The default URLs (`http://localhost:3350` and `http://localhost:3340`) are for a
 same-machine evaluation. State is kept in named Docker volumes, so subsequent
 `docker compose up -d` calls retain all identities and enrollment.
+The containers use read-only root filesystems with writable state volumes,
+drop Linux capabilities, and rotate their local JSON logs at three 10 MiB
+files per service.
 
 For use from other machines, create `.env` with externally reachable URLs:
 
@@ -49,7 +52,7 @@ CONTROL_PUBLIC_URL=https://control.example.com
 RELAY_PUBLIC_URL=https://relay.example.com
 CONTROL_AUDIENCE=prod
 CONTROL_CENTER_NAME=main
-RELAY_NAME=relay-a
+RELAY_NAME=primary
 RELAY_QAD_PORT=4433
 RELAY_QAD_BIND_PORT=7842
 ```
