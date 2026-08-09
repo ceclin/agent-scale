@@ -7,9 +7,11 @@ The project uses semantic versioning after its first public release. Before
 
 ## Unreleased
 
-- Renamed the development-side Center role to Client across CLI commands,
-  signed APIs, persisted state, filesystem paths, and documentation; advanced
-  the incompatible Control and RPC protocol versions.
+## 0.6.0 - 2026-08-09
+
+- Standardized the development-side role as Client across CLI commands, signed
+  APIs, persisted state, filesystem paths, and documentation; advanced the
+  incompatible Control and RPC protocol versions.
 - Added configurable Relay QAD UDP ports and Control-managed private TLS:
   Relays generate their own keys and CSRs, while Control signs certificates and
   distributes its dedicated CA through the signed topology.

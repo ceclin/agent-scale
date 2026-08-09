@@ -11,7 +11,7 @@ Run the `Distribution` workflow manually and optionally enter a branch, tag, or
 commit in `ref`. Leaving it empty snapshots the ref selected in the workflow UI.
 No version or changelog edit is required.
 
-Snapshot archives use a version such as `0.5.0-snapshot.42.0123456789ab`, are
+Snapshot archives use a version such as `0.6.0-snapshot.42.0123456789ab`, are
 available as a single GitHub Actions artifact for 14 days, and include a
 consolidated `SHA256SUMS`. Build jobs retain their internal transfer artifacts
 for one day only. Control and Relay images receive three tags:
@@ -26,12 +26,12 @@ Snapshot publication never creates a GitHub Release and never advances
 ## Prepare a prerelease or release
 
 1. Set `[workspace.package].version` to an unprefixed semantic version such as
-   `0.5.0-preview.1` or `0.5.0`, then refresh `Cargo.lock`.
+   `0.6.0-preview.1` or `0.6.0`, then refresh `Cargo.lock`.
 2. Move the completed entries from `Unreleased` into a dated heading with the
-   exact form `## 0.5.0 - YYYY-MM-DD` in `CHANGELOG.md`.
+   exact form `## 0.6.0 - YYYY-MM-DD` in `CHANGELOG.md`.
 3. Run `cargo x lint`, `cargo x test`, and the relevant end-to-end tests.
 4. Land the release change on `main`, then create and push the matching tag,
-   such as `v0.5.0-preview.1` or `v0.5.0`.
+   such as `v0.6.0-preview.1` or `v0.6.0`.
 
 The release workflow rejects malformed tags, tags that do not match the
 workspace version, and versions without a dated changelog heading. Do not reuse
