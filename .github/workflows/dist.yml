@@ -128,6 +128,11 @@ jobs:
         run: |
           target="${{ matrix.platform.target }}"
           export "CC_${target//-/_}=musl-gcc"
+          if [ "$target" = "aarch64-unknown-linux-musl" ]; then
+            # GCC's AArch64 outline-atomics initializer references glibc's
+            # __getauxval, which musl does not provide.
+            export CFLAGS_aarch64_unknown_linux_musl=-mno-outline-atomics
+          fi
           cargo build --locked --profile dist \
             -p "${{ matrix.package }}" \
             --target "$target"
