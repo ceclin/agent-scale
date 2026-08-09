@@ -4,7 +4,7 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 BIN="$ROOT/target/debug"
 TMP=$(mktemp -d)
-CENTER_HOME="$TMP/center"
+CLIENT_HOME="$TMP/client"
 EDGE_HOME="$TMP/edge"
 RELAY_STATE="$TMP/relay"
 CONTROL_URL=http://127.0.0.1:35350
@@ -17,7 +17,7 @@ relay_pid=
 edge_pid=
 
 cleanup() {
-    AGENT_SCALE_HOME="$CENTER_HOME" "$BIN/agent-scale" daemon --stop >/dev/null 2>&1 || true
+    AGENT_SCALE_HOME="$CLIENT_HOME" "$BIN/agent-scale" daemon --stop >/dev/null 2>&1 || true
     for pid in "$edge_pid" "$relay_pid" "$control_pid"; do
         if [ -n "$pid" ]; then kill "$pid" >/dev/null 2>&1 || true; fi
     done
@@ -42,8 +42,8 @@ until curl -fsS "$CONTROL_URL/healthz" >/dev/null 2>&1; do
     sleep 0.05
 done
 
-center_join=$("$BIN/as-control" center invite center)
-AGENT_SCALE_HOME="$CENTER_HOME" "$BIN/agent-scale" control join "$center_join" >/dev/null
+client_join=$("$BIN/as-control" client invite client)
+AGENT_SCALE_HOME="$CLIENT_HOME" "$BIN/agent-scale" control join "$client_join" >/dev/null
 relay_join=$("$BIN/as-control" relay invite relay-a "$RELAY_URL")
 printf '%s\n' "$relay_join" >"$TMP/relay.join"
 "$BIN/as-relay" run --relay-bind 127.0.0.1:35340 --admin-bind 127.0.0.1:35341 \
@@ -61,12 +61,12 @@ done
 status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$RELAY_ADMIN_URL/v1/snapshot")
 [ "$status" = 404 ]
 
-edge_join=$(AGENT_SCALE_HOME="$CENTER_HOME" "$BIN/agent-scale" edge invite test)
+edge_join=$(AGENT_SCALE_HOME="$CLIENT_HOME" "$BIN/agent-scale" edge invite test)
 AGENT_SCALE_HOME="$EDGE_HOME" "$BIN/as-edge" join "$edge_join" --foreground >"$TMP/edge.out" 2>&1 &
 edge_pid=$!
 
 i=0
-until output=$(AGENT_SCALE_HOME="$CENTER_HOME" AGENT_SCALE_DIAL_SECS=2 \
+until output=$(AGENT_SCALE_HOME="$CLIENT_HOME" AGENT_SCALE_DIAL_SECS=2 \
     "$BIN/agent-scale" -e test exec -- sh -c 'printf relay-e2e-ok' 2>/dev/null) && \
     [ "$output" = relay-e2e-ok ]; do
     i=$((i + 1)); [ "$i" -lt 40 ] || { echo "edge did not become reachable" >&2; exit 1; }
@@ -109,7 +109,7 @@ until "$BIN/as-control" relay ls 2>/dev/null | grep "udp/$UPDATED_RELAY_QAD_PORT
     sleep 0.05
 done
 
-"$BIN/as-control" edge rm center/test >/dev/null
+"$BIN/as-control" edge rm client/test >/dev/null
 i=0
 until curl -fsS "$RELAY_ADMIN_URL/v1/status" 2>/dev/null | grep '"members":1' >/dev/null; do
     i=$((i + 1)); [ "$i" -lt 100 ] || { echo "relay did not apply revocation" >&2; exit 1; }

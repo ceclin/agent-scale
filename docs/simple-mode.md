@@ -1,6 +1,6 @@
 # Simple Mode
 
-Simple mode connects one center directly to one or more edges without deploying
+Simple mode connects one client directly to one or more edges without deploying
 `as-control` or a private relay. It uses the official relay map bundled with the
 installed iroh version and still upgrades to a direct peer-to-peer path whenever
 the network permits it.
@@ -22,10 +22,10 @@ agent-scale edge add test <EDGE_ENDPOINT_ID>
 agent-scale -e test exec -- uname -a
 ```
 
-The edge trusts the first authenticated center that connects and persists that
-center's EndpointId. Later connections are strict. To avoid trust-on-first-use,
+The edge trusts the first authenticated client that connects and persists that
+client's EndpointId. Later connections are strict. To avoid trust-on-first-use,
 run `agent-scale keygen` on the development machine and start the edge with
-`as-edge run test --center <CENTER_ENDPOINT_ID>`.
+`as-edge run test --client <CLIENT_ENDPOINT_ID>`.
 
 For a persistent current-user service on Linux, macOS, or Windows:
 
@@ -52,11 +52,11 @@ relay replaces the official default set.
 
 Relay operators forward encrypted iroh traffic but cannot impersonate either
 endpoint or read command payloads. Edge command access is authorized separately
-by its pinned center key. The official relay service is shared infrastructure,
+by its pinned client key. The official relay service is shared infrastructure,
 so its availability, capacity, and acceptable-use policy remain external
 dependencies.
 
 Use simple mode for evaluation, personal setups, and small static fleets. Use
-the [multi-center control plane](control-plane.md) when you need invitations,
+the [multi-client control plane](control-plane.md) when you need invitations,
 roles, edge ownership transfer, centrally managed private relays, or dynamic
 revocation.

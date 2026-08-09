@@ -14,7 +14,7 @@ as soon as practical and coordinate disclosure after a fix is available.
 
 agent-scale is currently pre-release. Security fixes are made on the latest
 development line; older snapshots are not supported. Users should update all
-center, edge, relay, and control binaries together because protocol revisions
+client, edge, relay, and control binaries together because protocol revisions
 may be intentionally incompatible.
 
 ## Security boundaries
@@ -22,4 +22,4 @@ may be intentionally incompatible.
 The project authenticates peers with pinned Ed25519 endpoint identities and
 signed control/relay state. It does not sandbox commands executed by `as-edge`.
 Run edge processes under an OS account, container, or VM whose privileges match
-the trust granted to the pinned center.
+the trust granted to the pinned client.

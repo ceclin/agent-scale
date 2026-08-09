@@ -44,11 +44,11 @@ Once `control.json` exists, the invitation file and Control URL are ignored;
 the Relay can restart from its verified offline snapshot while Control is down.
 
 `as-relay run` requires the Control profile created by `as-relay join`. There is
-no Center-signed initialization mode and no remote snapshot mutation endpoint.
+no Client-signed initialization mode and no remote snapshot mutation endpoint.
 The relay actively long-polls Control for complete, signed membership snapshots.
 
 `--qad-port` is the externally reachable UDP port that the Relay reports to
-Control; Control persists it and distributes it to Centers and Edges in the
+Control; Control persists it and distributes it to Clients and Edges in the
 signed NodeMap. An enrolled Relay started with a different explicit
 `--qad-port` signs and reports the update before its next long poll completes.
 Omitting it on later starts retains the enrolled value; changing only
@@ -69,7 +69,7 @@ Control owns a private Relay CA. During enrollment the Relay generates its TLS
 key locally and sends a signed CSR; Control returns a certificate whose SAN is
 restricted to the host in the invited Relay URL. The CA certificate and QAD port
 are covered by Control's signed NodeMap, so no certificate or CA file needs to
-be installed manually on individual Relays, Centers, or Edges. Back up the
+be installed manually on individual Relays, Clients, or Edges. Back up the
 entire Control state directory, including `relay-ca.key` and `relay-ca.der`.
 
 The WebSocket and admin listeners use plain HTTP. Put TLS in front of the public
@@ -87,7 +87,7 @@ This is an iroh requirement, not an agent-scale management endpoint.
 
 ## Membership and Failure Behavior
 
-Control derives relay membership from its committed Center, Edge, and Relay
+Control derives relay membership from its committed Client, Edge, and Relay
 topology. Accepted snapshots are flushed and atomically renamed before becoming
 active. Removed EndpointIds are disconnected immediately.
 
@@ -99,4 +99,4 @@ return. Removing the relay with `as-control relay rm prod-sg` causes its watcher
 to fail closed and disconnect all clients.
 
 Relay authorization controls relay resource use. Edge command access remains
-independently protected by the Edge's pinned Center identity.
+independently protected by the Edge's pinned Client identity.

@@ -3,7 +3,7 @@
 The Provisioner API lets an external controller reconcile agent-scale topology
 without making `as-control` aware of Kubernetes or any other scheduler. The
 controller owns workloads and process lifecycle; `as-control` remains the
-authority for identities, enrollment, and the persisted Center-to-Edge
+authority for identities, enrollment, and the persisted Client-to-Edge
 grouping.
 
 ## Trust A Provisioner
@@ -18,7 +18,7 @@ as-control provisioner ls
 
 Provisioners are administrative principals. Registration is deliberately
 available only through the mode-`0600` local admin socket. Removing one is
-blocked while it still manages a Center or has an active pending invitation:
+blocked while it still manages a Client or has an active pending invitation:
 
 ```sh
 as-control provisioner rm lab-controller
@@ -98,7 +98,7 @@ For example, a topology query body is:
 
 ```json
 {
-  "protocol_version": 3,
+  "protocol_version": 4,
   "audience": "prod",
   "request_id": "reconcile-01JXYZ",
   "issued_at": 1700000000,
@@ -123,10 +123,10 @@ endpoint id:
 ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c
 
 exact body (one line, no trailing newline):
-{"protocol_version":3,"audience":"prod","request_id":"request-1","issued_at":1700000000,"expected_revision":7,"action":{"action":"remove_center","name":"job-1"}}
+{"protocol_version":4,"audience":"prod","request_id":"request-1","issued_at":1700000000,"expected_revision":7,"action":{"action":"remove_client","name":"job-1"}}
 
 authorization:
-AgentScale-Ed25519 ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c:f76ea19f84a5b1bc5c0ef632222fefe08aff7813d07e09b0e88a15f7359667a6665ce8f1424da19256a195b0a1d7d350224266d6378c3c5b7ea0ccd28b1dd506
+AgentScale-Ed25519 ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c:7feb27e70f4a4569db5c8f299b6056eb3d84bc74d0897fe498996e0a6119b4b05af57a820eeb4236de88cb16a077ad2fdc0d155baa0cda0513484ae4ce07e90f
 ```
 
 The repository asserts this vector in `control-api`, so an incompatible wire
@@ -136,17 +136,17 @@ change fails tests.
 
 ```text
 Provisioner
-├── Center (name, EndpointId)
+├── Client (name, EndpointId)
 │   └── Edge (name, EndpointId)
 └── invitations (pending, claimed, or revoked)
 ```
 
 The supported mutation actions are:
 
-- `InviteCenter { name, ttl_secs, secret }`
+- `InviteClient { name, ttl_secs, secret }`
 - `InviteEdge { owner, name, ttl_secs, secret }`
 - `RevokeInvite { invite_id }`
-- `RemoveCenter { name }`
+- `RemoveClient { name }`
 - `RemoveEdge { owner, name }`
 - `TransferEdge { owner, name, endpoint_id, new_owner }`
 
@@ -168,18 +168,18 @@ A typical controller loop is:
 
 1. Read the scheduler's desired workload state.
 2. Request the Provisioner's current topology from `as-control`.
-3. Create Center or Edge invitations for missing identities and pass the join
+3. Create Client or Edge invitations for missing identities and pass the join
    URLs to the corresponding workloads through the scheduler's secret/config
    mechanism.
 4. Wait for those identities to claim their invitations and appear in the
    topology.
-5. Transfer or remove Edges, then remove an empty Center, when desired state
+5. Transfer or remove Edges, then remove an empty Client, when desired state
    changes.
 6. Re-read and retry after a revision conflict.
 
 One Provisioner cannot observe or mutate another Provisioner's topology.
-Transfers are permitted only between Centers managed by the same Provisioner.
-A Center cannot be removed while it owns an Edge or has an active pending Edge
+Transfers are permitted only between Clients managed by the same Provisioner.
+A Client cannot be removed while it owns an Edge or has an active pending Edge
 invitation. An expired invitation no longer reserves its name or blocks cleanup.
 
 ## Lifecycle Semantics
@@ -190,7 +190,7 @@ Pending invitations are retained through expiry. Claimed, revoked, and expired
 records are cleaned up after a further seven days; this history cleanup does not
 remove nodes, advance the authorization revision, or notify NodeMap watchers.
 
-Claimed Centers and Edges have no lease or automatic expiry. A missed heartbeat,
+Claimed Clients and Edges have no lease or automatic expiry. A missed heartbeat,
 scheduler outage, or temporarily disconnected node therefore cannot silently
 erase authorization state. The external controller explicitly removes topology
 through the Provisioner API after it has reconciled the workload lifecycle.

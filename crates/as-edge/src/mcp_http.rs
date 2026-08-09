@@ -1,4 +1,4 @@
-//! Normalizes edge-local HTTP transports here so the Center remains a blind
+//! Normalizes edge-local HTTP transports here so the Client remains a blind
 //! byte pipe and MCP clients need only one stdio-facing integration.
 
 use anyhow::{Context, Result};
@@ -61,7 +61,7 @@ pub async fn bridge(mut send: SendStream, recv: RecvStream, url: String, kind: K
 }
 
 /// Read the next newline-delimited JSON-RPC message from the iroh stream.
-/// Returns `None` at end-of-stream (the center closed the session).
+/// Returns `None` at end-of-stream (the client closed the session).
 async fn read_message(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<Option<Vec<u8>>> {
     loop {
         if let Some(pos) = buf.iter().position(|&b| b == b'\n') {

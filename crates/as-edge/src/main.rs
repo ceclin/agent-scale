@@ -34,7 +34,7 @@ enum Cmd {
     Id { who: String },
     /// List agent identities on this machine.
     Ls,
-    /// Remove an agent identity (its key + pinned center).
+    /// Remove an agent identity (its key + pinned client).
     Rm { who: String },
     /// Manage MCP definitions stored by one local edge identity.
     Mcp {
@@ -100,9 +100,9 @@ struct RunArgs {
     #[arg(short = 'r', long = "relay")]
     relays: Vec<String>,
 
-    /// Trusted center EndpointId (strict). Omit for trust-on-first-use.
+    /// Trusted client EndpointId (strict). Omit for trust-on-first-use.
     #[arg(long)]
-    center: Option<String>,
+    client: Option<String>,
 
     /// Explicit key-file path, overriding WHO. Generated on first use.
     #[arg(long)]
@@ -325,7 +325,7 @@ fn cmd_ls() -> Result<()> {
                 .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
                 .map(|a| SecretKey::from_bytes(&a).public().to_string())
                 .unwrap_or_else(|| "<unreadable>".into());
-            let pinned = std::fs::read_to_string(dir.join("trusted_center"))
+            let pinned = std::fs::read_to_string(dir.join("trusted_client"))
                 .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
@@ -335,14 +335,14 @@ fn cmd_ls() -> Result<()> {
                 match serde_json::from_slice::<ControlProfile>(&data) {
                     Ok(profile) => {
                         println!("  control:       {}", profile.control_url);
-                        println!("  owner:         {}", profile.map.map.allowed_centers.join(", "));
+                        println!("  owner:         {}", profile.map.map.allowed_clients.join(", "));
                     }
                     Err(_) => println!("  control:       <unreadable>"),
                 }
             } else {
                 match pinned {
-                    Some(c) => println!("  trusts center: {c}"),
-                    None => println!("  trusts center: (none pinned yet)"),
+                    Some(c) => println!("  trusts client: {c}"),
+                    None => println!("  trusts client: (none pinned yet)"),
                 }
             }
         }
@@ -373,8 +373,8 @@ async fn run_iroh_edge(args: &RunArgs) -> Result<()> {
     let profile = load_control_profile(&key_path.with_file_name("control.json"))?;
     if profile.is_some() {
         anyhow::ensure!(
-            args.relays.is_empty() && args.center.is_none(),
-            "a control-managed edge cannot override --relay or --center"
+            args.relays.is_empty() && args.client.is_none(),
+            "a control-managed edge cannot override --relay or --client"
         );
     }
     let (relays, relay_ca_der) = if let Some(profile) = profile.as_ref() {
@@ -410,38 +410,38 @@ async fn run_iroh_edge(args: &RunArgs) -> Result<()> {
         let allowed = profile
             .map
             .map
-            .allowed_centers
+            .allowed_clients
             .iter()
             .map(|value| {
                 value
                     .parse::<iroh::EndpointId>()
-                    .map_err(|error| anyhow::anyhow!("invalid center in control map: {error}"))
+                    .map_err(|error| anyhow::anyhow!("invalid client in control map: {error}"))
             })
             .collect::<Result<HashSet<_>>>()?;
-        iroh_edge::CenterPin::managed(allowed)
+        iroh_edge::ClientPin::managed(allowed)
     } else {
-        match args.center.as_deref() {
+        match args.client.as_deref() {
             Some(c) => {
-                let id: iroh::EndpointId = c.parse().map_err(|e| anyhow::anyhow!("bad --center: {e}"))?;
-                iroh_edge::CenterPin::strict(id)
+                let id: iroh::EndpointId = c.parse().map_err(|e| anyhow::anyhow!("bad --client: {e}"))?;
+                iroh_edge::ClientPin::strict(id)
             }
             None => {
-                let store = key_path.with_file_name("trusted_center");
+                let store = key_path.with_file_name("trusted_client");
                 let existing = match std::fs::read_to_string(&store) {
                     Ok(value) => Some(
                         value
                             .trim()
                             .parse::<iroh::EndpointId>()
-                            .with_context(|| format!("invalid trusted center in {}", store.display()))?,
+                            .with_context(|| format!("invalid trusted client in {}", store.display()))?,
                     ),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                     Err(error) => return Err(error).with_context(|| format!("read {}", store.display())),
                 };
                 match &existing {
-                    Some(id) => info!("trusting pinned center {id}"),
-                    None => warn!("no --center and none pinned yet: trusting the FIRST center to connect (TOFU)"),
+                    Some(id) => info!("trusting pinned client {id}"),
+                    None => warn!("no --client and none pinned yet: trusting the FIRST client to connect (TOFU)"),
                 }
-                iroh_edge::CenterPin::tofu(existing, store)
+                iroh_edge::ClientPin::tofu(existing, store)
             }
         }
     };
@@ -554,7 +554,7 @@ async fn join_control(args: JoinArgs) -> Result<()> {
         run_iroh_edge(&RunArgs {
             who: Some(who),
             relays: vec![],
-            center: None,
+            client: None,
             secret_key_file: None,
         })
         .await
@@ -592,7 +592,7 @@ fn spawn_control_watch(
     key: SecretKey,
     path: PathBuf,
     endpoint: iroh::Endpoint,
-    pin: iroh_edge::CenterPin,
+    pin: iroh_edge::ClientPin,
     mut profile: ControlProfile,
 ) {
     tokio::spawn(async move {
@@ -653,9 +653,9 @@ fn spawn_control_watch(
                     if response.status() == reqwest::StatusCode::FORBIDDEN
                         || response.status() == reqwest::StatusCode::GONE =>
                 {
-                    warn!(status = %response.status(), "edge enrollment was revoked; disconnecting all centers");
+                    warn!(status = %response.status(), "edge enrollment was revoked; disconnecting all clients");
                     if let Err(error) = pin.replace_managed(HashSet::new()) {
-                        warn!("cannot revoke center authorization: {error:#}");
+                        warn!("cannot revoke client authorization: {error:#}");
                     }
                     return;
                 }
@@ -672,7 +672,7 @@ fn spawn_control_watch(
 
 async fn apply_control_map(
     endpoint: &iroh::Endpoint,
-    pin: &iroh_edge::CenterPin,
+    pin: &iroh_edge::ClientPin,
     current_relays: &mut HashSet<String>,
     map: &SignedNodeMap,
 ) -> Result<()> {
@@ -692,12 +692,12 @@ async fn apply_control_map(
     }
     let allowed = map
         .map
-        .allowed_centers
+        .allowed_clients
         .iter()
         .map(|value| {
             value
                 .parse::<iroh::EndpointId>()
-                .map_err(|error| anyhow::anyhow!("invalid allowed center: {error}"))
+                .map_err(|error| anyhow::anyhow!("invalid allowed client: {error}"))
         })
         .collect::<Result<HashSet<_>>>()?;
     pin.replace_managed(allowed)?;

@@ -38,15 +38,15 @@ some end-to-end scenarios.
 
 ## Supported targets
 
-- center CLI/daemon: Linux x86-64/ARM64, macOS ARM64/x86-64, and Windows
+- client CLI/daemon: Linux x86-64/ARM64, macOS ARM64/x86-64, and Windows
   x86-64 (experimental);
 - control and private relay: Linux;
 - edge: Linux and macOS x86-64/ARM64, and Windows x86-64.
 
 Changes to platform-specific code should preserve these targets. CI checks the
-native Linux workspace, macOS Center and Edge, and Windows Center and Edge.
+native Linux workspace, macOS Client and Edge, and Windows Client and Edge.
 Distribution cross-compiles Linux and Windows binaries with `cargo-zigbuild`
-and builds the macOS Center and Edge binaries natively.
+and builds the macOS Client and Edge binaries natively.
 
 ## Change discipline
 

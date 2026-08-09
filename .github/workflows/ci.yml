@@ -51,7 +51,7 @@ jobs:
       - run: cargo x test
 
   macos:
-    name: macOS Center and Edge
+    name: macOS Client and Edge
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,7 +64,7 @@ jobs:
           -p control-api -p relay-api
 
   windows:
-    name: Windows Center and Edge
+    name: Windows Client and Edge
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

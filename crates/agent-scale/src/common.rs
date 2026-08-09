@@ -1,4 +1,4 @@
-//! Centralizes local state conventions so every Center process resolves the
+//! Centralizes local state conventions so every Client process resolves the
 //! same identity and IPC namespace.
 
 use std::ops::{Deref, DerefMut};
@@ -14,13 +14,13 @@ use sha2::{Digest, Sha256};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const CONFIG_SCHEMA: u32 = 1;
 
-/// Center home: $AGENT_SCALE_HOME or ~/.agent-scale.
+/// Client home: $AGENT_SCALE_HOME or ~/.agent-scale.
 pub fn home() -> PathBuf {
     if let Ok(h) = std::env::var("AGENT_SCALE_HOME") {
         return PathBuf::from(h);
     }
     // home_dir() is correct cross-platform (USERPROFILE on Windows, $HOME with a
-    // passwd-db fallback on Unix). Fail loudly rather than scatter center keys
+    // passwd-db fallback on Unix). Fail loudly rather than scatter client keys
     // and config into the cwd when there's genuinely no home.
     std::env::home_dir()
         .expect("no home directory found; set $AGENT_SCALE_HOME (or $HOME / %USERPROFILE%)")
@@ -28,7 +28,7 @@ pub fn home() -> PathBuf {
 }
 
 pub fn key_path() -> PathBuf {
-    home().join("center.key")
+    home().join("client.key")
 }
 pub fn config_path() -> PathBuf {
     home().join("config.json")
@@ -44,7 +44,7 @@ pub fn local_endpoint() -> String {
     #[cfg(windows)]
     {
         // Named pipes live in a machine-wide namespace. Key the name by the
-        // configured Center home so independent profiles owned by one user can
+        // configured Client home so independent profiles owned by one user can
         // run concurrently without exposing the path itself in the pipe name.
         let normalized = home().to_string_lossy().replace('/', "\\").to_lowercase();
         let digest = hex::encode(Sha256::digest(normalized.as_bytes()));
@@ -61,7 +61,7 @@ pub fn daemon_lock_path() -> PathBuf {
     daemon_dir().join("instance.lock")
 }
 
-/// Use this whenever a caller may initialize the Center identity on demand.
+/// Use this whenever a caller may initialize the Client identity on demand.
 pub fn load_or_create_key() -> Result<SecretKey> {
     scale_core::load_or_create_secret(&key_path())
 }

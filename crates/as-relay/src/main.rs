@@ -465,7 +465,7 @@ async fn status(State(state): State<AdminState>) -> Json<RelayStatus> {
     let snapshot = state.current.lock().await;
     Json(RelayStatus {
         audience: state.audience.to_string(),
-        center_id: state.authority_id.to_string(),
+        control_id: state.authority_id.to_string(),
         version: snapshot.version,
         members: snapshot.members.len(),
     })
@@ -515,7 +515,7 @@ async fn update_snapshot(
 fn relay_status(state: &AdminState, snapshot: &MembershipSnapshot) -> RelayStatus {
     RelayStatus {
         audience: state.audience.to_string(),
-        center_id: state.authority_id.to_string(),
+        control_id: state.authority_id.to_string(),
         version: snapshot.version,
         members: snapshot.members.len(),
     }
@@ -847,7 +847,7 @@ mod tests {
 
     #[test]
     fn validation_requires_unique_members() {
-        let center = iroh_base::SecretKey::generate().public();
+        let client = iroh_base::SecretKey::generate().public();
         let edge = iroh_base::SecretKey::generate().public();
         let mut snapshot = MembershipSnapshot {
             protocol_version: RELAY_PROTOCOL_VERSION,
@@ -861,8 +861,8 @@ mod tests {
         };
         assert!(validate_snapshot(&snapshot, "test").is_ok());
         snapshot.members.push(relay_api::RelayMember {
-            name: "center".into(),
-            endpoint_id: center.to_string(),
+            name: "client".into(),
+            endpoint_id: client.to_string(),
         });
         assert!(validate_snapshot(&snapshot, "test").is_ok());
         snapshot.members.push(relay_api::RelayMember {
@@ -874,16 +874,17 @@ mod tests {
 
     #[tokio::test]
     async fn signed_updates_are_monotonic_and_durable() {
-        let center_key = iroh_base::SecretKey::generate();
-        let center_id = center_key.public();
+        let control_key = iroh_base::SecretKey::generate();
+        let control_id = control_key.public();
+        let client_id = iroh_base::SecretKey::generate().public();
         let initial = MembershipSnapshot {
             protocol_version: RELAY_PROTOCOL_VERSION,
             audience: "test".into(),
             version: 0,
             issued_at: unix_timestamp(),
             members: vec![relay_api::RelayMember {
-                name: "center".into(),
-                endpoint_id: center_id.to_string(),
+                name: "client".into(),
+                endpoint_id: client_id.to_string(),
             }],
         };
         let dir = tempfile::tempdir().unwrap();
@@ -892,7 +893,7 @@ mod tests {
         let allowed = Arc::new(ArcSwap::from_pointee(validate_snapshot(&initial, "test").unwrap()));
         let state = AdminState {
             audience: Arc::from("test"),
-            authority_id: center_id,
+            authority_id: control_id,
             state_path: Arc::new(path.clone()),
             current: Arc::new(Mutex::new(initial)),
             allowed,
@@ -906,8 +907,8 @@ mod tests {
             issued_at: unix_timestamp(),
             members: vec![
                 relay_api::RelayMember {
-                    name: "center".into(),
-                    endpoint_id: center_id.to_string(),
+                    name: "client".into(),
+                    endpoint_id: client_id.to_string(),
                 },
                 relay_api::RelayMember {
                     name: "edge".into(),
@@ -915,7 +916,7 @@ mod tests {
                 },
             ],
         };
-        let signed = SignedSnapshot::sign(next.clone(), &center_key).unwrap();
+        let signed = SignedSnapshot::sign(next.clone(), &control_key).unwrap();
         let applied = update_snapshot(State(state.clone()), Json(signed.clone()))
             .await
             .unwrap();
@@ -929,7 +930,7 @@ mod tests {
         let _ = update_snapshot(State(state.clone()), Json(signed)).await.unwrap();
         let mut conflicting = next;
         conflicting.members.pop();
-        let conflict = SignedSnapshot::sign(conflicting, &center_key).unwrap();
+        let conflict = SignedSnapshot::sign(conflicting, &control_key).unwrap();
         let error = update_snapshot(State(state), Json(conflict)).await.unwrap_err();
         assert_eq!(error.status, StatusCode::CONFLICT);
     }

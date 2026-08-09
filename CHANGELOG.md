@@ -7,30 +7,33 @@ The project uses semantic versioning after its first public release. Before
 
 ## Unreleased
 
+- Renamed the development-side Center role to Client across CLI commands,
+  signed APIs, persisted state, filesystem paths, and documentation; advanced
+  the incompatible Control and RPC protocol versions.
 - Added configurable Relay QAD UDP ports and Control-managed private TLS:
   Relays generate their own keys and CSRs, while Control signs certificates and
   distributes its dedicated CA through the signed topology.
-- Allowed enrolled Centers to remove their own Control-managed Edges through
+- Allowed enrolled Clients to remove their own Control-managed Edges through
   signed, identity-bound requests.
 
 ## 0.5.0 - 2026-08-07
 
-- Added the `agent-scale` Center, `as-edge`, `as-control`, and `as-relay`
+- Added the `agent-scale` Client, `as-edge`, `as-control`, and `as-relay`
   binaries with authenticated iroh transport, streaming command execution,
   content-addressed file transfer, and transparent MCP proxying.
-- Supported Windows x86-64 development hosts for the Center CLI and daemon
+- Supported Windows x86-64 development hosts for the Client CLI and daemon
   through private local Named Pipe IPC.
 - Added simple mode for zero-infrastructure trials and Control-managed mode for
-  private Relay and multi-Center deployments.
+  private Relay and multi-Client deployments.
 - Persisted Control state in a versioned SQLite database with WAL, atomic
   topology revisions, restart recovery, and bounded invitation history.
 - Made private Relay enrollment Control-only, with signed membership snapshots,
   offline recovery, revocation, and immediate disconnection of removed members.
 - Added idempotent native Compose bootstrap through `as-control bootstrap` and
-  `as-relay run --join-if-needed`, with explicit Center enrollment and no shell
+  `as-relay run --join-if-needed`, with explicit Client enrollment and no shell
   initialization services.
 - Added signed Provisioner reconciliation scoped by owner, including idempotent
-  invitations and explicit Center/Edge lifecycle management.
+  invitations and explicit Client/Edge lifecycle management.
 - Added repeatable snapshot distributions plus tag-driven prereleases and
   releases, with versioned binary archives, multi-architecture Control and
   Relay images, SHA-256 checksums, and complete third-party license bundles.

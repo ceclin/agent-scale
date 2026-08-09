@@ -4,7 +4,7 @@
 mod provisioner;
 
 pub use provisioner::{
-    ManagedCenterInfo, ManagedEdgeInfo, PROVISIONER_AUTH_SCHEME, ProvisionerAction, ProvisionerHttpRequest,
+    ManagedClientInfo, ManagedEdgeInfo, PROVISIONER_AUTH_SCHEME, ProvisionerAction, ProvisionerHttpRequest,
     ProvisionerRequest, ProvisionerResponse, ProvisionerTopology, action_hash, provisioner_authorization,
     provisioner_signing_bytes, verify_provisioner_authorization,
 };
@@ -15,18 +15,18 @@ use iroh_base::{EndpointId, SecretKey, Signature};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
-const INVITE_DOMAIN: &[u8] = b"agent-scale-control-invite-v3\0";
-const CLAIM_DOMAIN: &[u8] = b"agent-scale-control-claim-v3\0";
-const EDGE_INVITE_REQUEST_DOMAIN: &[u8] = b"agent-scale-control-edge-invite-request-v3\0";
-const EDGE_REMOVE_REQUEST_DOMAIN: &[u8] = b"agent-scale-control-edge-remove-request-v3\0";
-const WATCH_DOMAIN: &[u8] = b"agent-scale-control-watch-v3\0";
-const MAP_DOMAIN: &[u8] = b"agent-scale-control-map-v3\0";
-pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
+const INVITE_DOMAIN: &[u8] = b"agent-scale-control-invite-v4\0";
+const CLAIM_DOMAIN: &[u8] = b"agent-scale-control-claim-v4\0";
+const EDGE_INVITE_REQUEST_DOMAIN: &[u8] = b"agent-scale-control-edge-invite-request-v4\0";
+const EDGE_REMOVE_REQUEST_DOMAIN: &[u8] = b"agent-scale-control-edge-remove-request-v4\0";
+const WATCH_DOMAIN: &[u8] = b"agent-scale-control-watch-v4\0";
+const MAP_DOMAIN: &[u8] = b"agent-scale-control-map-v4\0";
+pub const CONTROL_PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InviteKind {
-    Center,
+    Client,
     Edge { owner_id: String },
     Relay { url: String },
 }
@@ -159,7 +159,7 @@ impl ClaimRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EdgeInviteRequest {
     pub protocol_version: u32,
-    pub center_id: String,
+    pub client_id: String,
     pub audience: String,
     pub request_id: String,
     pub issued_at: i64,
@@ -179,7 +179,7 @@ impl EdgeInviteRequest {
     ) -> Result<Self> {
         let mut request = Self {
             protocol_version: CONTROL_PROTOCOL_VERSION,
-            center_id: key.public().to_string(),
+            client_id: key.public().to_string(),
             audience,
             request_id,
             issued_at,
@@ -193,7 +193,7 @@ impl EdgeInviteRequest {
 
     pub fn verify(&self) -> Result<EndpointId> {
         ensure_protocol_version(self.protocol_version)?;
-        let id: EndpointId = self.center_id.parse().context("invalid center id")?;
+        let id: EndpointId = self.client_id.parse().context("invalid client id")?;
         id.verify(&self.signing_bytes()?, &self.signature)
             .context("invalid edge invitation request signature")?;
         Ok(id)
@@ -204,7 +204,7 @@ impl EdgeInviteRequest {
             EDGE_INVITE_REQUEST_DOMAIN,
             &(
                 self.protocol_version,
-                &self.center_id,
+                &self.client_id,
                 &self.audience,
                 &self.request_id,
                 self.issued_at,
@@ -218,7 +218,7 @@ impl EdgeInviteRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EdgeRemoveRequest {
     pub protocol_version: u32,
-    pub center_id: String,
+    pub client_id: String,
     pub audience: String,
     pub nonce: String,
     pub issued_at: i64,
@@ -239,7 +239,7 @@ impl EdgeRemoveRequest {
         endpoint_id.parse::<EndpointId>().context("invalid edge endpoint id")?;
         let mut request = Self {
             protocol_version: CONTROL_PROTOCOL_VERSION,
-            center_id: key.public().to_string(),
+            client_id: key.public().to_string(),
             audience,
             nonce,
             issued_at,
@@ -256,7 +256,7 @@ impl EdgeRemoveRequest {
         self.endpoint_id
             .parse::<EndpointId>()
             .context("invalid edge endpoint id")?;
-        let id: EndpointId = self.center_id.parse().context("invalid center id")?;
+        let id: EndpointId = self.client_id.parse().context("invalid client id")?;
         id.verify(&self.signing_bytes()?, &self.signature)
             .context("invalid edge removal request signature")?;
         Ok(id)
@@ -267,7 +267,7 @@ impl EdgeRemoveRequest {
             EDGE_REMOVE_REQUEST_DOMAIN,
             &(
                 self.protocol_version,
-                &self.center_id,
+                &self.client_id,
                 &self.audience,
                 &self.nonce,
                 self.issued_at,
@@ -358,7 +358,7 @@ pub struct EdgeInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CenterInfo {
+pub struct ClientInfo {
     pub name: String,
     pub endpoint_id: String,
     pub edges: usize,
@@ -384,7 +384,7 @@ pub struct InviteInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Overview {
     pub revision: u64,
-    pub centers: Vec<CenterInfo>,
+    pub clients: Vec<ClientInfo>,
     pub edges: Vec<EdgeInfo>,
     pub relays: Vec<RelayNodeInfo>,
     pub invites: Vec<InviteInfo>,
@@ -403,7 +403,7 @@ pub struct NodeMap {
     /// DER-encoded private CA certificate used only for managed Relay TLS.
     pub relay_ca_der: Vec<u8>,
     #[serde(default)]
-    pub allowed_centers: Vec<String>,
+    pub allowed_clients: Vec<String>,
     #[serde(default)]
     pub edges: Vec<EdgeInfo>,
 }
@@ -436,7 +436,7 @@ pub struct ControlStatus {
     pub control_url: String,
     pub control_id: String,
     pub revision: u64,
-    pub centers: usize,
+    pub clients: usize,
     pub edges: usize,
     pub relays: usize,
 }
@@ -502,7 +502,7 @@ mod tests {
             control_id: control.public().to_string(),
             invite_id: "invite".into(),
             name: "dev".into(),
-            kind: InviteKind::Center,
+            kind: InviteKind::Client,
             secret_hash: hash_secret(&secret),
             expires_at: 100,
         };
@@ -523,7 +523,7 @@ mod tests {
             control_id: control.public().to_string(),
             invite_id: "invite".into(),
             name: "dev".into(),
-            kind: InviteKind::Center,
+            kind: InviteKind::Client,
             secret_hash: hash_secret(&secret),
             expires_at: 100,
         };
@@ -538,11 +538,11 @@ mod tests {
     }
 
     #[test]
-    fn edge_invite_request_is_bound_to_center_and_payload() {
-        let center = SecretKey::generate();
+    fn edge_invite_request_is_bound_to_client_and_payload() {
+        let client = SecretKey::generate();
         let request =
-            EdgeInviteRequest::sign(&center, "prod".into(), "request".into(), 50, "win-box".into(), 900).unwrap();
-        assert_eq!(request.verify().unwrap(), center.public());
+            EdgeInviteRequest::sign(&client, "prod".into(), "request".into(), 50, "win-box".into(), 900).unwrap();
+        assert_eq!(request.verify().unwrap(), client.public());
 
         let mut tampered = request;
         tampered.name = "other-box".into();
@@ -551,10 +551,10 @@ mod tests {
 
     #[test]
     fn edge_remove_request_is_bound_to_the_current_edge_identity() {
-        let center = SecretKey::generate();
+        let client = SecretKey::generate();
         let edge = SecretKey::generate();
         let request = EdgeRemoveRequest::sign(
-            &center,
+            &client,
             "prod".into(),
             "nonce".into(),
             50,
@@ -562,7 +562,7 @@ mod tests {
             edge.public().to_string(),
         )
         .unwrap();
-        assert_eq!(request.verify().unwrap(), center.public());
+        assert_eq!(request.verify().unwrap(), client.public());
 
         let mut tampered = request;
         tampered.endpoint_id = SecretKey::generate().public().to_string();
@@ -596,7 +596,7 @@ mod tests {
                 recipient_id: a.public().to_string(),
                 relays: vec![],
                 relay_ca_der: vec![1, 2, 3],
-                allowed_centers: vec![],
+                allowed_clients: vec![],
                 edges: vec![],
             },
             &control,

@@ -10,7 +10,7 @@ SCALE=$BIN/agent-scale
 RELAY=$BIN/relay-dev
 
 EDGE_HOME=$(mktemp -d)
-CENTER_HOME=$(mktemp -d)
+CLIENT_HOME=$(mktemp -d)
 RELAY_LOG=$(mktemp)
 EDGE_LOG=$(mktemp)
 OUT=$(mktemp)
@@ -18,11 +18,11 @@ PROJECT=$(mktemp -d)
 FAILED=0
 
 cleanup() {
-  AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" daemon --stop >/dev/null 2>&1 || true
+  AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" daemon --stop >/dev/null 2>&1 || true
   [ -n "${EDGE_PID:-}" ] && kill "$EDGE_PID" 2>/dev/null
   [ -n "${RELAY_PID:-}" ] && kill "$RELAY_PID" 2>/dev/null
   [ -n "${PYPID:-}" ] && kill "$PYPID" 2>/dev/null
-  rm -rf "$EDGE_HOME" "$CENTER_HOME" "$PROJECT" "$RELAY_LOG" "$EDGE_LOG" "$OUT" "${PYSRV:-}" "${PYSRV:-}.port"
+  rm -rf "$EDGE_HOME" "$CLIENT_HOME" "$PROJECT" "$RELAY_LOG" "$EDGE_LOG" "$OUT" "${PYSRV:-}" "${PYSRV:-}.port"
 }
 trap cleanup EXIT
 
@@ -38,11 +38,11 @@ echo "relay:  $URL"
 EDGE_ID=$(AGENT_SCALE_HOME="$EDGE_HOME" "$AGENT" id test)
 echo "edge:   $EDGE_ID"
 
-AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" edge add test "$EDGE_ID" --relay "$URL" >/dev/null
-AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" edge ls | grep -q "$EDGE_ID" \
+AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" edge add test "$EDGE_ID" --relay "$URL" >/dev/null
+AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" edge ls | grep -q "$EDGE_ID" \
   && echo "edge add/ls ok" || { echo "edge add/ls FAILED"; exit 1; }
 
-# Omitting --center exercises TOFU rather than strict pre-pinning.
+# Omitting --client exercises TOFU rather than strict pre-pinning.
 AGENT_SCALE_HOME="$EDGE_HOME" "$AGENT" run test --relay "$URL" >"$EDGE_LOG" 2>&1 &
 EDGE_PID=$!
 
@@ -50,18 +50,18 @@ echo "--- tests ---"
 
 READY=FAIL
 for _ in $(seq 1 100); do
-  if AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test exec -- true >/dev/null 2>&1; then
+  if AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" -e test exec -- true >/dev/null 2>&1; then
     READY=PASS
     break
   fi
   sleep 0.1
 done
 check "$READY" "warmup exec (auto-spawn daemon + dial edge)"
-[ -f "$EDGE_HOME/test/trusted_center" ] && check PASS "TOFU: edge pinned center on first connect" || check FAIL "TOFU pin"
+[ -f "$EDGE_HOME/test/trusted_client" ] && check PASS "TOFU: edge pinned client on first connect" || check FAIL "TOFU pin"
 
 # Observe FIRST while the remote process is still sleeping to prove output
 # arrives before process exit without depending on local startup speed.
-AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test exec -- sh -c 'echo FIRST; sleep 2; echo SECOND' >"$OUT" 2>/dev/null &
+AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" -e test exec -- sh -c 'echo FIRST; sleep 2; echo SECOND' >"$OUT" 2>/dev/null &
 CPID=$!
 STREAMING=FAIL
 for _ in $(seq 1 100); do
@@ -77,15 +77,15 @@ wait "$CPID"
 grep -q SECOND "$OUT" && check PASS "full output received after exit" || check FAIL "missing SECOND"
 
 # Remote exit codes must remain process exit codes at the CLI boundary.
-AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test exec -- sh -c 'exit 7' >/dev/null 2>&1
+AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" -e test exec -- sh -c 'exit 7' >/dev/null 2>&1
 [ $? -eq 7 ] && check PASS "exit code 7 propagated" || check FAIL "exit code propagation"
 
 # The framing contract must not merge stdout and stderr.
-AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test exec -- sh -c 'echo to-out; echo to-err 1>&2' >"$OUT" 2>/dev/null
+AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" -e test exec -- sh -c 'echo to-out; echo to-err 1>&2' >"$OUT" 2>/dev/null
 grep -q to-out "$OUT" && check PASS "stdout captured" || check FAIL "stdout"
 
 # The first command must discover an automatically spawned daemon.
-STATUS=$(AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" daemon --status)
+STATUS=$(AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" daemon --status)
 echo "  $STATUS"
 echo "$STATUS" | grep -qE '^daemon pid=[0-9]+ version=[^ ]+ active=[0-9]+ edges=[0-9]+ endpoint=' \
   && check PASS "daemon auto-spawned and alive" || check FAIL "daemon status"
@@ -93,23 +93,23 @@ echo "$STATUS" | grep -qE '^daemon pid=[0-9]+ version=[^ ]+ active=[0-9]+ edges=
 # A round trip detects both transfer-direction and content-addressing mistakes.
 SRC=$(mktemp); DL=$(mktemp); REMOTE=$(mktemp -u)
 head -c 4000000 /dev/urandom >"$SRC"
-AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test upload "$SRC" "$REMOTE" >/dev/null 2>&1 \
+AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" -e test upload "$SRC" "$REMOTE" >/dev/null 2>&1 \
   && check PASS "upload" || check FAIL "upload"
 { [ -f "$REMOTE" ] && cmp -s "$SRC" "$REMOTE"; } && check PASS "uploaded bytes match on edge" || check FAIL "upload content"
-AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test download "$REMOTE" "$DL" >/dev/null 2>&1 \
+AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" -e test download "$REMOTE" "$DL" >/dev/null 2>&1 \
   && check PASS "download" || check FAIL "download"
 cmp -s "$SRC" "$DL" && check PASS "downloaded bytes match" || check FAIL "download content"
 rm -f "$SRC" "$DL" "$REMOTE"
 
 # `cat` keeps the transparent MCP assertion independent of a third-party server.
-AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test mcp add echo -- cat >/dev/null
-MCP_OUT=$(printf 'mcp-ping\n' | timeout 20 env AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test mcp run echo 2>/dev/null | head -1)
+AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" -e test mcp add echo -- cat >/dev/null
+MCP_OUT=$(printf 'mcp-ping\n' | timeout 20 env AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" -e test mcp run echo 2>/dev/null | head -1)
 [ "$MCP_OUT" = "mcp-ping" ] && check PASS "mcp-proxy round-trip (via cat)" || check FAIL "mcp-proxy (got '$MCP_OUT')"
-AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test mcp ls | grep -q '^echo:' \
+AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" -e test mcp ls | grep -q '^echo:' \
   && check PASS "edge-owned mcp registry list" || check FAIL "mcp registry list"
 [ -f "$EDGE_HOME/test/mcp.json" ] \
   && check PASS "mcp registry persisted on edge" || check FAIL "mcp registry persistence"
-AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test mcp sync \
+AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" -e test mcp sync \
   --client claude --client codex --project "$PROJECT" >/dev/null 2>&1
 { grep -q 'test__echo' "$PROJECT/.mcp.json" \
   && grep -q 'mcp_servers.test__echo' "$PROJECT/.codex/config.toml" \
@@ -151,12 +151,12 @@ PY
   PYPID=$!
   MPORT=""
   for _ in $(seq 1 50); do MPORT=$(head -n1 "$PYSRV.port" 2>/dev/null); [ -n "$MPORT" ] && break; sleep 0.1; done
-  AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test mcp add echo-http --http "http://127.0.0.1:$MPORT/" >/dev/null
-  AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test mcp check echo-http >/dev/null 2>&1 \
+  AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" -e test mcp add echo-http --http "http://127.0.0.1:$MPORT/" >/dev/null
+  AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" -e test mcp check echo-http >/dev/null 2>&1 \
     && check PASS "mcp initialize health check" || check FAIL "mcp health check"
-  AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test exec -- true >/dev/null 2>&1
+  AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" -e test exec -- true >/dev/null 2>&1
   HTTP_OUT=$( (printf '{"jsonrpc":"2.0","id":7,"method":"hello"}\n'; sleep 2) \
-    | timeout 20 env AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test mcp run echo-http 2>/dev/null)
+    | timeout 20 env AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" -e test mcp run echo-http 2>/dev/null)
   echo "$HTTP_OUT" | grep -q '"echo": *"hello"' \
     && check PASS "mcp-proxy http/streamable POST response" || check FAIL "mcp-proxy http POST (got '$HTTP_OUT')"
   echo "$HTTP_OUT" | grep -q 'hi-from-server' \
@@ -189,10 +189,10 @@ PY
   PYPID=$!
   SPORT=""
   for _ in $(seq 1 50); do SPORT=$(head -n1 "$PYSSE.port" 2>/dev/null); [ -n "$SPORT" ] && break; sleep 0.1; done
-  AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test mcp add echo-sse --sse "http://127.0.0.1:$SPORT/sse" >/dev/null
-  AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test exec -- true >/dev/null 2>&1
+  AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" -e test mcp add echo-sse --sse "http://127.0.0.1:$SPORT/sse" >/dev/null
+  AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" -e test exec -- true >/dev/null 2>&1
   SSE_OUT=$( (printf '{"jsonrpc":"2.0","id":8,"method":"legacy"}\n'; sleep 2) \
-    | timeout 20 env AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test mcp run echo-sse 2>/dev/null | head -1)
+    | timeout 20 env AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" -e test mcp run echo-sse 2>/dev/null | head -1)
   echo "$SSE_OUT" | grep -q '"echo": *"legacy"' \
     && check PASS "mcp-proxy http/sse (legacy) round-trip" || check FAIL "mcp-proxy sse (got '$SSE_OUT')"
   kill "$PYPID" 2>/dev/null; PYPID=""
@@ -203,12 +203,12 @@ fi
 
 # A shorter idle timeout than command duration catches shutdown that ignores
 # in-flight work.
-AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" daemon --stop >/dev/null 2>&1
-IDLE_OUT=$(AGENT_SCALE_IDLE_SECS=2 AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" -e test exec -- sh -c 'sleep 5; echo survived' 2>/dev/null)
+AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" daemon --stop >/dev/null 2>&1
+IDLE_OUT=$(AGENT_SCALE_IDLE_SECS=2 AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" -e test exec -- sh -c 'sleep 5; echo survived' 2>/dev/null)
 [ "$IDLE_OUT" = "survived" ] && check PASS "idle timer doesn't kill in-flight exec" || check FAIL "idle killed exec (got '$IDLE_OUT')"
 # Registry removal proves the same timeout still applies after work completes.
 sleep 4
-STATUS9=$(AGENT_SCALE_HOME="$CENTER_HOME" "$SCALE" daemon --status)
+STATUS9=$(AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" daemon --status)
 echo "$STATUS9" | grep -qE "no daemon|alive=false" && check PASS "daemon idles out once work is done" || check FAIL "daemon didn't idle out ($STATUS9)"
 
 echo "--- $( [ $FAILED -eq 0 ] && echo ALL PASS || echo FAILURES ) ---"

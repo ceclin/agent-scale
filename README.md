@@ -14,14 +14,14 @@ change incompatibly before 1.0.
 | `agent-scale` | Linux, macOS, or Windows x86-64 developer machine | CLI and auto-started local daemon |
 | `as-edge` | Linux or macOS x86-64/ARM64, or Windows x86-64 | Authenticated command, transfer, and MCP endpoint |
 | `as-relay` | Linux relay host | Private iroh relay with signed dynamic membership |
-| `as-control` | Linux control host | Multi-center enrollment and signed desired state |
+| `as-control` | Linux control host | Multi-client enrollment and signed desired state |
 
 Versioned archives for all four binaries and the multi-architecture Control and
 Relay images are published by GitHub Releases. Each release includes
 a consolidated `SHA256SUMS`; see the [release guide](docs/releasing.md) for the
 target matrix and verification command.
 
-The center and edge pin each other's Ed25519 `EndpointId`. QUIC provides mutual
+The client and edge pin each other's Ed25519 `EndpointId`. QUIC provides mutual
 transport authentication; relay membership and control-plane maps are signed.
 If Control is temporarily unavailable, enrolled nodes continue with their last
 verified map. A definitive revocation response removes authorization and closes
@@ -55,16 +55,16 @@ agent-scale -e test exec -- cargo test
 ```
 
 On a Windows development machine, download the Windows x86-64 `agent-scale`
-archive, place `agent-scale.exe` on `PATH`, and run the same Center commands
+archive, place `agent-scale.exe` on `PATH`, and run the same Client commands
 from PowerShell. The background daemon is auto-started without a console window
 and communicates through a current-user-local Named Pipe; it does not install a
 service, require Administrator privileges, or open a listening network port.
-Windows Center support is currently experimental: its build and local IPC tests
-are wired into CI, but the complete Center-to-Edge workflow has not yet been
+Windows Client support is currently experimental: its build and local IPC tests
+are wired into CI, but the complete Client-to-Edge workflow has not yet been
 validated on a real Windows development host.
 
-Without `--center`, an edge uses trust on first use and durably pins the first
-center before authorizing it. Pass `--center ENDPOINT_ID` for an explicit pin.
+Without `--client`, an edge uses trust on first use and durably pins the first
+client before authorizing it. Pass `--client ENDPOINT_ID` for an explicit pin.
 See [simple mode](docs/simple-mode.md) and the
 [control-plane guide](docs/control-plane.md) for complete setup.
 
@@ -76,8 +76,8 @@ See [simple mode](docs/simple-mode.md) and the
 - transparent stdio, Streamable HTTP, and legacy SSE MCP proxying;
 - Control-signed private relay membership with offline snapshot recovery;
 - configurable Relay QAD UDP ports with Control-issued private TLS certificates;
-- optional multi-center enrollment and hot-reloaded desired state;
-- scheduler-neutral Provisioner API for isolated Center-to-Edge reconciliation.
+- optional multi-client enrollment and hot-reloaded desired state;
+- scheduler-neutral Provisioner API for isolated Client-to-Edge reconciliation.
 
 More detail is in [MCP](docs/mcp.md), [private relay](docs/private-relay.md), and
 [control plane](docs/control-plane.md). External controllers should also see the

@@ -1,8 +1,8 @@
 # Remote MCP servers
 
 MCP definitions belong to an edge identity and are stored in
-`$AGENT_SCALE_HOME/<who>/mcp.json`. The control plane and center cache do not
-store them, so transferring an edge to another center preserves its MCP setup.
+`$AGENT_SCALE_HOME/<who>/mcp.json`. The control plane and client cache do not
+store them, so transferring an edge to another client preserves its MCP setup.
 
 ## Manage servers
 

@@ -38,13 +38,13 @@ pub(crate) async fn mcp_stdio(
     let mut child_stderr = child.stderr.take().context("no mcp stderr")?;
     iroh_wire::write_frame(&mut send, T_RESULT, &serde_json::to_vec(&RpcResult::Ok(()))?).await?;
 
-    let mut center_open = true;
+    let mut client_open = true;
     let mut stdout_buf = vec![0u8; 64 * 1024];
     let mut stderr_buf = vec![0u8; CHUNK];
     let mut stderr_open = true;
     loop {
         tokio::select! {
-            frame = iroh_wire::read_frame(&mut recv), if center_open => match frame? {
+            frame = iroh_wire::read_frame(&mut recv), if client_open => match frame? {
                 Some(Frame { tag: T_DATA, payload }) => {
                     if let Some(stdin) = child_stdin.as_mut() {
                         stdin.write_all(&payload).await?;
@@ -53,7 +53,7 @@ pub(crate) async fn mcp_stdio(
                 }
                 _ => {
                     child_stdin = None;
-                    center_open = false;
+                    client_open = false;
                 }
             },
             read = child_stdout.read(&mut stdout_buf) => match read {

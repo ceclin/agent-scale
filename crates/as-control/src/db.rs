@@ -9,7 +9,7 @@ use control_api::{Invite, InviteKind};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::{
-    CenterRecord, ControlState, EdgeRecord, InviteRecord, InviteState, ProvisionerRecord, RelayRecord, STATE_SCHEMA,
+    ClientRecord, ControlState, EdgeRecord, InviteRecord, InviteState, ProvisionerRecord, RelayRecord, STATE_SCHEMA,
     unix_timestamp,
 };
 
@@ -120,11 +120,11 @@ impl Database {
                 })
             },
         )?;
-        let centers = query_all(
+        let clients = query_all(
             &connection,
-            "SELECT name, endpoint_id, managed_by FROM centers ORDER BY name",
+            "SELECT name, endpoint_id, managed_by FROM clients ORDER BY name",
             |row| {
-                Ok(CenterRecord {
+                Ok(ClientRecord {
                     name: row.get(0)?,
                     endpoint_id: row.get(1)?,
                     managed_by: row.get(2)?,
@@ -190,7 +190,7 @@ impl Database {
             public_url,
             relay_ca_der,
             revision,
-            centers,
+            clients,
             edges,
             relays,
             invites,
@@ -214,7 +214,7 @@ impl Database {
         }
         transaction.execute("DELETE FROM invitations", [])?;
         transaction.execute("DELETE FROM edges", [])?;
-        transaction.execute("DELETE FROM centers", [])?;
+        transaction.execute("DELETE FROM clients", [])?;
         transaction.execute("DELETE FROM relays", [])?;
         transaction.execute("UPDATE provisioners SET active = 0", [])?;
         let revision = i64::try_from(state.revision).context("control revision exceeds SQLite range")?;
@@ -228,9 +228,9 @@ impl Database {
                 params![item.endpoint_id, item.name],
             )?;
         }
-        for item in &state.centers {
+        for item in &state.clients {
             transaction.execute(
-                "INSERT INTO centers(endpoint_id, name, managed_by) VALUES (?1, ?2, ?3)",
+                "INSERT INTO clients(endpoint_id, name, managed_by) VALUES (?1, ?2, ?3)",
                 params![item.endpoint_id, item.name, item.managed_by],
             )?;
         }
@@ -248,13 +248,13 @@ impl Database {
         }
         for item in &state.invites {
             let (kind, owner_id) = match &item.invite.kind {
-                InviteKind::Center => ("center", None),
+                InviteKind::Client => ("client", None),
                 InviteKind::Edge { owner_id } => (
                     "edge",
                     state
-                        .centers
+                        .clients
                         .iter()
-                        .any(|center| center.endpoint_id == *owner_id)
+                        .any(|client| client.endpoint_id == *owner_id)
                         .then_some(owner_id.as_str()),
                 ),
                 InviteKind::Relay { .. } => ("relay", None),
@@ -276,7 +276,7 @@ impl Database {
             )?;
         }
         transaction.execute(
-            "DELETE FROM provisioners WHERE active = 0 AND endpoint_id NOT IN (SELECT managed_by FROM invitations WHERE managed_by IS NOT NULL) AND endpoint_id NOT IN (SELECT managed_by FROM centers WHERE managed_by IS NOT NULL)",
+            "DELETE FROM provisioners WHERE active = 0 AND endpoint_id NOT IN (SELECT managed_by FROM invitations WHERE managed_by IS NOT NULL) AND endpoint_id NOT IN (SELECT managed_by FROM clients WHERE managed_by IS NOT NULL)",
             [],
         )?;
         transaction.commit()?;
@@ -320,7 +320,7 @@ mod tests {
             public_url: "http://127.0.0.1:3350".into(),
             relay_ca_der: vec![1, 2, 3],
             revision: 0,
-            centers: vec![],
+            clients: vec![],
             edges: vec![],
             relays: vec![],
             invites: vec![],
@@ -368,13 +368,13 @@ mod tests {
         assert!(loaded.edges.is_empty());
 
         invalid.edges.clear();
-        invalid.centers = vec![
-            CenterRecord {
+        invalid.clients = vec![
+            ClientRecord {
                 name: "same".into(),
                 endpoint_id: SecretKey::generate().public().to_string(),
                 managed_by: None,
             },
-            CenterRecord {
+            ClientRecord {
                 name: "same".into(),
                 endpoint_id: SecretKey::generate().public().to_string(),
                 managed_by: None,
@@ -399,7 +399,7 @@ mod tests {
             name: "controller".into(),
             endpoint_id: provisioner_id.clone(),
         });
-        crate::create_invite(&key, &mut state, "job".into(), InviteKind::Center, 900).unwrap();
+        crate::create_invite(&key, &mut state, "job".into(), InviteKind::Client, 900).unwrap();
         state.invites[0].managed_by = Some(provisioner_id.clone());
         let database = Database::create(&dir.path().join("control.db"), &state).unwrap();
 

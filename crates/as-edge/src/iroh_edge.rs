@@ -17,18 +17,18 @@ use tracing::{info, warn};
 
 use crate::mcp_registry::RegistryStore;
 
-/// Which center(s) this edge will accept.
+/// Which client(s) this edge will accept.
 #[derive(Clone)]
-pub struct CenterPin {
-    inner: Arc<Mutex<CenterPinState>>,
+pub struct ClientPin {
+    inner: Arc<Mutex<ClientPinState>>,
 }
 
-struct CenterPinState {
-    auth: CenterAuth,
+struct ClientPinState {
+    auth: ClientAuth,
     connections: HashMap<iroh::EndpointId, HashMap<usize, iroh::endpoint::Connection>>,
 }
 
-enum CenterAuth {
+enum ClientAuth {
     Single {
         pinned: Option<iroh::EndpointId>,
         store: Option<PathBuf>,
@@ -36,11 +36,11 @@ enum CenterAuth {
     Managed(HashSet<iroh::EndpointId>),
 }
 
-impl CenterPin {
+impl ClientPin {
     pub fn strict(id: iroh::EndpointId) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(CenterPinState {
-                auth: CenterAuth::Single {
+            inner: Arc::new(Mutex::new(ClientPinState {
+                auth: ClientAuth::Single {
                     pinned: Some(id),
                     store: None,
                 },
@@ -51,8 +51,8 @@ impl CenterPin {
 
     pub fn tofu(existing: Option<iroh::EndpointId>, store: PathBuf) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(CenterPinState {
-                auth: CenterAuth::Single {
+            inner: Arc::new(Mutex::new(ClientPinState {
+                auth: ClientAuth::Single {
                     pinned: existing,
                     store: Some(store),
                 },
@@ -63,8 +63,8 @@ impl CenterPin {
 
     pub fn managed(ids: HashSet<iroh::EndpointId>) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(CenterPinState {
-                auth: CenterAuth::Managed(ids),
+            inner: Arc::new(Mutex::new(ClientPinState {
+                auth: ClientAuth::Managed(ids),
                 connections: HashMap::new(),
             })),
         }
@@ -74,16 +74,16 @@ impl CenterPin {
         let remote = connection.remote_id();
         let mut state = self.inner.lock().unwrap();
         let authorized = match &mut state.auth {
-            CenterAuth::Single { pinned: Some(id), .. } => *id == remote,
-            CenterAuth::Single { pinned, store } => {
+            ClientAuth::Single { pinned: Some(id), .. } => *id == remote,
+            ClientAuth::Single { pinned, store } => {
                 if let Some(path) = store {
                     scale_core::atomic_write(path, format!("{remote}\n").as_bytes())?;
                 }
                 *pinned = Some(remote);
-                info!("pinned center {remote} (trust-on-first-use)");
+                info!("pinned client {remote} (trust-on-first-use)");
                 true
             }
-            CenterAuth::Managed(ids) => ids.contains(&remote),
+            ClientAuth::Managed(ids) => ids.contains(&remote),
         };
         if authorized {
             state
@@ -109,8 +109,8 @@ impl CenterPin {
     fn is_authorized(&self, remote: iroh::EndpointId) -> bool {
         let state = self.inner.lock().unwrap();
         match &state.auth {
-            CenterAuth::Single { pinned, .. } => pinned.is_some_and(|id| id == remote),
-            CenterAuth::Managed(ids) => ids.contains(&remote),
+            ClientAuth::Single { pinned, .. } => pinned.is_some_and(|id| id == remote),
+            ClientAuth::Managed(ids) => ids.contains(&remote),
         }
     }
 
@@ -122,8 +122,8 @@ impl CenterPin {
     pub fn replace_managed(&self, next: HashSet<iroh::EndpointId>) -> Result<()> {
         let mut state = self.inner.lock().unwrap();
         let removed = {
-            let CenterAuth::Managed(current) = &mut state.auth else {
-                anyhow::bail!("cannot update a standalone center pin");
+            let ClientAuth::Managed(current) = &mut state.auth else {
+                anyhow::bail!("cannot update a standalone client pin");
             };
             let removed: Vec<_> = current.difference(&next).copied().collect();
             *current = next;
@@ -132,7 +132,7 @@ impl CenterPin {
         for endpoint_id in removed {
             if let Some(items) = state.connections.remove(&endpoint_id) {
                 for connection in items.into_values() {
-                    connection.close(1u32.into(), b"center authorization revoked");
+                    connection.close(1u32.into(), b"client authorization revoked");
                 }
             }
         }
@@ -140,7 +140,7 @@ impl CenterPin {
     }
 }
 
-pub async fn serve(endpoint: Endpoint, pin: CenterPin, store: FsStore, mcp_registry: RegistryStore) -> Result<()> {
+pub async fn serve(endpoint: Endpoint, pin: ClientPin, store: FsStore, mcp_registry: RegistryStore) -> Result<()> {
     info!("edge listening");
     while let Some(incoming) = endpoint.accept().await {
         let pin = pin.clone();
@@ -158,7 +158,7 @@ pub async fn serve(endpoint: Endpoint, pin: CenterPin, store: FsStore, mcp_regis
 
 async fn handle_conn(
     incoming: Incoming,
-    pin: CenterPin,
+    pin: ClientPin,
     store: FsStore,
     mcp_registry: RegistryStore,
     endpoint: Endpoint,
@@ -166,7 +166,7 @@ async fn handle_conn(
     let conn = incoming.await.context("handshake")?;
     let remote = conn.remote_id();
     if !pin.authorize_and_register(&conn)? {
-        warn!("rejecting unauthorized center {remote}");
+        warn!("rejecting unauthorized client {remote}");
         conn.close(1u32.into(), b"unauthorized");
         return Ok(());
     }
@@ -179,7 +179,7 @@ async fn handle_conn(
             .await
             .map_err(|e| anyhow::anyhow!("blobs accept: {e}"))
     } else {
-        info!("center {remote} connected");
+        info!("client {remote} connected");
         while let Ok((send, recv)) = conn.accept_bi().await {
             let store = store.clone();
             let mcp_registry = mcp_registry.clone();
@@ -202,7 +202,7 @@ async fn serve_request(
     store: FsStore,
     mcp_registry: RegistryStore,
     endpoint: Endpoint,
-    authenticated_center: iroh::EndpointId,
+    authenticated_client: iroh::EndpointId,
 ) -> Result<()> {
     let Frame { tag, payload } = match iroh_wire::read_frame(&mut recv).await? {
         Some(f) => f,
@@ -268,7 +268,7 @@ async fn serve_request(
                     });
                     iroh_wire::write_frame(&mut send, T_RESULT, &serde_json::to_vec(&resp)?).await?;
                     let _ = send.finish();
-                    let _ = recv.read_to_end(64).await; // wait for the center to close
+                    let _ = recv.read_to_end(64).await; // wait for the client to close
                     drop(tt); // GC the staged blob
                 }
                 Err(e) => {
@@ -282,15 +282,15 @@ async fn serve_request(
         }
         EdgeReq::ReceiveUpload {
             hash,
-            center_id,
-            center_relay,
+            client_id,
+            client_relay,
             path,
         } => {
             anyhow::ensure!(
-                center_id == authenticated_center.to_string(),
-                "upload center_id does not match authenticated connection"
+                client_id == authenticated_client.to_string(),
+                "upload client_id does not match authenticated connection"
             );
-            let resp = match recv_upload(&endpoint, &hash, &center_id, &center_relay, &path).await {
+            let resp = match recv_upload(&endpoint, &hash, &client_id, &client_relay, &path).await {
                 Ok(bytes) => RpcResult::Ok(TransferResult::Stored { bytes }),
                 Err(error) => RpcResult::Error(RemoteError::internal(format!("{error:#}"))),
             };
@@ -319,12 +319,12 @@ async fn write_error_result(send: &mut SendStream, error: anyhow::Error) -> Resu
     Ok(())
 }
 
-/// Fetch a blob from the center (streamed to disk) and write it to `path`.
-async fn recv_upload(endpoint: &Endpoint, hash: &str, center_id: &str, center_relay: &str, path: &str) -> Result<u64> {
-    let id: iroh::EndpointId = center_id.parse().map_err(|e| anyhow::anyhow!("bad center_id: {e}"))?;
-    let url: iroh::RelayUrl = center_relay
+/// Fetch a blob from the client (streamed to disk) and write it to `path`.
+async fn recv_upload(endpoint: &Endpoint, hash: &str, client_id: &str, client_relay: &str, path: &str) -> Result<u64> {
+    let id: iroh::EndpointId = client_id.parse().map_err(|e| anyhow::anyhow!("bad client_id: {e}"))?;
+    let url: iroh::RelayUrl = client_relay
         .parse()
-        .map_err(|e| anyhow::anyhow!("bad center_relay: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("bad client_relay: {e}"))?;
     let hash: iroh_blobs::Hash = hash.parse().map_err(|e| anyhow::anyhow!("bad hash: {e}"))?;
     let addr = EndpointAddr::from(id).with_relay_url(url);
     scale_transport::blobs::fetch_to_file(endpoint, addr, hash, path).await
@@ -335,10 +335,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn managed_center_set_replaces_authority() {
+    fn managed_client_set_replaces_authority() {
         let old = iroh::SecretKey::generate().public();
         let next = iroh::SecretKey::generate().public();
-        let pin = CenterPin::managed(HashSet::from([old]));
+        let pin = ClientPin::managed(HashSet::from([old]));
         assert!(pin.is_authorized(old));
         assert!(!pin.is_authorized(next));
 

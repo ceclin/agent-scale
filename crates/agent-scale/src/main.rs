@@ -26,7 +26,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Join or inspect the multi-center control plane.
+    /// Join or inspect the multi-client control plane.
     Control {
         #[command(subcommand)]
         cmd: ControlCmd,
@@ -53,7 +53,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: EdgeCmd,
     },
-    /// Ensure the center identity exists and print its EndpointId.
+    /// Ensure the client identity exists and print its EndpointId.
     Keygen,
     /// Daemon control: --status (default) or --stop.
     Daemon {
@@ -111,7 +111,7 @@ enum McpCmd {
 
 #[derive(Subcommand)]
 enum EdgeCmd {
-    /// Create a one-time invitation for an edge owned by this Center.
+    /// Create a one-time invitation for an edge owned by this Client.
     Invite {
         name: String,
         #[arg(long, default_value_t = 900)]
@@ -134,9 +134,9 @@ enum EdgeCmd {
 
 #[derive(Subcommand)]
 enum ControlCmd {
-    /// Enroll this center from a one-time control invitation.
+    /// Enroll this client from a one-time control invitation.
     Join { join_url: String },
-    /// Show this center's Control identity and cached map revision.
+    /// Show this client's Control identity and cached map revision.
     Status,
     /// Fetch and apply the latest control map now.
     Sync,

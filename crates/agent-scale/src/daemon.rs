@@ -55,7 +55,7 @@ struct Ctx {
     conns: Arc<Mutex<HashMap<String, Connection>>>,
     dials: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     store: FsStore,
-    center_id: EndpointId,
+    client_id: EndpointId,
     /// In-flight client handlers; the daemon won't idle out while > 0.
     active: Arc<AtomicUsize>,
     /// Relay URLs currently installed in the live iroh endpoint.
@@ -84,7 +84,7 @@ pub async fn run() -> Result<()> {
     let cfg = common::load_config()?;
     anyhow::ensure!(!cfg.edges.is_empty(), "no edges configured");
     let key = common::load_or_create_key()?;
-    let center_id = key.public();
+    let client_id = key.public();
 
     let mut relays = HashMap::new();
     for e in &cfg.edges {
@@ -150,7 +150,7 @@ pub async fn run() -> Result<()> {
         conns: Arc::new(Mutex::new(HashMap::new())),
         dials: Arc::new(Mutex::new(HashMap::new())),
         store: store.clone(),
-        center_id,
+        client_id,
         active: Arc::new(AtomicUsize::new(0)),
         known_relays,
     };
@@ -335,10 +335,10 @@ fn spawn_control_watcher(ctx: Ctx) {
                     backoff = 1;
                 }
                 Ok(crate::control::WatchOutcome::Revoked) => {
-                    warn!("center enrollment was revoked; disconnecting managed edges");
+                    warn!("client enrollment was revoked; disconnecting managed edges");
                     cfg.edges.retain(|edge| !edge.managed);
                     if let Err(error) = common::save_config(&cfg) {
-                        warn!("cannot persist center revocation: {error:#}");
+                        warn!("cannot persist client revocation: {error:#}");
                     }
                     reload_edges(&ctx).await;
                     return;
@@ -593,10 +593,10 @@ async fn do_upload(ctx: &Ctx, edge: &EdgeCfg, local: &str, remote: &str) -> Resu
     let (mut es, mut er) = conn.open_bi().await.map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
     let req = EdgeReq::ReceiveUpload {
         hash,
-        center_id: ctx.center_id.to_string(),
-        // Tell the edge to dial the center back on a relay both share (the
-        // center joined every edge relay into its endpoint).
-        center_relay: edge.relays.first().cloned().unwrap_or_default(),
+        client_id: ctx.client_id.to_string(),
+        // Tell the edge to dial the client back on a relay both share (the
+        // client joined every edge relay into its endpoint).
+        client_relay: edge.relays.first().cloned().unwrap_or_default(),
         path: remote.to_string(),
     };
     iroh_wire::write_frame(&mut es, T_START, &serde_json::to_vec(&req)?).await?;

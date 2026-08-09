@@ -16,9 +16,9 @@ use iroh::endpoint::{RelayMode, presets};
 use iroh::{Endpoint, RelayMap, RelayUrl, SecretKey};
 
 /// ALPN for the agent-scale RPC protocol.
-pub const ALPN: &[u8] = b"agent-scale/rpc/3";
+pub const ALPN: &[u8] = b"agent-scale/rpc/4";
 
-/// Valid tags in the center/edge and client/daemon frame protocols.
+/// Valid tags in the client/edge and client/daemon frame protocols.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum FrameTag {
@@ -212,7 +212,7 @@ fn split_header(header: [u8; 5]) -> Result<(FrameTag, usize)> {
     Ok((tag, len))
 }
 
-/// Framing over iroh QUIC streams (center <-> edge).
+/// Framing over iroh QUIC streams (client <-> edge).
 pub mod iroh_wire {
     use super::*;
     use iroh::endpoint::{RecvStream, SendStream};

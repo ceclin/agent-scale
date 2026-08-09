@@ -1,4 +1,4 @@
-//! A shared schema keeps Center and Edge framing changes compile-time coupled.
+//! A shared schema keeps Client and Edge framing changes compile-time coupled.
 
 use std::collections::BTreeMap;
 
@@ -10,13 +10,13 @@ pub enum EdgeReq {
     /// Run a command, streaming STDOUT/STDERR/EXIT frames.
     Exec(ExecParams),
     /// Add a local (on-edge) file to the blob store; reply with its hash so the
-    /// center can fetch it. (download direction)
+    /// client can fetch it. (download direction)
     PrepareDownload { path: String },
-    /// Fetch a blob from the center and write it to `path`. (upload direction)
+    /// Fetch a blob from the client and write it to `path`. (upload direction)
     ReceiveUpload {
         hash: String,
-        center_id: String,
-        center_relay: String,
+        client_id: String,
+        client_relay: String,
         path: String,
     },
     /// Read the edge-owned MCP registry.

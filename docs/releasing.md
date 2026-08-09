@@ -78,7 +78,7 @@ and `linux/arm64` to `ghcr.io/ceclin/agent-scale-control:<version>` and
 according to the channel.
 The Compose file accepts `AGENT_SCALE_CONTROL_IMAGE` and
 `AGENT_SCALE_RELAY_IMAGE` when immutable digests or private registry mirrors are
-preferred. Center is distributed only as an `agent-scale` binary archive.
+preferred. Client is distributed only as an `agent-scale` binary archive.
 
 ## Embedded upstream licenses
 

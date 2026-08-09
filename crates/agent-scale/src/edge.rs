@@ -1,4 +1,4 @@
-//! Simple-mode registry changes stay local; managed removals use the Center's
+//! Simple-mode registry changes stay local; managed removals use the Client's
 //! signed Control API.
 
 use crate::common::{self, EdgeCfg};

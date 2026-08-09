@@ -139,7 +139,7 @@ mod platform {
 }
 
 #[cfg(not(any(unix, windows)))]
-compile_error!("agent-scale Center supports Unix and Windows hosts");
+compile_error!("agent-scale Client supports Unix and Windows hosts");
 
 #[cfg(test)]
 mod tests {

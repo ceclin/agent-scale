@@ -16,7 +16,7 @@ use crate::common::{self, Config, ControlCfg, EdgeCfg};
 
 pub async fn join(join_url: String) -> Result<()> {
     let mut config = common::config_transaction()?;
-    anyhow::ensure!(config.control.is_none(), "this center is already enrolled in control");
+    anyhow::ensure!(config.control.is_none(), "this client is already enrolled in control");
     anyhow::ensure!(
         config.edges.is_empty(),
         "remove standalone edges before joining control"
@@ -25,12 +25,12 @@ pub async fn join(join_url: String) -> Result<()> {
     let token = JoinToken::decode(parsed.fragment().context("join URL is missing its token fragment")?)?;
     let control_id = token.verify()?;
     let (name, audience, control_url) = match &token.invite.kind {
-        InviteKind::Center => (
+        InviteKind::Client => (
             token.invite.name.clone(),
             token.invite.audience.clone(),
             token.invite.control_url.clone(),
         ),
-        _ => bail!("this invitation is not for a center"),
+        _ => bail!("this invitation is not for a client"),
     };
     let key = common::load_or_create_key()?;
     let request = ClaimRequest::sign(token, &key, unix_timestamp(), random_token(16))?;
@@ -39,15 +39,15 @@ pub async fn join(join_url: String) -> Result<()> {
         .json(&request)
         .send()
         .await
-        .context("claim center invitation")?;
+        .context("claim client invitation")?;
     let status = response.status();
     let body = response.bytes().await?;
     anyhow::ensure!(
         status.is_success(),
-        "control rejected center claim ({status}): {}",
+        "control rejected client claim ({status}): {}",
         String::from_utf8_lossy(&body)
     );
-    let joined: JoinResult = serde_json::from_slice(&body).context("decode center join response")?;
+    let joined: JoinResult = serde_json::from_slice(&body).context("decode client join response")?;
     joined.map.verify(control_id, key.public())?;
     config.control = Some(ControlCfg {
         name: name.clone(),
@@ -59,13 +59,13 @@ pub async fn join(join_url: String) -> Result<()> {
     apply_map(&mut config, joined.map)?;
     config.commit()?;
     signal_daemon().await?;
-    println!("joined control as center '{name}' ({})", key.public());
+    println!("joined control as client '{name}' ({})", key.public());
     Ok(())
 }
 
 pub async fn status() -> Result<()> {
     let config = common::load_config_or_default()?;
-    let control = config.control.as_ref().context("center is not enrolled in control")?;
+    let control = config.control.as_ref().context("client is not enrolled in control")?;
     let response = client()
         .get(api_url(&control.url, "v1/status")?)
         .send()
@@ -77,7 +77,7 @@ pub async fn status() -> Result<()> {
     println!("{}", control.name);
     println!("  control:  {}", control.url);
     println!("  revision: {}", status.revision);
-    println!("  centers:  {}", status.centers);
+    println!("  clients:  {}", status.clients);
     println!("  edges:    {}", status.edges);
     println!("  relays:   {}", status.relays);
     Ok(())
@@ -85,7 +85,7 @@ pub async fn status() -> Result<()> {
 
 pub async fn edge_invite(name: String, ttl_secs: u64) -> Result<()> {
     let config = common::load_config_or_default()?;
-    let control = config.control.context("center is not enrolled in control")?;
+    let control = config.control.context("client is not enrolled in control")?;
     let request = EdgeInviteRequest::sign(
         &common::load_or_create_key()?,
         control.audience,
@@ -107,7 +107,7 @@ pub async fn edge_invite(name: String, ttl_secs: u64) -> Result<()> {
 
 pub async fn edge_remove(name: String) -> Result<()> {
     let mut config = common::config_transaction()?;
-    let control = config.control.clone().context("center is not enrolled in control")?;
+    let control = config.control.clone().context("client is not enrolled in control")?;
     let edge = config
         .edges
         .iter()
@@ -170,11 +170,11 @@ pub async fn watch_config(config: &mut Config) -> Result<WatchOutcome> {
     let revision = config
         .control
         .as_ref()
-        .context("center is not enrolled in control")?
+        .context("client is not enrolled in control")?
         .map
         .map
         .revision;
-    let control = config.control.clone().context("center is not enrolled in control")?;
+    let control = config.control.clone().context("client is not enrolled in control")?;
     let key = common::load_or_create_key()?;
     let request = WatchRequest::sign(&key, revision, unix_timestamp(), random_token(16))?;
     let response = client()
@@ -202,7 +202,7 @@ pub async fn watch_config(config: &mut Config) -> Result<WatchOutcome> {
 }
 
 async fn sync_config_at(config: &mut Config, known_revision: u64) -> Result<()> {
-    let control = config.control.clone().context("center is not enrolled in control")?;
+    let control = config.control.clone().context("client is not enrolled in control")?;
     let key = common::load_or_create_key()?;
     let request = WatchRequest::sign(&key, known_revision, unix_timestamp(), random_token(16))?;
     let response = client()

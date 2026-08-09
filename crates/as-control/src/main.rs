@@ -23,8 +23,8 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand};
 use control_api::{
-    CONTROL_PROTOCOL_VERSION, CenterInfo, ClaimRequest, ControlStatus, EdgeInfo, EdgeInviteRequest, EdgeRemoveRequest,
-    Invite, InviteInfo, InviteKind, InviteResult, JoinResult, JoinToken, ManagedCenterInfo, ManagedEdgeInfo, NodeMap,
+    CONTROL_PROTOCOL_VERSION, ClaimRequest, ClientInfo, ControlStatus, EdgeInfo, EdgeInviteRequest, EdgeRemoveRequest,
+    Invite, InviteInfo, InviteKind, InviteResult, JoinResult, JoinToken, ManagedClientInfo, ManagedEdgeInfo, NodeMap,
     Overview, ProvisionerAction, ProvisionerRequest, ProvisionerResponse, ProvisionerTopology, RelayInfo,
     RelayNodeInfo, SignedNodeMap, WatchRequest, action_hash, hash_secret, verify_provisioner_authorization,
 };
@@ -41,14 +41,14 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
-const STATE_SCHEMA: u32 = 4;
+const STATE_SCHEMA: u32 = 5;
 const CLOCK_SKEW_SECS: i64 = 300;
 const DEFAULT_TTL_SECS: u64 = 15 * 60;
 
 #[derive(Parser)]
 #[command(
     name = "as-control",
-    about = "agent-scale multi-center control plane",
+    about = "agent-scale multi-client control plane",
     after_help = "AS_CONTROL_STATE_DIR defaults to ~/.agent-scale-control; the administration \
                   socket is always $AS_CONTROL_STATE_DIR/admin.sock."
 )]
@@ -88,10 +88,10 @@ enum Command {
     },
     /// Show all registered nodes and the current revision.
     Status,
-    /// Manage centers through the local administration socket.
-    Center {
+    /// Manage clients through the local administration socket.
+    Client {
         #[command(subcommand)]
-        command: CenterCommand,
+        command: ClientCommand,
     },
     /// Manage edges through the local administration socket.
     Edge {
@@ -116,7 +116,7 @@ enum Command {
 }
 
 #[derive(Subcommand)]
-enum CenterCommand {
+enum ClientCommand {
     Invite {
         name: String,
         #[arg(long, default_value_t = DEFAULT_TTL_SECS)]
@@ -140,7 +140,7 @@ enum EdgeCommand {
     Ls,
     Transfer {
         edge: String,
-        new_center: String,
+        new_client: String,
     },
     Rm {
         edge: String,
@@ -178,17 +178,17 @@ enum InviteCommand {
 #[serde(tag = "command", rename_all = "snake_case")]
 enum LocalAdminRequest {
     Overview,
-    ListCenters,
+    ListClients,
     ListEdges,
     ListRelays,
     ListInvites,
     ListProvisioners,
-    InviteCenter { name: String, ttl_secs: u64 },
+    InviteClient { name: String, ttl_secs: u64 },
     InviteEdge { name: String, owner: String, ttl_secs: u64 },
     InviteRelay { name: String, url: String, ttl_secs: u64 },
     RevokeInvite { invite_id: String },
-    RemoveCenter { name: String },
-    TransferEdge { edge: String, new_center: String },
+    RemoveClient { name: String },
+    TransferEdge { edge: String, new_client: String },
     RemoveEdge { edge: String },
     RemoveRelay { name: String },
     AddProvisioner { name: String, endpoint_id: String },
@@ -199,7 +199,7 @@ enum LocalAdminRequest {
 #[serde(tag = "result", content = "data", rename_all = "snake_case")]
 enum LocalAdminResponse {
     Overview(Overview),
-    Centers(Vec<CenterInfo>),
+    Clients(Vec<ClientInfo>),
     Edges(Vec<EdgeInfo>),
     Relays(Vec<RelayNodeInfo>),
     Invites(Vec<InviteInfo>),
@@ -210,7 +210,7 @@ enum LocalAdminResponse {
 }
 
 #[derive(Debug, Clone)]
-struct CenterRecord {
+struct ClientRecord {
     name: String,
     endpoint_id: String,
     managed_by: Option<String>,
@@ -241,7 +241,7 @@ struct ProvisionerRecord {
 struct ProvisionerInfo {
     name: String,
     endpoint_id: String,
-    centers: usize,
+    clients: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,7 +269,7 @@ struct ControlState {
     public_url: String,
     relay_ca_der: Vec<u8>,
     revision: u64,
-    centers: Vec<CenterRecord>,
+    clients: Vec<ClientRecord>,
     edges: Vec<EdgeRecord>,
     relays: Vec<RelayRecord>,
     invites: Vec<InviteRecord>,
@@ -356,11 +356,11 @@ async fn main() -> Result<()> {
         ),
         Command::Run { bind } => run(state_dir, bind, admin_socket).await,
         Command::Status => print_admin_response(admin_call(&admin_socket, LocalAdminRequest::Overview).await?),
-        Command::Center { command } => {
+        Command::Client { command } => {
             let request = match command {
-                CenterCommand::Invite { name, ttl_secs } => LocalAdminRequest::InviteCenter { name, ttl_secs },
-                CenterCommand::Ls => LocalAdminRequest::ListCenters,
-                CenterCommand::Rm { name } => LocalAdminRequest::RemoveCenter { name },
+                ClientCommand::Invite { name, ttl_secs } => LocalAdminRequest::InviteClient { name, ttl_secs },
+                ClientCommand::Ls => LocalAdminRequest::ListClients,
+                ClientCommand::Rm { name } => LocalAdminRequest::RemoveClient { name },
             };
             print_admin_response(admin_call(&admin_socket, request).await?)
         }
@@ -370,7 +370,7 @@ async fn main() -> Result<()> {
                     LocalAdminRequest::InviteEdge { name, owner, ttl_secs }
                 }
                 EdgeCommand::Ls => LocalAdminRequest::ListEdges,
-                EdgeCommand::Transfer { edge, new_center } => LocalAdminRequest::TransferEdge { edge, new_center },
+                EdgeCommand::Transfer { edge, new_client } => LocalAdminRequest::TransferEdge { edge, new_client },
                 EdgeCommand::Rm { edge } => LocalAdminRequest::RemoveEdge { edge },
             };
             print_admin_response(admin_call(&admin_socket, request).await?)
@@ -426,7 +426,7 @@ fn init(dir: PathBuf, public_url: String, audience: String) -> Result<()> {
         public_url,
         relay_ca_der,
         revision: 0,
-        centers: vec![],
+        clients: vec![],
         edges: vec![],
         relays: vec![],
         invites: vec![],
@@ -434,7 +434,7 @@ fn init(dir: PathBuf, public_url: String, audience: String) -> Result<()> {
     };
     db::Database::create(&database_path(&dir), &state)?;
     println!("initialized control {}", key.public());
-    println!("next: as-control run, then as-control center invite <name>");
+    println!("next: as-control run, then as-control client invite <name>");
     Ok(())
 }
 
@@ -494,7 +494,7 @@ fn bootstrap(
             public_url: public_url.clone(),
             relay_ca_der,
             revision: 0,
-            centers: vec![],
+            clients: vec![],
             edges: vec![],
             relays: vec![],
             invites: vec![],
@@ -630,8 +630,8 @@ fn public_router(store: Arc<Store>) -> Router {
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .route("/v1/status", get(status))
         .route("/v1/claim", post(claim))
-        .route("/v1/edge/invite", post(center_edge_invite))
-        .route("/v1/edge/remove", post(center_edge_remove))
+        .route("/v1/edge/invite", post(client_edge_invite))
+        .route("/v1/edge/remove", post(client_edge_remove))
         .route("/v1/provisioner", post(provisioner_request))
         .route("/v1/watch", post(watch))
         .route("/v1/relay/watch", post(relay_watch))
@@ -645,7 +645,7 @@ async fn status(State(AppState(store)): State<AppState>) -> Json<ControlStatus> 
         control_url: state.public_url.clone(),
         control_id: store.key.public().to_string(),
         revision: state.revision,
-        centers: state.centers.len(),
+        clients: state.clients.len(),
         edges: state.edges.len(),
         relays: state.relays.len(),
     })
@@ -785,11 +785,11 @@ fn validate_relay_claim(
     Ok(qad_port)
 }
 
-async fn center_edge_invite(
+async fn client_edge_invite(
     State(AppState(store)): State<AppState>,
     Json(request): Json<EdgeInviteRequest>,
 ) -> Result<Json<InviteResult>, ApiError> {
-    let center_id = request.verify().map_err(ApiError::unauthorized)?;
+    let client_id = request.verify().map_err(ApiError::unauthorized)?;
     check_time(request.issued_at, unix_timestamp()).map_err(ApiError::unauthorized)?;
     validate_name(&request.name).map_err(ApiError::bad)?;
     if request.request_id.is_empty() || request.request_id.len() > 128 {
@@ -800,11 +800,11 @@ async fn center_edge_invite(
         return Err(ApiError::unauthorized("control audience mismatch"));
     }
     let managed_by = state
-        .centers
+        .clients
         .iter()
-        .find(|center| center.endpoint_id == center_id.to_string())
-        .map(|center| center.managed_by.clone())
-        .ok_or_else(|| ApiError::forbidden("center is not registered"))?;
+        .find(|client| client.endpoint_id == client_id.to_string())
+        .map(|client| client.managed_by.clone())
+        .ok_or_else(|| ApiError::forbidden("client is not registered"))?;
     if state
         .invites
         .iter()
@@ -813,7 +813,7 @@ async fn center_edge_invite(
         return Err(ApiError::conflict("edge invitation request was already used"));
     }
     let kind = InviteKind::Edge {
-        owner_id: center_id.to_string(),
+        owner_id: client_id.to_string(),
     };
     validate_invite_name(&state, &request.name, &kind)?;
     let mut next = state.clone();
@@ -830,28 +830,28 @@ async fn center_edge_invite(
     Ok(Json(result))
 }
 
-async fn center_edge_remove(
+async fn client_edge_remove(
     State(AppState(store)): State<AppState>,
     Json(request): Json<EdgeRemoveRequest>,
 ) -> Result<Json<SignedNodeMap>, ApiError> {
-    let center_endpoint = request.verify().map_err(ApiError::unauthorized)?;
+    let client_endpoint = request.verify().map_err(ApiError::unauthorized)?;
     check_time(request.issued_at, unix_timestamp()).map_err(ApiError::unauthorized)?;
     validate_name(&request.name).map_err(ApiError::bad)?;
     if request.nonce.is_empty() || request.nonce.len() > 128 {
         return Err(ApiError::bad("nonce must contain 1-128 characters"));
     }
-    let center_id = center_endpoint.to_string();
+    let client_id = client_endpoint.to_string();
     let mut state = store.state.lock().await;
     if request.audience != state.audience {
         return Err(ApiError::unauthorized("control audience mismatch"));
     }
-    if !state.centers.iter().any(|center| center.endpoint_id == center_id) {
-        return Err(ApiError::forbidden("center is not registered"));
+    if !state.clients.iter().any(|client| client.endpoint_id == client_id) {
+        return Err(ApiError::forbidden("client is not registered"));
     }
     let mut next = state.clone();
     let before = next.edges.len();
     next.edges.retain(|edge| {
-        !(edge.owner_id == center_id && edge.name == request.name && edge.endpoint_id == request.endpoint_id)
+        !(edge.owner_id == client_id && edge.name == request.name && edge.endpoint_id == request.endpoint_id)
     });
     if next.edges.len() == before {
         return Err(ApiError::bad(format!(
@@ -860,7 +860,7 @@ async fn center_edge_remove(
         )));
     }
     commit_candidate(&store, &mut state, next).await?;
-    let map = signed_map(&state, &store.key, center_endpoint).map_err(ApiError::internal)?;
+    let map = signed_map(&state, &store.key, client_endpoint).map_err(ApiError::internal)?;
     Ok(Json(map))
 }
 
@@ -912,14 +912,14 @@ async fn dispatch_provisioner_mutation(
 ) -> Result<ProvisionerResponse, ApiError> {
     match &request.action {
         ProvisionerAction::GetTopology => unreachable!("queries are handled before mutation dispatch"),
-        ProvisionerAction::InviteCenter { name, ttl_secs, secret } => {
+        ProvisionerAction::InviteClient { name, ttl_secs, secret } => {
             provisioner_invite(
                 store,
                 state,
                 provisioner_id,
                 request,
                 name,
-                InviteKind::Center,
+                InviteKind::Client,
                 *ttl_secs,
                 secret,
             )
@@ -931,7 +931,7 @@ async fn dispatch_provisioner_mutation(
             ttl_secs,
             secret,
         } => {
-            let owner_id = managed_center_id(state, owner, provisioner_id)?;
+            let owner_id = managed_client_id(state, owner, provisioner_id)?;
             provisioner_invite(
                 store,
                 state,
@@ -962,35 +962,35 @@ async fn dispatch_provisioner_mutation(
             commit_candidate(store, state, next).await?;
             provisioner_ok(state)
         }
-        ProvisionerAction::RemoveCenter { name } => {
-            let Some(center) = state
-                .centers
+        ProvisionerAction::RemoveClient { name } => {
+            let Some(client) = state
+                .clients
                 .iter()
                 .find(|item| item.name == *name && item.managed_by.as_deref() == Some(provisioner_id))
                 .cloned()
             else {
-                if state.centers.iter().any(|item| item.name == *name) {
-                    return Err(ApiError::forbidden("center is managed by another authority"));
+                if state.clients.iter().any(|item| item.name == *name) {
+                    return Err(ApiError::forbidden("client is managed by another authority"));
                 }
                 return provisioner_ok(state);
             };
-            if state.edges.iter().any(|edge| edge.owner_id == center.endpoint_id) {
-                return Err(ApiError::conflict("center still owns edges"));
+            if state.edges.iter().any(|edge| edge.owner_id == client.endpoint_id) {
+                return Err(ApiError::conflict("client still owns edges"));
             }
             if state.invites.iter().any(|invite| {
                 invite_is_active_pending(invite)
-                    && matches!(&invite.invite.kind, InviteKind::Edge { owner_id } if owner_id == &center.endpoint_id)
+                    && matches!(&invite.invite.kind, InviteKind::Edge { owner_id } if owner_id == &client.endpoint_id)
             }) {
-                return Err(ApiError::conflict("center still has pending edge invites"));
+                return Err(ApiError::conflict("client still has pending edge invites"));
             }
             check_expected_revision(state, request.expected_revision)?;
             let mut next = state.clone();
-            next.centers.retain(|item| item.endpoint_id != center.endpoint_id);
+            next.clients.retain(|item| item.endpoint_id != client.endpoint_id);
             commit_candidate(store, state, next).await?;
             provisioner_ok(state)
         }
         ProvisionerAction::RemoveEdge { owner, name } => {
-            let owner_id = managed_center_id(state, owner, provisioner_id)?;
+            let owner_id = managed_client_id(state, owner, provisioner_id)?;
             let exists = state
                 .edges
                 .iter()
@@ -1015,8 +1015,8 @@ async fn dispatch_provisioner_mutation(
                 .parse::<EndpointId>()
                 .map_err(|error| ApiError::bad(format!("invalid edge endpoint id: {error}")))?
                 .to_string();
-            let owner_id = managed_center_id(state, owner, provisioner_id)?;
-            let new_owner_id = managed_center_id(state, new_owner, provisioner_id)?;
+            let owner_id = managed_client_id(state, owner, provisioner_id)?;
+            let new_owner_id = managed_client_id(state, new_owner, provisioner_id)?;
             if !state
                 .edges
                 .iter()
@@ -1036,7 +1036,7 @@ async fn dispatch_provisioner_mutation(
                 .iter()
                 .any(|item| item.owner_id == new_owner_id && item.name == *name)
             {
-                return Err(ApiError::conflict("target center already has an edge with this name"));
+                return Err(ApiError::conflict("target client already has an edge with this name"));
             }
             check_expected_revision(state, request.expected_revision)?;
             let mut next = state.clone();
@@ -1099,17 +1099,17 @@ async fn provisioner_invite(
 }
 
 fn provisioner_topology(state: &ControlState, provisioner_id: &str) -> ProvisionerTopology {
-    let centers = state
-        .centers
+    let clients = state
+        .clients
         .iter()
-        .filter(|center| center.managed_by.as_deref() == Some(provisioner_id))
-        .map(|center| ManagedCenterInfo {
-            name: center.name.clone(),
-            endpoint_id: center.endpoint_id.clone(),
+        .filter(|client| client.managed_by.as_deref() == Some(provisioner_id))
+        .map(|client| ManagedClientInfo {
+            name: client.name.clone(),
+            endpoint_id: client.endpoint_id.clone(),
             edges: state
                 .edges
                 .iter()
-                .filter(|edge| edge.owner_id == center.endpoint_id)
+                .filter(|edge| edge.owner_id == client.endpoint_id)
                 .map(|edge| ManagedEdgeInfo {
                     name: edge.name.clone(),
                     endpoint_id: edge.endpoint_id.clone(),
@@ -1125,7 +1125,7 @@ fn provisioner_topology(state: &ControlState, provisioner_id: &str) -> Provision
         .collect();
     ProvisionerTopology {
         revision: state.revision,
-        centers,
+        clients,
         invites,
     }
 }
@@ -1136,13 +1136,13 @@ fn provisioner_ok(state: &ControlState) -> Result<ProvisionerResponse, ApiError>
     })
 }
 
-fn managed_center_id(state: &ControlState, name: &str, provisioner_id: &str) -> Result<String, ApiError> {
+fn managed_client_id(state: &ControlState, name: &str, provisioner_id: &str) -> Result<String, ApiError> {
     state
-        .centers
+        .clients
         .iter()
-        .find(|center| center.name == name && center.managed_by.as_deref() == Some(provisioner_id))
-        .map(|center| center.endpoint_id.clone())
-        .ok_or_else(|| ApiError::bad(format!("unknown managed center '{name}'")))
+        .find(|client| client.name == name && client.managed_by.as_deref() == Some(provisioner_id))
+        .map(|client| client.endpoint_id.clone())
+        .ok_or_else(|| ApiError::bad(format!("unknown managed client '{name}'")))
 }
 
 fn check_expected_revision(state: &ControlState, expected: Option<u64>) -> Result<(), ApiError> {
@@ -1193,15 +1193,15 @@ async fn relay_watch(
     wait_for_revision(&store, endpoint_id, request.known_revision, true).await?;
     let state = store.state.lock().await;
     anyhow_relay_exists(&state, endpoint_id)?;
-    let mut members = Vec::with_capacity(state.centers.len() + state.edges.len());
-    members.extend(state.centers.iter().map(|center| RelayMember {
-        name: format!("center/{}", center.name),
-        endpoint_id: center.endpoint_id.clone(),
+    let mut members = Vec::with_capacity(state.clients.len() + state.edges.len());
+    members.extend(state.clients.iter().map(|client| RelayMember {
+        name: format!("client/{}", client.name),
+        endpoint_id: client.endpoint_id.clone(),
     }));
     members.extend(state.edges.iter().map(|edge| RelayMember {
         name: format!(
             "edge/{}/{}",
-            center_name(&state, &edge.owner_id).unwrap_or("unknown"),
+            client_name(&state, &edge.owner_id).unwrap_or("unknown"),
             edge.name
         ),
         endpoint_id: edge.endpoint_id.clone(),
@@ -1304,9 +1304,9 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
             let state = store.state.lock().await;
             Ok(LocalAdminResponse::Overview(overview(&state)))
         }
-        LocalAdminRequest::ListCenters => {
+        LocalAdminRequest::ListClients => {
             let state = store.state.lock().await;
-            Ok(LocalAdminResponse::Centers(overview(&state).centers))
+            Ok(LocalAdminResponse::Clients(overview(&state).clients))
         }
         LocalAdminRequest::ListEdges => {
             let state = store.state.lock().await;
@@ -1329,27 +1329,27 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
                     .map(|item| ProvisionerInfo {
                         name: item.name.clone(),
                         endpoint_id: item.endpoint_id.clone(),
-                        centers: state
-                            .centers
+                        clients: state
+                            .clients
                             .iter()
-                            .filter(|center| center.managed_by.as_deref() == Some(&item.endpoint_id))
+                            .filter(|client| client.managed_by.as_deref() == Some(&item.endpoint_id))
                             .count(),
                     })
                     .collect(),
             ))
         }
-        LocalAdminRequest::InviteCenter { name, ttl_secs } => {
-            local_create_invite(store, name, InviteKind::Center, ttl_secs, None).await
+        LocalAdminRequest::InviteClient { name, ttl_secs } => {
+            local_create_invite(store, name, InviteKind::Client, ttl_secs, None).await
         }
         LocalAdminRequest::InviteEdge { name, owner, ttl_secs } => {
             let (owner_id, managed_by) = {
                 let state = store.state.lock().await;
                 state
-                    .centers
+                    .clients
                     .iter()
-                    .find(|center| center.name == owner)
-                    .map(|center| (center.endpoint_id.clone(), center.managed_by.clone()))
-                    .ok_or_else(|| ApiError::bad(format!("unknown center '{owner}'")))?
+                    .find(|client| client.name == owner)
+                    .map(|client| (client.endpoint_id.clone(), client.managed_by.clone()))
+                    .ok_or_else(|| ApiError::bad(format!("unknown client '{owner}'")))?
             };
             local_create_invite(store, name, InviteKind::Edge { owner_id }, ttl_secs, managed_by).await
         }
@@ -1375,42 +1375,42 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
             commit_candidate(store, &mut state, next).await?;
             Ok(LocalAdminResponse::Ok)
         }
-        LocalAdminRequest::RemoveCenter { name } => {
+        LocalAdminRequest::RemoveClient { name } => {
             let mut state = store.state.lock().await;
-            let center = state
-                .centers
+            let client = state
+                .clients
                 .iter()
-                .find(|center| center.name == name)
+                .find(|client| client.name == name)
                 .cloned()
-                .ok_or_else(|| ApiError::bad(format!("unknown center '{name}'")))?;
-            if state.edges.iter().any(|edge| edge.owner_id == center.endpoint_id) {
-                return Err(ApiError::conflict("center still owns edges"));
+                .ok_or_else(|| ApiError::bad(format!("unknown client '{name}'")))?;
+            if state.edges.iter().any(|edge| edge.owner_id == client.endpoint_id) {
+                return Err(ApiError::conflict("client still owns edges"));
             }
             if state.invites.iter().any(|invite| {
                 invite_is_active_pending(invite)
                     && matches!(
                         &invite.invite.kind,
-                        InviteKind::Edge { owner_id } if owner_id == &center.endpoint_id
+                        InviteKind::Edge { owner_id } if owner_id == &client.endpoint_id
                     )
             }) {
-                return Err(ApiError::conflict("center still has pending edge invites"));
+                return Err(ApiError::conflict("client still has pending edge invites"));
             }
             let mut next = state.clone();
-            next.centers.retain(|item| item.endpoint_id != center.endpoint_id);
+            next.clients.retain(|item| item.endpoint_id != client.endpoint_id);
             commit_candidate(store, &mut state, next).await?;
             Ok(LocalAdminResponse::Ok)
         }
-        LocalAdminRequest::TransferEdge { edge, new_center } => {
+        LocalAdminRequest::TransferEdge { edge, new_client } => {
             let (owner_name, edge_name) = parse_edge_ref(&edge)?;
             let mut state = store.state.lock().await;
-            let old_owner = center_id_by_name(&state, owner_name)?;
-            let new_owner = center_id_by_name(&state, &new_center)?;
+            let old_owner = client_id_by_name(&state, owner_name)?;
+            let new_owner = client_id_by_name(&state, &new_client)?;
             if state
                 .edges
                 .iter()
                 .any(|item| item.owner_id == new_owner && item.name == edge_name)
             {
-                return Err(ApiError::conflict("target center already has an edge with this name"));
+                return Err(ApiError::conflict("target client already has an edge with this name"));
             }
             let mut next = state.clone();
             let record = next
@@ -1425,7 +1425,7 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
         LocalAdminRequest::RemoveEdge { edge } => {
             let (owner_name, edge_name) = parse_edge_ref(&edge)?;
             let mut state = store.state.lock().await;
-            let owner_id = center_id_by_name(&state, owner_name)?;
+            let owner_id = client_id_by_name(&state, owner_name)?;
             let mut next = state.clone();
             let before = next.edges.len();
             next.edges
@@ -1472,11 +1472,11 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
                 return Err(ApiError::bad(format!("unknown provisioner '{name}'")));
             };
             if state
-                .centers
+                .clients
                 .iter()
-                .any(|center| center.managed_by.as_deref() == Some(&provisioner.endpoint_id))
+                .any(|client| client.managed_by.as_deref() == Some(&provisioner.endpoint_id))
             {
-                return Err(ApiError::conflict("provisioner still manages centers"));
+                return Err(ApiError::conflict("provisioner still manages clients"));
             }
             if state.invites.iter().any(|invite| {
                 invite_is_active_pending(invite) && invite.managed_by.as_deref() == Some(&provisioner.endpoint_id)
@@ -1515,16 +1515,16 @@ async fn local_create_invite(
 fn overview(state: &ControlState) -> Overview {
     Overview {
         revision: state.revision,
-        centers: state
-            .centers
+        clients: state
+            .clients
             .iter()
-            .map(|center| CenterInfo {
-                name: center.name.clone(),
-                endpoint_id: center.endpoint_id.clone(),
+            .map(|client| ClientInfo {
+                name: client.name.clone(),
+                endpoint_id: client.endpoint_id.clone(),
                 edges: state
                     .edges
                     .iter()
-                    .filter(|edge| edge.owner_id == center.endpoint_id)
+                    .filter(|edge| edge.owner_id == client.endpoint_id)
                     .count(),
             })
             .collect(),
@@ -1535,7 +1535,7 @@ fn overview(state: &ControlState) -> Overview {
                 name: edge.name.clone(),
                 endpoint_id: edge.endpoint_id.clone(),
                 owner_id: edge.owner_id.clone(),
-                owner_name: center_name(state, &edge.owner_id).unwrap_or("unknown").into(),
+                owner_name: client_name(state, &edge.owner_id).unwrap_or("unknown").into(),
             })
             .collect(),
         relays: state
@@ -1574,16 +1574,16 @@ fn invite_info(invite: &InviteRecord) -> InviteInfo {
 fn parse_edge_ref(value: &str) -> Result<(&str, &str), ApiError> {
     value
         .split_once('/')
-        .ok_or_else(|| ApiError::bad("edge must be written as <center>/<edge>"))
+        .ok_or_else(|| ApiError::bad("edge must be written as <client>/<edge>"))
 }
 
-fn center_id_by_name(state: &ControlState, name: &str) -> Result<String, ApiError> {
+fn client_id_by_name(state: &ControlState, name: &str) -> Result<String, ApiError> {
     state
-        .centers
+        .clients
         .iter()
-        .find(|center| center.name == name)
-        .map(|center| center.endpoint_id.clone())
-        .ok_or_else(|| ApiError::bad(format!("unknown center '{name}'")))
+        .find(|client| client.name == name)
+        .map(|client| client.endpoint_id.clone())
+        .ok_or_else(|| ApiError::bad(format!("unknown client '{name}'")))
 }
 
 #[cfg(unix)]
@@ -1613,15 +1613,15 @@ fn print_admin_response(response: LocalAdminResponse) -> Result<()> {
     match response {
         LocalAdminResponse::Overview(value) => {
             println!("revision: {}", value.revision);
-            println!("centers:  {}", value.centers.len());
+            println!("clients:  {}", value.clients.len());
             println!("edges:    {}", value.edges.len());
             println!("relays:   {}", value.relays.len());
         }
-        LocalAdminResponse::Centers(values) => {
-            for center in values {
-                println!("{}", center.name);
-                println!("  endpoint_id: {}", center.endpoint_id);
-                println!("  edges:       {}", center.edges);
+        LocalAdminResponse::Clients(values) => {
+            for client in values {
+                println!("{}", client.name);
+                println!("  endpoint_id: {}", client.endpoint_id);
+                println!("  edges:       {}", client.edges);
             }
         }
         LocalAdminResponse::Edges(values) => {
@@ -1654,7 +1654,7 @@ fn print_admin_response(response: LocalAdminResponse) -> Result<()> {
             for provisioner in values {
                 println!("{}", provisioner.name);
                 println!("  endpoint_id: {}", provisioner.endpoint_id);
-                println!("  centers:    {}", provisioner.centers);
+                println!("  clients:    {}", provisioner.clients);
             }
         }
         LocalAdminResponse::Invite(value) => println!("{}", value.join_url),
@@ -1723,22 +1723,22 @@ fn add_claimed_node(
     relay_qad_port: Option<u16>,
 ) -> Result<(), ApiError> {
     match &invite.kind {
-        InviteKind::Center => {
+        InviteKind::Client => {
             if state
-                .centers
+                .clients
                 .iter()
                 .any(|item| item.name == invite.name || item.endpoint_id == endpoint_id.to_string())
             {
-                return Err(ApiError::conflict("center name or identity already exists"));
+                return Err(ApiError::conflict("client name or identity already exists"));
             }
-            state.centers.push(CenterRecord {
+            state.clients.push(ClientRecord {
                 name: invite.name.clone(),
                 endpoint_id: endpoint_id.to_string(),
                 managed_by: managed_by.map(ToOwned::to_owned),
             });
         }
         InviteKind::Edge { owner_id } => {
-            anyhow_center_exists(state, owner_id)?;
+            anyhow_client_exists(state, owner_id)?;
             if state.edges.iter().any(|item| {
                 item.owner_id == *owner_id && item.name == invite.name || item.endpoint_id == endpoint_id.to_string()
             }) {
@@ -1780,13 +1780,13 @@ fn signed_map(state: &ControlState, key: &SecretKey, recipient: EndpointId) -> R
             qad_port: relay.qad_port,
         })
         .collect();
-    let (allowed_centers, edges) =
+    let (allowed_clients, edges) =
         if let Some(edge) = state.edges.iter().find(|edge| edge.endpoint_id == recipient_string) {
             (vec![edge.owner_id.clone()], vec![])
         } else if state
-            .centers
+            .clients
             .iter()
-            .any(|center| center.endpoint_id == recipient_string)
+            .any(|client| client.endpoint_id == recipient_string)
         {
             let edges = state
                 .edges
@@ -1796,7 +1796,7 @@ fn signed_map(state: &ControlState, key: &SecretKey, recipient: EndpointId) -> R
                     name: edge.name.clone(),
                     endpoint_id: edge.endpoint_id.clone(),
                     owner_id: edge.owner_id.clone(),
-                    owner_name: center_name(state, &edge.owner_id).unwrap_or("unknown").to_string(),
+                    owner_name: client_name(state, &edge.owner_id).unwrap_or("unknown").to_string(),
                 })
                 .collect();
             (vec![], edges)
@@ -1816,7 +1816,7 @@ fn signed_map(state: &ControlState, key: &SecretKey, recipient: EndpointId) -> R
             recipient_id: recipient_string,
             relays,
             relay_ca_der: state.relay_ca_der.clone(),
-            allowed_centers,
+            allowed_clients,
             edges,
         },
         key,
@@ -1919,7 +1919,7 @@ fn validate_token_for_state(
 
 fn validate_invite_name(state: &ControlState, name: &str, kind: &InviteKind) -> Result<(), ApiError> {
     let registered_duplicate = match kind {
-        InviteKind::Center => state.centers.iter().any(|item| item.name == name),
+        InviteKind::Client => state.clients.iter().any(|item| item.name == name),
         InviteKind::Edge { owner_id } => state
             .edges
             .iter()
@@ -1929,7 +1929,7 @@ fn validate_invite_name(state: &ControlState, name: &str, kind: &InviteKind) -> 
     let pending_duplicate = state.invites.iter().any(|record| {
         invite_is_active_pending(record)
             && match (&record.invite.kind, kind) {
-                (InviteKind::Center, InviteKind::Center) => record.invite.name == name,
+                (InviteKind::Client, InviteKind::Client) => record.invite.name == name,
                 (InviteKind::Edge { owner_id: left }, InviteKind::Edge { owner_id: right }) => {
                     left == right && record.invite.name == name
                 }
@@ -1978,24 +1978,24 @@ fn validate_join_secret(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn center_name<'a>(state: &'a ControlState, id: &str) -> Option<&'a str> {
+fn client_name<'a>(state: &'a ControlState, id: &str) -> Option<&'a str> {
     state
-        .centers
+        .clients
         .iter()
         .find(|item| item.endpoint_id == id)
         .map(|item| item.name.as_str())
 }
 
-fn anyhow_center_exists(state: &ControlState, id: &str) -> Result<(), ApiError> {
-    if state.centers.iter().any(|item| item.endpoint_id == id) {
+fn anyhow_client_exists(state: &ControlState, id: &str) -> Result<(), ApiError> {
+    if state.clients.iter().any(|item| item.endpoint_id == id) {
         Ok(())
     } else {
-        Err(ApiError::bad("unknown center"))
+        Err(ApiError::bad("unknown client"))
     }
 }
 
 fn anyhow_node_exists(state: &ControlState, id: EndpointId) -> Result<(), ApiError> {
-    if state.centers.iter().any(|item| item.endpoint_id == id.to_string())
+    if state.clients.iter().any(|item| item.endpoint_id == id.to_string())
         || state.edges.iter().any(|item| item.endpoint_id == id.to_string())
     {
         Ok(())
@@ -2204,7 +2204,7 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["as-control", "bootstrap", "center", "main"]).is_err());
+        assert!(Cli::try_parse_from(["as-control", "bootstrap", "client", "main"]).is_err());
         assert!(Cli::try_parse_from(["as-control", "prepare"]).is_err());
     }
 
@@ -2243,7 +2243,7 @@ mod tests {
         );
         assert!(validate_relay_claim(&relay, Some(4433), None).is_err());
         assert!(validate_relay_claim(&relay, None, Some(&[1])).is_err());
-        assert!(validate_relay_claim(&InviteKind::Center, Some(4433), Some(&[1])).is_err());
+        assert!(validate_relay_claim(&InviteKind::Client, Some(4433), Some(&[1])).is_err());
     }
 
     #[test]
@@ -2270,12 +2270,12 @@ mod tests {
 
         let control_dir = dir.path().join("control");
         let (lock, _key, database, mut state) = open_exclusive(&control_dir).unwrap();
-        assert!(state.centers.is_empty());
+        assert!(state.clients.is_empty());
         assert!(
             state
                 .invites
                 .iter()
-                .all(|invite| !matches!(invite.invite.kind, InviteKind::Center))
+                .all(|invite| !matches!(invite.invite.kind, InviteKind::Client))
         );
         run_bootstrap().unwrap();
         let relay_id = SecretKey::generate().public().to_string();
@@ -2323,13 +2323,13 @@ mod tests {
             public_url: "http://127.0.0.1:1".into(),
             relay_ca_der: vec![1, 2, 3],
             revision: 3,
-            centers: vec![
-                CenterRecord {
+            clients: vec![
+                ClientRecord {
                     name: "a".into(),
                     endpoint_id: a.public().to_string(),
                     managed_by: None,
                 },
-                CenterRecord {
+                ClientRecord {
                     name: "b".into(),
                     endpoint_id: b.public().to_string(),
                     managed_by: None,
@@ -2345,7 +2345,7 @@ mod tests {
             provisioners: vec![],
         };
         let edge_map = signed_map(&state, &key, edge.public()).unwrap();
-        assert_eq!(edge_map.map.allowed_centers, vec![b.public().to_string()]);
+        assert_eq!(edge_map.map.allowed_clients, vec![b.public().to_string()]);
         assert!(signed_map(&state, &key, a.public()).unwrap().map.edges.is_empty());
         assert_eq!(signed_map(&state, &key, b.public()).unwrap().map.edges.len(), 1);
     }
@@ -2357,13 +2357,13 @@ mod tests {
         let (lock, _control_key, database, mut current) = open_exclusive(dir.path()).unwrap();
         let key = SecretKey::generate();
         let mut next = current.clone();
-        next.centers = vec![
-            CenterRecord {
+        next.clients = vec![
+            ClientRecord {
                 name: "duplicate".into(),
                 endpoint_id: key.public().to_string(),
                 managed_by: None,
             },
-            CenterRecord {
+            ClientRecord {
                 name: "duplicate".into(),
                 endpoint_id: SecretKey::generate().public().to_string(),
                 managed_by: None,
@@ -2383,14 +2383,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn center_edge_invites_are_self_owned_and_replay_protected() {
+    async fn client_edge_invites_are_self_owned_and_replay_protected() {
         let dir = tempfile::tempdir().unwrap();
         init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
         let (lock, control_key, database, mut state) = open_exclusive(dir.path()).unwrap();
-        let center = SecretKey::generate();
-        state.centers.push(CenterRecord {
+        let client = SecretKey::generate();
+        state.clients.push(ClientRecord {
             name: "main".into(),
-            endpoint_id: center.public().to_string(),
+            endpoint_id: client.public().to_string(),
             managed_by: None,
         });
         database.replace_sync(&state).unwrap();
@@ -2413,21 +2413,21 @@ mod tests {
             900,
         )
         .unwrap();
-        let error = center_edge_invite(State(AppState(store.clone())), Json(unauthorized))
+        let error = client_edge_invite(State(AppState(store.clone())), Json(unauthorized))
             .await
             .unwrap_err();
         assert_eq!(error.status, StatusCode::FORBIDDEN);
 
         let request = EdgeInviteRequest::sign(
-            &center,
+            &client,
             "test".into(),
-            "center-request".into(),
+            "client-request".into(),
             unix_timestamp(),
             "box".into(),
             900,
         )
         .unwrap();
-        let response = center_edge_invite(State(AppState(store.clone())), Json(request.clone()))
+        let response = client_edge_invite(State(AppState(store.clone())), Json(request.clone()))
             .await
             .unwrap();
         assert!(response.0.join_url.contains("/join#"));
@@ -2435,41 +2435,41 @@ mod tests {
         assert_eq!(
             state.invites.last().unwrap().invite.kind,
             InviteKind::Edge {
-                owner_id: center.public().to_string()
+                owner_id: client.public().to_string()
             }
         );
         drop(state);
 
-        let error = center_edge_invite(State(AppState(store)), Json(request))
+        let error = client_edge_invite(State(AppState(store)), Json(request))
             .await
             .unwrap_err();
         assert_eq!(error.status, StatusCode::CONFLICT);
     }
 
     #[tokio::test]
-    async fn centers_can_remove_only_their_current_edge_identity() {
+    async fn clients_can_remove_only_their_current_edge_identity() {
         let dir = tempfile::tempdir().unwrap();
         init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
         let (lock, control_key, database, mut state) = open_exclusive(dir.path()).unwrap();
-        let center = SecretKey::generate();
-        let other_center = SecretKey::generate();
+        let client = SecretKey::generate();
+        let other_client = SecretKey::generate();
         let edge = SecretKey::generate();
-        state.centers = vec![
-            CenterRecord {
+        state.clients = vec![
+            ClientRecord {
                 name: "main".into(),
-                endpoint_id: center.public().to_string(),
+                endpoint_id: client.public().to_string(),
                 managed_by: None,
             },
-            CenterRecord {
+            ClientRecord {
                 name: "other".into(),
-                endpoint_id: other_center.public().to_string(),
+                endpoint_id: other_client.public().to_string(),
                 managed_by: None,
             },
         ];
         state.edges.push(EdgeRecord {
             name: "box".into(),
             endpoint_id: edge.public().to_string(),
-            owner_id: center.public().to_string(),
+            owner_id: client.public().to_string(),
         });
         database.replace_sync(&state).unwrap();
         let revision = state.revision;
@@ -2483,7 +2483,7 @@ mod tests {
         });
 
         let unauthorized = EdgeRemoveRequest::sign(
-            &other_center,
+            &other_client,
             "test".into(),
             "other-request".into(),
             unix_timestamp(),
@@ -2492,13 +2492,13 @@ mod tests {
         )
         .unwrap();
         assert!(
-            center_edge_remove(State(AppState(store.clone())), Json(unauthorized))
+            client_edge_remove(State(AppState(store.clone())), Json(unauthorized))
                 .await
                 .is_err()
         );
 
         let request = EdgeRemoveRequest::sign(
-            &center,
+            &client,
             "test".into(),
             "remove-request".into(),
             unix_timestamp(),
@@ -2506,7 +2506,7 @@ mod tests {
             edge.public().to_string(),
         )
         .unwrap();
-        let map = center_edge_remove(State(AppState(store.clone())), Json(request))
+        let map = client_edge_remove(State(AppState(store.clone())), Json(request))
             .await
             .unwrap()
             .0;
@@ -2522,8 +2522,8 @@ mod tests {
         let (lock, control_key, database, mut state) = open_exclusive(dir.path()).unwrap();
         let provisioner = SecretKey::generate();
         let other_provisioner = SecretKey::generate();
-        let center = SecretKey::generate();
-        let other_center = SecretKey::generate();
+        let client = SecretKey::generate();
+        let other_client = SecretKey::generate();
         state.provisioners = vec![
             ProvisionerRecord {
                 name: "controller-a".into(),
@@ -2534,15 +2534,15 @@ mod tests {
                 endpoint_id: other_provisioner.public().to_string(),
             },
         ];
-        state.centers = vec![
-            CenterRecord {
+        state.clients = vec![
+            ClientRecord {
                 name: "job-a".into(),
-                endpoint_id: center.public().to_string(),
+                endpoint_id: client.public().to_string(),
                 managed_by: Some(provisioner.public().to_string()),
             },
-            CenterRecord {
+            ClientRecord {
                 name: "job-b".into(),
-                endpoint_id: other_center.public().to_string(),
+                endpoint_id: other_client.public().to_string(),
                 managed_by: Some(other_provisioner.public().to_string()),
             },
         ];
@@ -2572,8 +2572,8 @@ mod tests {
         let ProvisionerResponse::Topology(topology) = response else {
             panic!("expected topology response");
         };
-        assert_eq!(topology.centers.len(), 1);
-        assert_eq!(topology.centers[0].name, "job-a");
+        assert_eq!(topology.clients.len(), 1);
+        assert_eq!(topology.clients[0].name, "job-a");
 
         let stranger = SecretKey::generate();
         let unauthorized = ProvisionerRequest::sign(
@@ -2589,7 +2589,7 @@ mod tests {
         assert_eq!(error.status, StatusCode::FORBIDDEN);
 
         let revision = store.state.lock().await.revision;
-        let invite_action = ProvisionerAction::InviteCenter {
+        let invite_action = ProvisionerAction::InviteClient {
             name: "job-new".into(),
             ttl_secs: 900,
             secret: "a".repeat(43),
@@ -2597,7 +2597,7 @@ mod tests {
         let invite_request = ProvisionerRequest::sign(
             &provisioner,
             "test".into(),
-            "invite-center-1".into(),
+            "invite-client-1".into(),
             unix_timestamp(),
             Some(revision),
             invite_action.clone(),
@@ -2616,10 +2616,10 @@ mod tests {
         let reused_request_id = ProvisionerRequest::sign(
             &provisioner,
             "test".into(),
-            "invite-center-1".into(),
+            "invite-client-1".into(),
             unix_timestamp(),
             Some(revision_after_first),
-            ProvisionerAction::InviteCenter {
+            ProvisionerAction::InviteClient {
                 name: "different".into(),
                 ttl_secs: 900,
                 secret: "b".repeat(43),
@@ -2634,10 +2634,10 @@ mod tests {
         let stale = ProvisionerRequest::sign(
             &provisioner,
             "test".into(),
-            "invite-center-stale".into(),
+            "invite-client-stale".into(),
             unix_timestamp(),
             Some(revision),
-            ProvisionerAction::InviteCenter {
+            ProvisionerAction::InviteClient {
                 name: "stale".into(),
                 ttl_secs: 900,
                 secret: "c".repeat(43),
@@ -2649,7 +2649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provisioner_enrollment_persists_center_edge_grouping() {
+    async fn provisioner_enrollment_persists_client_edge_grouping() {
         let dir = tempfile::tempdir().unwrap();
         init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
         let (lock, control_key, database, mut state) = open_exclusive(dir.path()).unwrap();
@@ -2668,30 +2668,30 @@ mod tests {
             _lock: lock,
         });
 
-        let center_secret = "c".repeat(43);
-        let center_invite = ProvisionerRequest::sign(
+        let client_secret = "c".repeat(43);
+        let client_invite = ProvisionerRequest::sign(
             &provisioner,
             "test".into(),
-            "center-invite".into(),
+            "client-invite".into(),
             unix_timestamp(),
             Some(store.state.lock().await.revision),
-            ProvisionerAction::InviteCenter {
+            ProvisionerAction::InviteClient {
                 name: "job".into(),
                 ttl_secs: 900,
-                secret: center_secret,
+                secret: client_secret,
             },
         )
         .unwrap();
-        let ProvisionerResponse::Invite(center_result) =
-            send_provisioner_request(store.clone(), center_invite).await.unwrap().0
+        let ProvisionerResponse::Invite(client_result) =
+            send_provisioner_request(store.clone(), client_invite).await.unwrap().0
         else {
-            panic!("expected center invite");
+            panic!("expected client invite");
         };
-        let center_token = JoinToken::decode(center_result.join_url.split_once('#').unwrap().1).unwrap();
-        let center_key = SecretKey::generate();
-        let center_claim =
-            ClaimRequest::sign(center_token, &center_key, unix_timestamp(), "center-claim".into()).unwrap();
-        let _ = claim(State(AppState(store.clone())), Json(center_claim)).await.unwrap();
+        let client_token = JoinToken::decode(client_result.join_url.split_once('#').unwrap().1).unwrap();
+        let client_key = SecretKey::generate();
+        let client_claim =
+            ClaimRequest::sign(client_token, &client_key, unix_timestamp(), "client-claim".into()).unwrap();
+        let _ = claim(State(AppState(store.clone())), Json(client_claim)).await.unwrap();
 
         let edge_invite = ProvisionerRequest::sign(
             &provisioner,
@@ -2718,12 +2718,12 @@ mod tests {
         let _ = claim(State(AppState(store.clone())), Json(edge_claim)).await.unwrap();
 
         let topology = provisioner_topology(&*store.state.lock().await, &provisioner.public().to_string());
-        assert_eq!(topology.centers.len(), 1);
-        assert_eq!(topology.centers[0].name, "job");
-        assert_eq!(topology.centers[0].endpoint_id, center_key.public().to_string());
-        assert_eq!(topology.centers[0].edges.len(), 1);
-        assert_eq!(topology.centers[0].edges[0].name, "lab");
-        assert_eq!(topology.centers[0].edges[0].endpoint_id, edge_key.public().to_string());
+        assert_eq!(topology.clients.len(), 1);
+        assert_eq!(topology.clients[0].name, "job");
+        assert_eq!(topology.clients[0].endpoint_id, client_key.public().to_string());
+        assert_eq!(topology.clients[0].edges.len(), 1);
+        assert_eq!(topology.clients[0].edges[0].name, "lab");
+        assert_eq!(topology.clients[0].edges[0].endpoint_id, edge_key.public().to_string());
     }
 
     #[test]
@@ -2735,15 +2735,15 @@ mod tests {
             public_url: "http://127.0.0.1:1".into(),
             relay_ca_der: vec![1, 2, 3],
             revision: 1,
-            centers: vec![],
+            clients: vec![],
             edges: vec![],
             relays: vec![],
             invites: vec![],
             provisioners: vec![],
         };
-        create_invite(&key, &mut state, "job".into(), InviteKind::Center, 1).unwrap();
+        create_invite(&key, &mut state, "job".into(), InviteKind::Client, 1).unwrap();
         state.invites[0].invite.expires_at = unix_timestamp() - 1;
-        assert!(validate_invite_name(&state, "job", &InviteKind::Center).is_ok());
+        assert!(validate_invite_name(&state, "job", &InviteKind::Client).is_ok());
     }
 
     #[test]
@@ -2756,14 +2756,14 @@ mod tests {
             public_url: "http://127.0.0.1:1".into(),
             relay_ca_der: vec![1, 2, 3],
             revision: 9,
-            centers: vec![],
+            clients: vec![],
             edges: vec![],
             relays: vec![],
             invites: vec![],
             provisioners: vec![],
         };
         for name in ["recent-expired", "old-expired", "recent-claimed", "old-revoked"] {
-            create_invite(&key, &mut state, name.into(), InviteKind::Center, 60).unwrap();
+            create_invite(&key, &mut state, name.into(), InviteKind::Client, 60).unwrap();
         }
         state.invites[0].invite.expires_at = now - 60;
         state.invites[1].invite.expires_at = now - INVITATION_RETENTION_SECS - 1;
@@ -2808,7 +2808,7 @@ mod tests {
             "http-idempotency".into(),
             unix_timestamp(),
             Some(0),
-            ProvisionerAction::InviteCenter {
+            ProvisionerAction::InviteClient {
                 name: "job".into(),
                 ttl_secs: 900,
                 secret: "s".repeat(43),

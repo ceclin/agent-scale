@@ -32,7 +32,7 @@ pub struct SignedSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayStatus {
     pub audience: String,
-    pub center_id: String,
+    pub control_id: String,
     pub version: u64,
     pub members: usize,
 }
@@ -70,10 +70,10 @@ impl SignedSnapshot {
         Ok(Self { snapshot, signature })
     }
 
-    pub fn verify(&self, center_id: EndpointId) -> Result<()> {
-        center_id
+    pub fn verify(&self, control_id: EndpointId) -> Result<()> {
+        control_id
             .verify(&self.snapshot.canonical_bytes()?, &self.signature)
-            .context("invalid center signature")
+            .context("invalid Control signature")
     }
 }
 
@@ -81,15 +81,15 @@ impl SignedSnapshot {
 mod tests {
     use super::*;
 
-    fn snapshot(center: EndpointId) -> MembershipSnapshot {
+    fn snapshot(client: EndpointId) -> MembershipSnapshot {
         MembershipSnapshot {
             protocol_version: RELAY_PROTOCOL_VERSION,
             audience: "relay.example.test".into(),
             version: 1,
             issued_at: 42,
             members: vec![RelayMember {
-                name: "center".into(),
-                endpoint_id: center.to_string(),
+                name: "client".into(),
+                endpoint_id: client.to_string(),
             }],
         }
     }
