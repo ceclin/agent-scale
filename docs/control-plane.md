@@ -59,6 +59,8 @@ RELAY_QAD_BIND_PORT=7842
 
 Publish those HTTPS routes through a reverse proxy. Control targets port 3350;
 the Relay data plane targets port 3340 and must preserve WebSocket upgrades.
+iroh also requires plain HTTP access to the Relay's exact `/generate_204` path;
+see [Private Relay](private-relay.md) for the redirect exception.
 The Relay management port 3341 stays bound to host loopback. Compose also maps
 the chosen public QAD UDP port to the independently configurable container bind
 port (both default to 7842). Control automatically issues and distributes the private QAD TLS chain;

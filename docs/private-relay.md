@@ -72,11 +72,18 @@ are covered by Control's signed NodeMap, so no certificate or CA file needs to
 be installed manually on individual Relays, Centers, or Edges. Back up the
 entire Control state directory, including `relay-ca.key` and `relay-ca.der`.
 
-The WebSocket and admin listeners use plain HTTP. Put TLS in front of the public relay listener in
-production; its proxy route must preserve WebSocket upgrade headers. Keep the
-administrative listener private. It exposes only `/healthz` and the read-only
-`/v1/status` endpoint. QAD is a separate UDP/QUIC listener and already uses the
-Control-issued TLS certificate; do not send it through the HTTP reverse proxy.
+The WebSocket and admin listeners use plain HTTP. Put TLS in front of the public
+relay listener in production; its proxy route must preserve WebSocket upgrade
+headers. Keep the administrative listener private. It exposes only `/healthz`
+and the read-only `/v1/status` endpoint. QAD is a separate UDP/QUIC listener and
+already uses the Control-issued TLS certificate; do not send it through the
+HTTP reverse proxy.
+
+iroh captive-portal detection requires plain HTTP access to the exact
+`/generate_204` path and does not follow redirects. Route only that path to the
+Relay ahead of any HTTPS redirect; the Relay returns `204 No Content` with the
+matching `X-Iroh-Response`. Redirecting it causes a false captive-portal report.
+This is an iroh requirement, not an agent-scale management endpoint.
 
 ## Membership and Failure Behavior
 
