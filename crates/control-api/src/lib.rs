@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 const INVITE_DOMAIN: &[u8] = b"agent-scale-control-invite-v3\0";
 const CLAIM_DOMAIN: &[u8] = b"agent-scale-control-claim-v3\0";
 const EDGE_INVITE_REQUEST_DOMAIN: &[u8] = b"agent-scale-control-edge-invite-request-v3\0";
+const EDGE_REMOVE_REQUEST_DOMAIN: &[u8] = b"agent-scale-control-edge-remove-request-v3\0";
 const WATCH_DOMAIN: &[u8] = b"agent-scale-control-watch-v3\0";
 const MAP_DOMAIN: &[u8] = b"agent-scale-control-map-v3\0";
 pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
@@ -209,6 +210,69 @@ impl EdgeInviteRequest {
                 self.issued_at,
                 &self.name,
                 self.ttl_secs,
+            ),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeRemoveRequest {
+    pub protocol_version: u32,
+    pub center_id: String,
+    pub audience: String,
+    pub nonce: String,
+    pub issued_at: i64,
+    pub name: String,
+    pub endpoint_id: String,
+    pub signature: Signature,
+}
+
+impl EdgeRemoveRequest {
+    pub fn sign(
+        key: &SecretKey,
+        audience: String,
+        nonce: String,
+        issued_at: i64,
+        name: String,
+        endpoint_id: String,
+    ) -> Result<Self> {
+        endpoint_id.parse::<EndpointId>().context("invalid edge endpoint id")?;
+        let mut request = Self {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            center_id: key.public().to_string(),
+            audience,
+            nonce,
+            issued_at,
+            name,
+            endpoint_id,
+            signature: key.sign(b"placeholder"),
+        };
+        request.signature = key.sign(&request.signing_bytes()?);
+        Ok(request)
+    }
+
+    pub fn verify(&self) -> Result<EndpointId> {
+        ensure_protocol_version(self.protocol_version)?;
+        self.endpoint_id
+            .parse::<EndpointId>()
+            .context("invalid edge endpoint id")?;
+        let id: EndpointId = self.center_id.parse().context("invalid center id")?;
+        id.verify(&self.signing_bytes()?, &self.signature)
+            .context("invalid edge removal request signature")?;
+        Ok(id)
+    }
+
+    fn signing_bytes(&self) -> Result<Vec<u8>> {
+        domain_bytes(
+            EDGE_REMOVE_REQUEST_DOMAIN,
+            &(
+                self.protocol_version,
+                &self.center_id,
+                &self.audience,
+                &self.nonce,
+                self.issued_at,
+                &self.name,
+                &self.endpoint_id,
             ),
         )
     }
@@ -482,6 +546,26 @@ mod tests {
 
         let mut tampered = request;
         tampered.name = "other-box".into();
+        assert!(tampered.verify().is_err());
+    }
+
+    #[test]
+    fn edge_remove_request_is_bound_to_the_current_edge_identity() {
+        let center = SecretKey::generate();
+        let edge = SecretKey::generate();
+        let request = EdgeRemoveRequest::sign(
+            &center,
+            "prod".into(),
+            "nonce".into(),
+            50,
+            "win-box".into(),
+            edge.public().to_string(),
+        )
+        .unwrap();
+        assert_eq!(request.verify().unwrap(), center.public());
+
+        let mut tampered = request;
+        tampered.endpoint_id = SecretKey::generate().public().to_string();
         assert!(tampered.verify().is_err());
     }
 

@@ -129,10 +129,10 @@ agent-scale control join '<center-url>'
 
 ## Add Centers And Edges
 
-Network administration is local-only: run `as-control` on the Control host or
-through `docker compose exec`. An enrolled Center has one self-service ability:
-it may create any number of invitations for Edges owned by itself. Centers only
-receive the Edges assigned to their authenticated EndpointId.
+Global network administration is local-only: run `as-control` on the Control
+host or through `docker compose exec`. An enrolled Center may remotely create
+invitations for Edges owned by itself and remove those Edges later. Centers
+only receive the Edges assigned to their authenticated EndpointId.
 
 ```sh
 # Control host
@@ -146,6 +146,9 @@ agent-scale edge invite win-box
 
 # Test machine, after manually downloading as-edge
 as-edge join '<edge-url>'
+
+# laptop-b: remove its own Edge when the machine is deallocated
+agent-scale edge rm win-box
 ```
 
 Other local administration commands follow the same shape:
@@ -168,8 +171,10 @@ docker compose exec control \
   as-control edge invite win-box --owner laptop-b
 ```
 
-Center-created invitations are signed with the Center identity. Control derives
-the owner from that verified identity; the request cannot name another Center.
+Center-created invitations and removals are signed with the Center identity.
+Control derives the owner from that verified identity, so neither request can
+act on another Center's partition. Removal also identifies the current Edge
+EndpointId, preventing a delayed request from deleting a same-name replacement.
 There is no invitation quota, but each invitation still has a bounded TTL
 (`--ttl-secs`, 15 minutes by default and at most 7 days).
 

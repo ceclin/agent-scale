@@ -10,6 +10,8 @@ The project uses semantic versioning after its first public release. Before
 - Added configurable Relay QAD UDP ports and Control-managed private TLS:
   Relays generate their own keys and CSRs, while Control signs certificates and
   distributes its dedicated CA through the signed topology.
+- Allowed enrolled Centers to remove their own Control-managed Edges through
+  signed, identity-bound requests.
 
 ## 0.5.0 - 2026-08-07
 

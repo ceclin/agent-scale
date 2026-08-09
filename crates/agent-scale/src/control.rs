@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use control_api::{
-    ClaimRequest, ControlStatus, EdgeInviteRequest, InviteKind, InviteResult, JoinResult, JoinToken, SignedNodeMap,
-    WatchRequest,
+    ClaimRequest, ControlStatus, EdgeInviteRequest, EdgeRemoveRequest, InviteKind, InviteResult, JoinResult, JoinToken,
+    SignedNodeMap, WatchRequest,
 };
 use rand::Rng;
 use reqwest::{Client, Url};
@@ -102,6 +102,48 @@ pub async fn edge_invite(name: String, ttl_secs: u64) -> Result<()> {
         .context("create edge invitation")?;
     let result: InviteResult = decode_response(response).await?;
     println!("{}", result.join_url);
+    Ok(())
+}
+
+pub async fn edge_remove(name: String) -> Result<()> {
+    let mut config = common::config_transaction()?;
+    let control = config.control.clone().context("center is not enrolled in control")?;
+    let edge = config
+        .edges
+        .iter()
+        .find(|edge| edge.managed && edge.name == name)
+        .cloned()
+        .with_context(|| format!("no managed edge named '{name}'"))?;
+    let key = common::load_or_create_key()?;
+    let request = EdgeRemoveRequest::sign(
+        &key,
+        control.audience.clone(),
+        random_token(16),
+        unix_timestamp(),
+        name.clone(),
+        edge.endpoint_id,
+    )?;
+    let response = client()
+        .post(api_url(&control.url, "v1/edge/remove")?)
+        .json(&request)
+        .send()
+        .await
+        .context("remove managed edge")?;
+    let map: SignedNodeMap = decode_response(response).await?;
+    let control_id = control.control_id.parse().context("invalid cached control id")?;
+    map.verify(control_id, key.public())?;
+    anyhow::ensure!(
+        map.map.audience == control.audience && map.map.control_url == control.url,
+        "control map binding mismatch"
+    );
+    anyhow::ensure!(
+        map.map.revision > control.map.map.revision,
+        "control revision did not advance"
+    );
+    apply_map(&mut config, map)?;
+    config.commit()?;
+    signal_daemon().await?;
+    println!("removed edge '{name}'");
     Ok(())
 }
 

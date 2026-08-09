@@ -105,7 +105,7 @@ old_edge_id=$("${control[@]}" edge ls | awk '/endpoint_id:/ { print $2; exit }')
 kill "$edge_pid"
 wait "$edge_pid" 2>/dev/null || true
 edge_pid=
-replacement_join=$("${control[@]}" edge invite box --owner center-b)
+replacement_join=$(AGENT_SCALE_HOME="$work/center-b" target/debug/agent-scale edge invite box)
 AGENT_SCALE_HOME="$work/edge-replacement" target/debug/as-edge join "$replacement_join" --foreground \
   >"$work/edge-replacement.log" 2>&1 &
 edge_pid=$!
@@ -117,7 +117,7 @@ done
 [[ "${output:-}" == "replacement" ]]
 new_edge_id=$("${control[@]}" edge ls | awk '/endpoint_id:/ { print $2; exit }')
 [[ "$new_edge_id" != "$old_edge_id" ]]
-"${control[@]}" edge rm center-b/box
+AGENT_SCALE_HOME="$work/center-b" target/debug/agent-scale edge rm box
 "${control[@]}" center rm center-b
 "${control[@]}" center rm center-a
 

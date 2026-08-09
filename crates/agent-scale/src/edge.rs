@@ -1,5 +1,5 @@
-//! Simple-mode registry changes stay local and hot-reload the daemon; managed
-//! topology is deliberately handled elsewhere.
+//! Simple-mode registry changes stay local; managed removals use the Center's
+//! signed Control API.
 
 use crate::common::{self, EdgeCfg};
 use anyhow::Result;
@@ -55,18 +55,10 @@ pub fn ls() -> Result<()> {
 }
 
 pub async fn rm(name: String) -> Result<()> {
-    let mut cfg = common::config_transaction()?;
-    anyhow::ensure!(
-        cfg.control.is_none(),
-        "manual edges cannot be changed in a control-managed profile"
-    );
-    if let Some(edge) = cfg.edges.iter().find(|edge| edge.name == name && edge.managed) {
-        anyhow::bail!(
-            "edge '{}' is control-managed; remove it with `as-control edge rm <center>/{}` on the Control host",
-            edge.name,
-            edge.name
-        );
+    if common::load_config_or_default()?.control.is_some() {
+        return crate::control::edge_remove(name).await;
     }
+    let mut cfg = common::config_transaction()?;
     anyhow::ensure!(cfg.edges.iter().any(|e| e.name == name), "no edge named '{name}'");
     let before = cfg.edges.len();
     cfg.edges.retain(|e| e.name != name);

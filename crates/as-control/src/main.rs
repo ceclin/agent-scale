@@ -23,10 +23,10 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand};
 use control_api::{
-    CONTROL_PROTOCOL_VERSION, CenterInfo, ClaimRequest, ControlStatus, EdgeInfo, EdgeInviteRequest, Invite, InviteInfo,
-    InviteKind, InviteResult, JoinResult, JoinToken, ManagedCenterInfo, ManagedEdgeInfo, NodeMap, Overview,
-    ProvisionerAction, ProvisionerRequest, ProvisionerResponse, ProvisionerTopology, RelayInfo, RelayNodeInfo,
-    SignedNodeMap, WatchRequest, action_hash, hash_secret, verify_provisioner_authorization,
+    CONTROL_PROTOCOL_VERSION, CenterInfo, ClaimRequest, ControlStatus, EdgeInfo, EdgeInviteRequest, EdgeRemoveRequest,
+    Invite, InviteInfo, InviteKind, InviteResult, JoinResult, JoinToken, ManagedCenterInfo, ManagedEdgeInfo, NodeMap,
+    Overview, ProvisionerAction, ProvisionerRequest, ProvisionerResponse, ProvisionerTopology, RelayInfo,
+    RelayNodeInfo, SignedNodeMap, WatchRequest, action_hash, hash_secret, verify_provisioner_authorization,
 };
 use iroh_base::{EndpointId, SecretKey};
 use rand::Rng;
@@ -631,6 +631,7 @@ fn public_router(store: Arc<Store>) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/claim", post(claim))
         .route("/v1/edge/invite", post(center_edge_invite))
+        .route("/v1/edge/remove", post(center_edge_remove))
         .route("/v1/provisioner", post(provisioner_request))
         .route("/v1/watch", post(watch))
         .route("/v1/relay/watch", post(relay_watch))
@@ -827,6 +828,40 @@ async fn center_edge_invite(
         .managed_by = managed_by;
     commit_candidate(&store, &mut state, next).await?;
     Ok(Json(result))
+}
+
+async fn center_edge_remove(
+    State(AppState(store)): State<AppState>,
+    Json(request): Json<EdgeRemoveRequest>,
+) -> Result<Json<SignedNodeMap>, ApiError> {
+    let center_endpoint = request.verify().map_err(ApiError::unauthorized)?;
+    check_time(request.issued_at, unix_timestamp()).map_err(ApiError::unauthorized)?;
+    validate_name(&request.name).map_err(ApiError::bad)?;
+    if request.nonce.is_empty() || request.nonce.len() > 128 {
+        return Err(ApiError::bad("nonce must contain 1-128 characters"));
+    }
+    let center_id = center_endpoint.to_string();
+    let mut state = store.state.lock().await;
+    if request.audience != state.audience {
+        return Err(ApiError::unauthorized("control audience mismatch"));
+    }
+    if !state.centers.iter().any(|center| center.endpoint_id == center_id) {
+        return Err(ApiError::forbidden("center is not registered"));
+    }
+    let mut next = state.clone();
+    let before = next.edges.len();
+    next.edges.retain(|edge| {
+        !(edge.owner_id == center_id && edge.name == request.name && edge.endpoint_id == request.endpoint_id)
+    });
+    if next.edges.len() == before {
+        return Err(ApiError::bad(format!(
+            "unknown edge '{}' with the expected identity",
+            request.name
+        )));
+    }
+    commit_candidate(&store, &mut state, next).await?;
+    let map = signed_map(&state, &store.key, center_endpoint).map_err(ApiError::internal)?;
+    Ok(Json(map))
 }
 
 async fn provisioner_request(
@@ -2409,6 +2444,75 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn centers_can_remove_only_their_current_edge_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
+        let (lock, control_key, database, mut state) = open_exclusive(dir.path()).unwrap();
+        let center = SecretKey::generate();
+        let other_center = SecretKey::generate();
+        let edge = SecretKey::generate();
+        state.centers = vec![
+            CenterRecord {
+                name: "main".into(),
+                endpoint_id: center.public().to_string(),
+                managed_by: None,
+            },
+            CenterRecord {
+                name: "other".into(),
+                endpoint_id: other_center.public().to_string(),
+                managed_by: None,
+            },
+        ];
+        state.edges.push(EdgeRecord {
+            name: "box".into(),
+            endpoint_id: edge.public().to_string(),
+            owner_id: center.public().to_string(),
+        });
+        database.replace_sync(&state).unwrap();
+        let revision = state.revision;
+        let store = Arc::new(Store {
+            database,
+            key: control_key,
+            relay_ca: load_relay_ca(dir.path()).unwrap().1,
+            state: Mutex::new(state),
+            changed: Notify::new(),
+            _lock: lock,
+        });
+
+        let unauthorized = EdgeRemoveRequest::sign(
+            &other_center,
+            "test".into(),
+            "other-request".into(),
+            unix_timestamp(),
+            "box".into(),
+            edge.public().to_string(),
+        )
+        .unwrap();
+        assert!(
+            center_edge_remove(State(AppState(store.clone())), Json(unauthorized))
+                .await
+                .is_err()
+        );
+
+        let request = EdgeRemoveRequest::sign(
+            &center,
+            "test".into(),
+            "remove-request".into(),
+            unix_timestamp(),
+            "box".into(),
+            edge.public().to_string(),
+        )
+        .unwrap();
+        let map = center_edge_remove(State(AppState(store.clone())), Json(request))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(map.map.revision, revision + 1);
+        assert!(map.map.edges.is_empty());
+        assert!(store.state.lock().await.edges.is_empty());
     }
 
     #[tokio::test]
