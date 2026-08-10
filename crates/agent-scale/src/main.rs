@@ -11,6 +11,7 @@ mod mcp_sync;
 
 use std::process::ExitCode;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
@@ -47,6 +48,11 @@ enum Cmd {
     Mcp {
         #[command(subcommand)]
         cmd: McpCmd,
+    },
+    /// Forward local TCP or SOCKS5 traffic through a selected edge.
+    Proxy {
+        #[command(subcommand)]
+        cmd: ProxyCmd,
     },
     /// Manage configured edges (test machines).
     Edge {
@@ -110,6 +116,41 @@ enum McpCmd {
 }
 
 #[derive(Subcommand)]
+enum ProxyCmd {
+    /// Start a daemon-owned proxy listener.
+    Start {
+        #[command(subcommand)]
+        kind: ProxyStart,
+    },
+    /// List listeners owned by the current daemon process.
+    Ls,
+    /// Stop a listener by name.
+    Stop { name: String },
+}
+
+#[derive(Subcommand)]
+enum ProxyStart {
+    /// Forward one local TCP listener to a fixed Edge-side target.
+    Tcp {
+        name: String,
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+        #[arg(long)]
+        target: String,
+        #[arg(long, default_value_t = 10)]
+        connect_timeout_secs: u64,
+    },
+    /// Start a no-auth SOCKS5 listener (CONNECT and UDP ASSOCIATE).
+    Socks5 {
+        name: String,
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+        #[arg(long, default_value_t = 10)]
+        connect_timeout_secs: u64,
+    },
+}
+
+#[derive(Subcommand)]
 enum EdgeCmd {
     /// Create a one-time invitation for an edge owned by this Client.
     Invite {
@@ -154,10 +195,10 @@ fn main() -> ExitCode {
         if !cli.edges.is_empty()
             && !matches!(
                 &cli.cmd,
-                Cmd::Exec { .. } | Cmd::Upload { .. } | Cmd::Download { .. } | Cmd::Mcp { .. }
+                Cmd::Exec { .. } | Cmd::Upload { .. } | Cmd::Download { .. } | Cmd::Mcp { .. } | Cmd::Proxy { .. }
             )
         {
-            eprintln!("agent-scale: -e/--edge is only valid for exec, upload, download, and mcp");
+            eprintln!("agent-scale: -e/--edge is only valid for exec, upload, download, mcp, and proxy start");
             return ExitCode::FAILURE;
         }
         let edges = cli.edges;
@@ -273,6 +314,63 @@ fn main() -> ExitCode {
                     })
                 }
             },
+            Cmd::Proxy { cmd } => match cmd {
+                ProxyCmd::Start { kind } => match one_edge(&edges) {
+                    Ok(edge) => {
+                        let spec = match kind {
+                            ProxyStart::Tcp {
+                                name,
+                                listen,
+                                target,
+                                connect_timeout_secs,
+                            } => parse_proxy_target(&target).map(|target| common::ProxySpec {
+                                name,
+                                edge,
+                                listen,
+                                connect_timeout_secs,
+                                kind: common::ProxyKind::Tcp { target },
+                            }),
+                            ProxyStart::Socks5 {
+                                name,
+                                listen,
+                                connect_timeout_secs,
+                            } => Ok(common::ProxySpec {
+                                name,
+                                edge,
+                                listen,
+                                connect_timeout_secs,
+                                kind: common::ProxyKind::Socks5,
+                            }),
+                        };
+                        match spec {
+                            Ok(spec) => report(client::proxy_start(spec).await, |info| {
+                                println!("{} listening on {} via edge {}", info.name, info.listen, info.edge);
+                                ExitCode::SUCCESS
+                            }),
+                            Err(error) => report::<()>(Err(error), |()| ExitCode::SUCCESS),
+                        }
+                    }
+                    Err(error) => report::<()>(Err(error), |()| ExitCode::SUCCESS),
+                },
+                ProxyCmd::Ls => {
+                    if !edges.is_empty() {
+                        report::<()>(Err(anyhow::anyhow!("proxy ls does not accept -e/--edge")), |()| {
+                            ExitCode::SUCCESS
+                        })
+                    } else {
+                        report(client::proxy_list().await, print_proxies)
+                    }
+                }
+                ProxyCmd::Stop { name } => {
+                    if !edges.is_empty() {
+                        report::<()>(Err(anyhow::anyhow!("proxy stop does not accept -e/--edge")), |()| {
+                            ExitCode::SUCCESS
+                        })
+                    } else {
+                        report(client::proxy_stop(name).await, |()| ExitCode::SUCCESS)
+                    }
+                }
+            },
             Cmd::Daemon { status, stop } => report(daemon::control(status, stop).await, |()| ExitCode::SUCCESS),
             Cmd::Daemonize => match daemon::run().await {
                 Ok(()) => ExitCode::SUCCESS,
@@ -292,6 +390,38 @@ fn one_edge(edges: &[String]) -> anyhow::Result<String> {
         edges.len()
     );
     Ok(edges[0].clone())
+}
+
+fn parse_proxy_target(value: &str) -> anyhow::Result<protocol::ProxyTarget> {
+    let (host, port) = value
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("target must be HOST:PORT"))?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    anyhow::ensure!(!host.is_empty(), "target host cannot be empty");
+    let port = port.parse::<u16>().context("target port must be between 1 and 65535")?;
+    anyhow::ensure!(port != 0, "target port must be between 1 and 65535");
+    Ok(protocol::ProxyTarget {
+        host: host.to_owned(),
+        port,
+    })
+}
+
+fn print_proxies(proxies: Vec<common::ProxyInfo>) -> ExitCode {
+    if proxies.is_empty() {
+        println!("no proxies running");
+        return ExitCode::SUCCESS;
+    }
+    for proxy in proxies {
+        let kind = match proxy.kind {
+            common::ProxyKind::Tcp { target } => format!("tcp -> {}:{}", target.host, target.port),
+            common::ProxyKind::Socks5 => "socks5".into(),
+        };
+        println!("{}: {} on {} via {}", proxy.name, kind, proxy.listen, proxy.edge);
+    }
+    ExitCode::SUCCESS
 }
 
 fn print_mcp_catalog(catalog: protocol::McpCatalog) -> ExitCode {
@@ -365,5 +495,39 @@ mod tests {
             .is_ok()
         );
         assert!(Cli::try_parse_from(["agent-scale", "-e", "win", "mcp", "sync"]).is_err());
+    }
+
+    #[test]
+    fn proxy_start_accepts_tcp_and_socks5_forms() {
+        assert!(
+            Cli::try_parse_from([
+                "agent-scale",
+                "-e",
+                "linux",
+                "proxy",
+                "start",
+                "tcp",
+                "db",
+                "--listen",
+                "127.0.0.1:15432",
+                "--target",
+                "db.internal:5432",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agent-scale",
+                "-e",
+                "linux",
+                "proxy",
+                "start",
+                "socks5",
+                "dev",
+                "--listen",
+                "127.0.0.1:1080",
+            ])
+            .is_ok()
+        );
     }
 }

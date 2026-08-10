@@ -15,6 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::common::{self, ClientOp, ClientReq, LOCAL_PROTOCOL_VERSION, LocalCommand, LocalRequest, VERSION};
 use crate::common::{DaemonAdmin, DaemonStatus};
+use crate::common::{ProxyAdmin, ProxyAdminResult, ProxyInfo, ProxySpec};
 
 fn work_request(edge: String, op: ClientOp) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&LocalRequest {
@@ -262,6 +263,66 @@ pub async fn daemon_admin(command: DaemonAdmin) -> Result<Option<DaemonStatus>> 
         },
         Some(frame) => anyhow::bail!("unexpected daemon admin frame {}", frame.tag),
         None => anyhow::bail!("daemon closed without an admin response"),
+    }
+}
+
+pub async fn proxy_start(spec: ProxySpec) -> Result<ProxyInfo> {
+    check_edge(&spec.edge).await?;
+    match proxy_request(ProxyAdmin::Start(spec), true).await? {
+        Some(ProxyAdminResult::Started(info)) => Ok(info),
+        Some(_) => anyhow::bail!("daemon returned an unexpected proxy result"),
+        None => anyhow::bail!("daemon did not start"),
+    }
+}
+
+pub async fn proxy_stop(name: String) -> Result<()> {
+    match proxy_request(ProxyAdmin::Stop { name }, false).await? {
+        Some(ProxyAdminResult::Stopped) => Ok(()),
+        Some(_) => anyhow::bail!("daemon returned an unexpected proxy result"),
+        None => anyhow::bail!("daemon is not running"),
+    }
+}
+
+pub async fn proxy_list() -> Result<Vec<ProxyInfo>> {
+    match proxy_request(ProxyAdmin::List, false).await? {
+        Some(ProxyAdminResult::List(proxies)) => Ok(proxies),
+        Some(_) => anyhow::bail!("daemon returned an unexpected proxy result"),
+        None => Ok(Vec::new()),
+    }
+}
+
+async fn proxy_request(command: ProxyAdmin, spawn: bool) -> Result<Option<ProxyAdminResult>> {
+    let mut stream = if spawn {
+        ensure_daemon().await?
+    } else {
+        match crate::local_ipc::connect().await {
+            Ok(stream) => stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error).context("connect to daemon control socket"),
+        }
+    };
+    let request = LocalRequest {
+        version: VERSION.into(),
+        protocol_version: LOCAL_PROTOCOL_VERSION,
+        command: LocalCommand::Proxy(command),
+    };
+    io_wire::write_frame(&mut stream, T_START, &serde_json::to_vec(&request)?).await?;
+    match io_wire::read_frame(&mut stream).await? {
+        Some(Frame { tag: T_RESULT, payload }) => {
+            match serde_json::from_slice::<RpcResult<ProxyAdminResult>>(&payload)? {
+                RpcResult::Ok(result) => Ok(Some(result)),
+                RpcResult::Error(error) => anyhow::bail!("{}: {}", error.code, error.message),
+            }
+        }
+        Some(frame) => anyhow::bail!("unexpected daemon proxy frame {}", frame.tag),
+        None => anyhow::bail!("daemon closed without a proxy response"),
     }
 }
 

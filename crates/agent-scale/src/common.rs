@@ -1,6 +1,7 @@
 //! Centralizes local state conventions so every Client process resolves the
 //! same identity and IPC namespace.
 
+use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 
@@ -196,6 +197,7 @@ pub struct LocalRequest {
 pub enum LocalCommand {
     Work(ClientReq),
     Admin(DaemonAdmin),
+    Proxy(ProxyAdmin),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -213,6 +215,46 @@ pub struct DaemonStatus {
     pub protocol_version: u32,
     pub active_requests: usize,
     pub configured_edges: usize,
+    #[serde(default)]
+    pub configured_proxies: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxySpec {
+    pub name: String,
+    pub edge: String,
+    pub listen: SocketAddr,
+    pub connect_timeout_secs: u64,
+    pub kind: ProxyKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProxyKind {
+    Tcp { target: protocol::ProxyTarget },
+    Socks5,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyInfo {
+    pub name: String,
+    pub edge: String,
+    pub listen: SocketAddr,
+    pub kind: ProxyKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ProxyAdmin {
+    Start(ProxySpec),
+    Stop { name: String },
+    List,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ProxyAdminResult {
+    Started(ProxyInfo),
+    Stopped,
+    List(Vec<ProxyInfo>),
 }
 
 #[derive(Serialize, Deserialize)]

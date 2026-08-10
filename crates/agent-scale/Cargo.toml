@@ -16,6 +16,7 @@ base64 = { workspace = true }
 clap = { workspace = true }
 control-api = { path = "../control-api" }
 fs2 = "0.4"
+fast-socks5 = "1.0"
 hex = { workspace = true }
 iroh = "1.0.3"
 iroh-blobs = "0.103"

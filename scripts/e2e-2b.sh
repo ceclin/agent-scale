@@ -87,7 +87,7 @@ grep -q to-out "$OUT" && check PASS "stdout captured" || check FAIL "stdout"
 # The first command must discover an automatically spawned daemon.
 STATUS=$(AGENT_SCALE_HOME="$CLIENT_HOME" "$SCALE" daemon --status)
 echo "  $STATUS"
-echo "$STATUS" | grep -qE '^daemon pid=[0-9]+ version=[^ ]+ active=[0-9]+ edges=[0-9]+ endpoint=' \
+echo "$STATUS" | grep -qE '^daemon pid=[0-9]+ version=[^ ]+ active=[0-9]+ edges=[0-9]+ proxies=[0-9]+ endpoint=' \
   && check PASS "daemon auto-spawned and alive" || check FAIL "daemon status"
 
 # A round trip detects both transfer-direction and content-addressing mistakes.

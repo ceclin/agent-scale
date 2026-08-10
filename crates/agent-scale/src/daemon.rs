@@ -2,6 +2,7 @@
 //! stay fast and do not each create an iroh endpoint.
 
 mod connection_pool;
+mod proxy;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -63,6 +64,7 @@ struct Ctx {
     active: Arc<AtomicUsize>,
     /// Relay URLs currently installed in the live iroh endpoint.
     known_relays: Arc<Mutex<HashMap<String, RelayRuntimeConfig>>>,
+    proxies: proxy::ProxyManager,
 }
 
 /// Increments the active-handler count for its lifetime (RAII so it decrements
@@ -167,6 +169,7 @@ pub async fn run() -> Result<()> {
         client_id,
         active: Arc::new(AtomicUsize::new(0)),
         known_relays,
+        proxies: proxy::ProxyManager::default(),
     };
 
     spawn_blobs_acceptor(endpoint.clone(), edges.clone(), store.clone());
@@ -197,7 +200,7 @@ pub async fn run() -> Result<()> {
                 Err(_) => {
                     // Only idle out when nothing is in flight (a long exec /
                     // transfer / live MCP session keeps the daemon alive).
-                    if ctx.active.load(Ordering::SeqCst) > 0 {
+                    if ctx.active.load(Ordering::SeqCst) > 0 || !ctx.proxies.is_empty().await {
                         continue;
                     }
                     info!("idle for {}s; shutting down", idle.as_secs());
@@ -207,6 +210,7 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    ctx.proxies.shutdown().await;
     let _ = std::fs::remove_file(common::registry_path());
     endpoint.close().await;
     Ok(())
@@ -385,9 +389,9 @@ async fn handle_client(
     };
     anyhow::ensure!(tag == T_START, "expected START from client, got {tag}");
     let request: LocalRequest = serde_json::from_slice(&payload)?;
-    if let LocalCommand::Admin(command) = request.command {
+    if let LocalCommand::Admin(command) = &request.command {
         return handle_admin(
-            command,
+            *command,
             request.version,
             request.protocol_version,
             &ctx,
@@ -400,8 +404,16 @@ async fn handle_client(
         request.version == VERSION && request.protocol_version == LOCAL_PROTOCOL_VERSION,
         "client/daemon protocol mismatch"
     );
-    let LocalCommand::Work(req) = request.command else {
-        unreachable!()
+    let req = match request.command {
+        LocalCommand::Proxy(command) => {
+            let response = match ctx.proxies.handle(ctx.clone(), command).await {
+                Ok(result) => RpcResult::Ok(result),
+                Err(error) => RpcResult::Error(RemoteError::internal(format!("{error:#}"))),
+            };
+            return io_wire::write_frame(&mut cw, T_RESULT, &serde_json::to_vec(&response)?).await;
+        }
+        LocalCommand::Work(req) => req,
+        LocalCommand::Admin(_) => unreachable!(),
     };
     let edge = {
         let edges = ctx.edges.lock().await;
@@ -444,6 +456,7 @@ async fn handle_admin(
         protocol_version: LOCAL_PROTOCOL_VERSION,
         active_requests: ctx.active.load(Ordering::SeqCst).saturating_sub(1),
         configured_edges: ctx.edges.lock().await.len(),
+        configured_proxies: ctx.proxies.len().await,
     };
     let compatible = client_version == VERSION && client_protocol_version == LOCAL_PROTOCOL_VERSION;
     let response = if matches!(command, DaemonAdmin::Status | DaemonAdmin::Shutdown) || compatible {
@@ -679,11 +692,12 @@ pub async fn control(_status: bool, stop: bool) -> Result<()> {
     }
     match crate::client::daemon_admin(DaemonAdmin::Status).await? {
         Some(status) => println!(
-            "daemon pid={} version={} active={} edges={} endpoint={}",
+            "daemon pid={} version={} active={} edges={} proxies={} endpoint={}",
             status.pid,
             status.version,
             status.active_requests,
             status.configured_edges,
+            status.configured_proxies,
             common::local_endpoint()
         ),
         None => println!("no daemon running"),
