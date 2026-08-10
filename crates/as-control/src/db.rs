@@ -11,7 +11,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::{
     ClientRecord, ControlState, EdgeRecord, InviteRecord, InviteState, ProvisionerRecord,
-    RELAY_CREDENTIAL_LIFETIME_SECS, RelayRecord, RevocationRecord, STATE_SCHEMA, unix_timestamp,
+    RELAY_CREDENTIAL_LIFETIME_SECS, RelayRecord, RevocationRecord, STATE_SCHEMA, StateChange, StateDelta,
+    unix_timestamp,
 };
 
 const MIGRATION_1: &str = include_str!("schema.sql");
@@ -404,6 +405,153 @@ impl Database {
         Ok(())
     }
 
+    fn apply_delta_sync(
+        &self,
+        expected_revision: u64,
+        expected_relay_revision: u64,
+        revision: u64,
+        relay_revision: u64,
+        delta: &StateDelta,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            revision == expected_revision || revision == expected_revision.saturating_add(1),
+            "control revision must remain unchanged or advance atomically by one"
+        );
+        anyhow::ensure!(
+            relay_revision == expected_relay_revision || relay_revision == expected_relay_revision.saturating_add(1),
+            "Relay revision must remain unchanged or advance atomically by one"
+        );
+        let mut connection = self.connection.lock().expect("database mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for change in &delta.changes {
+            match change {
+                StateChange::PutClient(item) => {
+                    if let Some(endpoint_id) = item.managed_by.as_deref() {
+                        ensure_provisioner_placeholder(&transaction, endpoint_id)?;
+                    }
+                    let generation = i64::try_from(item.credential_generation)
+                        .context("Client credential generation exceeds SQLite range")?;
+                    transaction.execute(
+                        "INSERT INTO clients(endpoint_id, name, managed_by, credential_generation, credential_issued_at, credential_expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(endpoint_id) DO UPDATE SET name=excluded.name, managed_by=excluded.managed_by, credential_generation=excluded.credential_generation, credential_issued_at=excluded.credential_issued_at, credential_expires_at=excluded.credential_expires_at",
+                        params![item.endpoint_id, item.name, item.managed_by, generation, item.credential_issued_at, item.credential_expires_at],
+                    )?;
+                }
+                StateChange::DeleteClient(endpoint_id) => {
+                    transaction.execute("DELETE FROM clients WHERE endpoint_id = ?1", [endpoint_id])?;
+                }
+                StateChange::PutEdge(item) => {
+                    let generation = i64::try_from(item.credential_generation)
+                        .context("Edge credential generation exceeds SQLite range")?;
+                    transaction.execute(
+                        "INSERT INTO edges(endpoint_id, name, owner_id, credential_generation, credential_issued_at, credential_expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(endpoint_id) DO UPDATE SET name=excluded.name, owner_id=excluded.owner_id, credential_generation=excluded.credential_generation, credential_issued_at=excluded.credential_issued_at, credential_expires_at=excluded.credential_expires_at",
+                        params![item.endpoint_id, item.name, item.owner_id, generation, item.credential_issued_at, item.credential_expires_at],
+                    )?;
+                }
+                StateChange::DeleteEdge(endpoint_id) => {
+                    transaction.execute("DELETE FROM edges WHERE endpoint_id = ?1", [endpoint_id])?;
+                }
+                StateChange::PutRelay(item) => {
+                    transaction.execute(
+                        "INSERT INTO relays(endpoint_id, name, url, qad_port) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(endpoint_id) DO UPDATE SET name=excluded.name, url=excluded.url, qad_port=excluded.qad_port",
+                        params![item.endpoint_id, item.name, item.url, item.qad_port],
+                    )?;
+                }
+                StateChange::DeleteRelay(endpoint_id) => {
+                    transaction.execute("DELETE FROM relays WHERE endpoint_id = ?1", [endpoint_id])?;
+                }
+                StateChange::PutInvite(item) => {
+                    if let Some(endpoint_id) = item.managed_by.as_deref() {
+                        ensure_provisioner_placeholder(&transaction, endpoint_id)?;
+                    }
+                    let (kind, owner_id) = match &item.invite.kind {
+                        InviteKind::Client => ("client", None),
+                        InviteKind::Edge { owner_id } => ("edge", Some(owner_id.as_str())),
+                        InviteKind::Relay { .. } => ("relay", None),
+                    };
+                    let state = match item.state {
+                        InviteState::Pending => "pending",
+                        InviteState::Claimed => "claimed",
+                        InviteState::Revoked => "revoked",
+                    };
+                    transaction.execute(
+                        "INSERT INTO invitations(invite_id, name, kind, owner_id, invite_json, expires_at, state, claimed_by, request_id, managed_by, request_hash, terminal_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT(invite_id) DO UPDATE SET name=excluded.name, kind=excluded.kind, owner_id=excluded.owner_id, invite_json=excluded.invite_json, expires_at=excluded.expires_at, state=excluded.state, claimed_by=excluded.claimed_by, request_id=excluded.request_id, managed_by=excluded.managed_by, request_hash=excluded.request_hash, terminal_at=excluded.terminal_at",
+                        params![item.invite.invite_id, item.invite.name, kind, owner_id, serde_json::to_string(&item.invite)?, item.invite.expires_at, state, item.claimed_by, item.request_id, item.managed_by, item.request_hash, item.terminal_at],
+                    )?;
+                }
+                StateChange::DeleteInvite(invite_id) => {
+                    transaction.execute("DELETE FROM invitations WHERE invite_id = ?1", [invite_id])?;
+                }
+                StateChange::PutProvisioner(item) => {
+                    transaction.execute(
+                        "INSERT INTO provisioners(endpoint_id, name, active) VALUES (?1, ?2, 1) ON CONFLICT(endpoint_id) DO UPDATE SET name=excluded.name, active=1",
+                        params![item.endpoint_id, item.name],
+                    )?;
+                }
+                StateChange::DeleteProvisioner(endpoint_id) => {
+                    transaction.execute(
+                        "UPDATE provisioners SET active = 0 WHERE endpoint_id = ?1",
+                        [endpoint_id],
+                    )?;
+                }
+                StateChange::PutRevocation(item) => {
+                    anyhow::ensure!(
+                        item.revision <= relay_revision,
+                        "revocation record is ahead of Relay revision"
+                    );
+                    let generation = i64::try_from(item.revoked_through_generation)
+                        .context("revoked credential generation exceeds SQLite range")?;
+                    let item_revision =
+                        i64::try_from(item.revision).context("revocation revision exceeds SQLite range")?;
+                    transaction.execute(
+                        "INSERT INTO relay_revocations(endpoint_id, revoked_through_generation, expires_at, revision) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(endpoint_id) DO UPDATE SET revoked_through_generation=excluded.revoked_through_generation, expires_at=excluded.expires_at, revision=excluded.revision",
+                        params![item.endpoint_id, generation, item.expires_at, item_revision],
+                    )?;
+                }
+                StateChange::DeleteRevocation(endpoint_id) => {
+                    transaction.execute("DELETE FROM relay_revocations WHERE endpoint_id = ?1", [endpoint_id])?;
+                }
+            }
+        }
+        transaction.execute(
+            "DELETE FROM provisioners WHERE active = 0 AND endpoint_id NOT IN (SELECT managed_by FROM invitations WHERE managed_by IS NOT NULL) AND endpoint_id NOT IN (SELECT managed_by FROM clients WHERE managed_by IS NOT NULL)",
+            [],
+        )?;
+        let revision = i64::try_from(revision).context("control revision exceeds SQLite range")?;
+        let relay_revision = i64::try_from(relay_revision).context("Relay revision exceeds SQLite range")?;
+        let expected_revision = i64::try_from(expected_revision).context("control revision exceeds SQLite range")?;
+        let expected_relay_revision =
+            i64::try_from(expected_relay_revision).context("Relay revision exceeds SQLite range")?;
+        let changed = transaction.execute(
+            "UPDATE metadata SET revision = ?1, relay_revision = ?2 WHERE id = 1 AND revision = ?3 AND relay_revision = ?4",
+            params![revision, relay_revision, expected_revision, expected_relay_revision],
+        )?;
+        anyhow::ensure!(changed == 1, "durable Control revision changed while applying mutation");
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub async fn apply_delta(
+        &self,
+        expected_revision: u64,
+        expected_relay_revision: u64,
+        revision: u64,
+        relay_revision: u64,
+        delta: StateDelta,
+    ) -> Result<()> {
+        let database = self.clone();
+        tokio::task::spawn_blocking(move || {
+            database.apply_delta_sync(
+                expected_revision,
+                expected_relay_revision,
+                revision,
+                relay_revision,
+                &delta,
+            )
+        })
+        .await
+        .context("join SQLite writer")?
+    }
+
     pub fn apply_sync(&self, previous: &ControlState, next: &ControlState) -> Result<()> {
         let mut connection = self.connection.lock().expect("database mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -629,13 +777,6 @@ impl Database {
         transaction.commit()?;
         Ok(())
     }
-
-    pub async fn apply(&self, previous: ControlState, next: ControlState) -> Result<()> {
-        let database = self.clone();
-        tokio::task::spawn_blocking(move || database.apply_sync(&previous, &next))
-            .await
-            .context("join SQLite writer")?
-    }
 }
 
 fn query_all<T>(
@@ -645,6 +786,14 @@ fn query_all<T>(
 ) -> Result<Vec<T>> {
     let mut statement = connection.prepare(sql)?;
     Ok(statement.query_map([], map)?.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn ensure_provisioner_placeholder(transaction: &rusqlite::Transaction<'_>, endpoint_id: &str) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO provisioners(endpoint_id, name, active) VALUES (?1, ?2, 0) ON CONFLICT(endpoint_id) DO NOTHING",
+        params![endpoint_id, format!("deleted:{endpoint_id}")],
+    )?;
+    Ok(())
 }
 
 fn has_column(transaction: &rusqlite::Transaction<'_>, table: &str, column: &str) -> Result<bool> {

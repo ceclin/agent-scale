@@ -297,6 +297,113 @@ struct ControlState {
     revocations: Vec<RevocationRecord>,
 }
 
+#[derive(Debug, Clone)]
+enum StateChange {
+    PutClient(ClientRecord),
+    DeleteClient(String),
+    PutEdge(EdgeRecord),
+    DeleteEdge(String),
+    PutRelay(RelayRecord),
+    DeleteRelay(String),
+    PutInvite(Box<InviteRecord>),
+    DeleteInvite(String),
+    PutProvisioner(ProvisionerRecord),
+    DeleteProvisioner(String),
+    PutRevocation(RevocationRecord),
+    DeleteRevocation(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Publish {
+    None,
+    Nodes,
+    NodesAndRelays,
+}
+
+#[derive(Debug, Clone)]
+struct StateDelta {
+    changes: Vec<StateChange>,
+    publish: Publish,
+}
+
+impl StateDelta {
+    fn quiet(changes: Vec<StateChange>) -> Self {
+        Self {
+            changes,
+            publish: Publish::None,
+        }
+    }
+
+    fn topology(changes: Vec<StateChange>) -> Self {
+        Self {
+            changes,
+            publish: Publish::Nodes,
+        }
+    }
+
+    fn revocation(changes: Vec<StateChange>) -> Self {
+        Self {
+            changes,
+            publish: Publish::NodesAndRelays,
+        }
+    }
+
+    fn apply(self, state: &mut ControlState) {
+        for change in self.changes {
+            match change {
+                StateChange::PutClient(record) => upsert_record(&mut state.clients, record, |item, key| {
+                    item.endpoint_id == key.endpoint_id
+                }),
+                StateChange::DeleteClient(endpoint_id) => {
+                    state.clients.retain(|item| item.endpoint_id != endpoint_id);
+                }
+                StateChange::PutEdge(record) => upsert_record(&mut state.edges, record, |item, key| {
+                    item.endpoint_id == key.endpoint_id
+                }),
+                StateChange::DeleteEdge(endpoint_id) => {
+                    state.edges.retain(|item| item.endpoint_id != endpoint_id);
+                }
+                StateChange::PutRelay(record) => upsert_record(&mut state.relays, record, |item, key| {
+                    item.endpoint_id == key.endpoint_id
+                }),
+                StateChange::DeleteRelay(endpoint_id) => {
+                    state.relays.retain(|item| item.endpoint_id != endpoint_id);
+                }
+                StateChange::PutInvite(record) => upsert_record(&mut state.invites, *record, |item, key| {
+                    item.invite.invite_id == key.invite.invite_id
+                }),
+                StateChange::DeleteInvite(invite_id) => {
+                    state.invites.retain(|item| item.invite.invite_id != invite_id);
+                }
+                StateChange::PutProvisioner(record) => {
+                    upsert_record(&mut state.provisioners, record, |item, key| {
+                        item.endpoint_id == key.endpoint_id
+                    });
+                }
+                StateChange::DeleteProvisioner(endpoint_id) => {
+                    state.provisioners.retain(|item| item.endpoint_id != endpoint_id);
+                }
+                StateChange::PutRevocation(record) => {
+                    upsert_record(&mut state.revocations, record, |item, key| {
+                        item.endpoint_id == key.endpoint_id
+                    });
+                }
+                StateChange::DeleteRevocation(endpoint_id) => {
+                    state.revocations.retain(|item| item.endpoint_id != endpoint_id);
+                }
+            }
+        }
+    }
+}
+
+fn upsert_record<T>(items: &mut Vec<T>, record: T, same_key: impl Fn(&T, &T) -> bool) {
+    if let Some(existing) = items.iter_mut().find(|item| same_key(item, &record)) {
+        *existing = record;
+    } else {
+        items.push(record);
+    }
+}
+
 struct Store {
     database: db::Database,
     key: SecretKey,
@@ -730,15 +837,14 @@ async fn claim(
         InviteState::Claimed => return Err(ApiError::conflict("invite was already claimed")),
         InviteState::Revoked => return Err(ApiError::gone("invite was revoked")),
     }
-    let mut next = state.clone();
-    let invite = next.invites[index].invite.clone();
-    let managed_by = next.invites[index].managed_by.clone();
-    let credential_generation = next
+    let invite = state.invites[index].invite.clone();
+    let managed_by = state.invites[index].managed_by.clone();
+    let credential_generation = state
         .revision
         .checked_add(1)
         .ok_or_else(|| ApiError::internal("revision overflow"))?;
-    add_claimed_node(
-        &mut next,
+    let node_change = claimed_node_change(
+        &state,
         &invite,
         endpoint_id,
         managed_by.as_deref(),
@@ -746,15 +852,17 @@ async fn claim(
         credential_generation,
         now,
     )?;
-    next.invites[index].state = InviteState::Claimed;
-    next.invites[index].claimed_by = Some(endpoint_id.to_string());
-    next.invites[index].terminal_at = Some(now);
-    next.revision = next
-        .revision
-        .checked_add(1)
-        .ok_or_else(|| ApiError::internal("revision overflow"))?;
-    let map = signed_map(&next, &store.key, endpoint_id).map_err(ApiError::internal)?;
-    persist_candidate(&store, &mut state, next, true).await?;
+    let mut invite_record = state.invites[index].clone();
+    invite_record.state = InviteState::Claimed;
+    invite_record.claimed_by = Some(endpoint_id.to_string());
+    invite_record.terminal_at = Some(now);
+    commit_delta(
+        &store,
+        &mut state,
+        StateDelta::topology(vec![node_change, StateChange::PutInvite(Box::new(invite_record))]),
+    )
+    .await?;
+    let map = signed_map(&state, &store.key, endpoint_id).map_err(ApiError::internal)?;
     Ok(Json(JoinResult {
         name: invite.name,
         kind: invite.kind,
@@ -859,17 +967,23 @@ async fn client_edge_invite(
         owner_id: client_id.to_string(),
     };
     validate_invite_name(&state, &request.name, &kind)?;
-    let mut next = state.clone();
-    let result = create_invite(&store.key, &mut next, request.name, kind, request.ttl_secs).map_err(ApiError::bad)?;
-    next.invites
-        .last_mut()
-        .expect("create_invite always appends an invitation")
-        .request_id = Some(request.request_id);
-    next.invites
-        .last_mut()
-        .expect("create_invite always appends an invitation")
-        .managed_by = managed_by;
-    commit_candidate(&store, &mut state, next).await?;
+    let (result, mut record) = build_invite(
+        &store.key,
+        &state,
+        request.name,
+        kind,
+        request.ttl_secs,
+        random_token(32),
+    )
+    .map_err(ApiError::bad)?;
+    record.request_id = Some(request.request_id);
+    record.managed_by = managed_by;
+    commit_delta(
+        &store,
+        &mut state,
+        StateDelta::topology(vec![StateChange::PutInvite(Box::new(record))]),
+    )
+    .await?;
     Ok(Json(result))
 }
 
@@ -891,30 +1005,29 @@ async fn client_edge_remove(
     if !state.clients.iter().any(|client| client.endpoint_id == client_id) {
         return Err(ApiError::forbidden("client is not registered"));
     }
-    let mut next = state.clone();
-    let removed = next
+    let removed = state
         .edges
         .iter()
         .find(|edge| edge.owner_id == client_id && edge.name == request.name && edge.endpoint_id == request.endpoint_id)
         .cloned();
-    let before = next.edges.len();
-    next.edges.retain(|edge| {
-        !(edge.owner_id == client_id && edge.name == request.name && edge.endpoint_id == request.endpoint_id)
-    });
-    if next.edges.len() == before {
+    let Some(removed) = removed else {
         return Err(ApiError::bad(format!(
             "unknown edge '{}' with the expected identity",
             request.name
         )));
-    }
-    let removed = removed.expect("the length check proves an Edge was removed");
-    add_revocation(
-        &mut next,
+    };
+    let revocation = revocation_change(
+        &state,
         &removed.endpoint_id,
         removed.credential_generation,
         removed.credential_expires_at,
     );
-    commit_revocation_candidate(&store, &mut state, next).await?;
+    commit_delta(
+        &store,
+        &mut state,
+        StateDelta::revocation(vec![StateChange::DeleteEdge(removed.endpoint_id), revocation]),
+    )
+    .await?;
     let map = signed_map(&state, &store.key, client_endpoint).map_err(ApiError::internal)?;
     Ok(Json(map))
 }
@@ -1011,10 +1124,15 @@ async fn dispatch_provisioner_mutation(
                 InviteState::Pending => {}
             }
             check_expected_revision(state, request.expected_revision)?;
-            let mut next = state.clone();
-            next.invites[index].state = InviteState::Revoked;
-            next.invites[index].terminal_at = Some(unix_timestamp());
-            commit_candidate(store, state, next).await?;
+            let mut invite = state.invites[index].clone();
+            invite.state = InviteState::Revoked;
+            invite.terminal_at = Some(unix_timestamp());
+            commit_delta(
+                store,
+                state,
+                StateDelta::topology(vec![StateChange::PutInvite(Box::new(invite))]),
+            )
+            .await?;
             provisioner_ok(state)
         }
         ProvisionerAction::RemoveClient { name } => {
@@ -1039,15 +1157,18 @@ async fn dispatch_provisioner_mutation(
                 return Err(ApiError::conflict("client still has pending edge invites"));
             }
             check_expected_revision(state, request.expected_revision)?;
-            let mut next = state.clone();
-            next.clients.retain(|item| item.endpoint_id != client.endpoint_id);
-            add_revocation(
-                &mut next,
+            let revocation = revocation_change(
+                state,
                 &client.endpoint_id,
                 client.credential_generation,
                 client.credential_expires_at,
             );
-            commit_revocation_candidate(store, state, next).await?;
+            commit_delta(
+                store,
+                state,
+                StateDelta::revocation(vec![StateChange::DeleteClient(client.endpoint_id), revocation]),
+            )
+            .await?;
             provisioner_ok(state)
         }
         ProvisionerAction::RemoveEdge { owner, name } => {
@@ -1061,16 +1182,18 @@ async fn dispatch_provisioner_mutation(
                 return provisioner_ok(state);
             };
             check_expected_revision(state, request.expected_revision)?;
-            let mut next = state.clone();
-            next.edges
-                .retain(|item| !(item.owner_id == owner_id && item.name == *name));
-            add_revocation(
-                &mut next,
+            let revocation = revocation_change(
+                state,
                 &edge.endpoint_id,
                 edge.credential_generation,
                 edge.credential_expires_at,
             );
-            commit_revocation_candidate(store, state, next).await?;
+            commit_delta(
+                store,
+                state,
+                StateDelta::revocation(vec![StateChange::DeleteEdge(edge.endpoint_id), revocation]),
+            )
+            .await?;
             provisioner_ok(state)
         }
         ProvisionerAction::TransferEdge {
@@ -1107,13 +1230,14 @@ async fn dispatch_provisioner_mutation(
                 return Err(ApiError::conflict("target client already has an edge with this name"));
             }
             check_expected_revision(state, request.expected_revision)?;
-            let mut next = state.clone();
-            next.edges
-                .iter_mut()
+            let mut edge = state
+                .edges
+                .iter()
                 .find(|item| item.owner_id == owner_id && item.name == *name && item.endpoint_id == endpoint_id)
                 .expect("managed edge was checked above")
-                .owner_id = new_owner_id;
-            commit_candidate(store, state, next).await?;
+                .clone();
+            edge.owner_id = new_owner_id;
+            commit_delta(store, state, StateDelta::topology(vec![StateChange::PutEdge(edge)])).await?;
             provisioner_ok(state)
         }
     }
@@ -1145,24 +1269,17 @@ async fn provisioner_invite(
 
     check_expected_revision(state, request.expected_revision)?;
     validate_invite_name(state, name, &kind)?;
-    let mut next = state.clone();
-    let result = create_invite_with_secret(
-        &store.key,
-        &mut next,
-        name.to_owned(),
-        kind,
-        ttl_secs,
-        secret.to_owned(),
-    )
-    .map_err(ApiError::bad)?;
-    let record = next
-        .invites
-        .last_mut()
-        .expect("create_invite always appends an invitation");
+    let (result, mut record) =
+        build_invite(&store.key, state, name.to_owned(), kind, ttl_secs, secret.to_owned()).map_err(ApiError::bad)?;
     record.request_id = Some(request.request_id.clone());
     record.managed_by = Some(provisioner_id.to_owned());
     record.request_hash = Some(request_hash);
-    commit_candidate(store, state, next).await?;
+    commit_delta(
+        store,
+        state,
+        StateDelta::topology(vec![StateChange::PutInvite(Box::new(record))]),
+    )
+    .await?;
     Ok(ProvisionerResponse::Invite(result))
 }
 
@@ -1255,9 +1372,14 @@ async fn relay_watch(
             .position(|relay| relay.endpoint_id == endpoint_id.to_string())
             .ok_or_else(|| ApiError::forbidden("relay is not registered"))?;
         if state.relays[index].qad_port != request.relay_qad_port {
-            let mut next = state.clone();
-            next.relays[index].qad_port = request.relay_qad_port;
-            commit_candidate(&store, &mut state, next).await?;
+            let mut relay = state.relays[index].clone();
+            relay.qad_port = request.relay_qad_port;
+            commit_delta(
+                &store,
+                &mut state,
+                StateDelta::topology(vec![StateChange::PutRelay(relay)]),
+            )
+            .await?;
         }
     }
     wait_for_relay_revision(&store, endpoint_id, request.known_revision).await?;
@@ -1310,15 +1432,20 @@ async fn renew_relay_credential_if_needed(store: &Arc<Store>, endpoint_id: Endpo
     if expires_at > renew_at {
         return Ok(false);
     }
-    let mut next = state.clone();
-    if let Some(record) = next.clients.iter_mut().find(|record| record.endpoint_id == endpoint) {
+    let change = if let Some(record) = state.clients.iter().find(|record| record.endpoint_id == endpoint) {
+        let mut record = record.clone();
         record.credential_issued_at = now;
         record.credential_expires_at = now.saturating_add(RELAY_CREDENTIAL_LIFETIME_SECS);
-    } else if let Some(record) = next.edges.iter_mut().find(|record| record.endpoint_id == endpoint) {
+        StateChange::PutClient(record)
+    } else if let Some(record) = state.edges.iter().find(|record| record.endpoint_id == endpoint) {
+        let mut record = record.clone();
         record.credential_issued_at = now;
         record.credential_expires_at = now.saturating_add(RELAY_CREDENTIAL_LIFETIME_SECS);
-    }
-    persist_candidate(store, &mut state, next, false).await?;
+        StateChange::PutEdge(record)
+    } else {
+        return Ok(false);
+    };
+    commit_delta(store, &mut state, StateDelta::quiet(vec![change])).await?;
     Ok(true)
 }
 
@@ -1472,11 +1599,11 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
         }
         LocalAdminRequest::RevokeInvite { invite_id } => {
             let mut state = store.state.lock().await;
-            let mut next = state.clone();
-            let invite = next
+            let mut invite = state
                 .invites
-                .iter_mut()
+                .iter()
                 .find(|item| item.invite.invite_id == invite_id)
+                .cloned()
                 .ok_or_else(|| ApiError::bad("unknown invite"))?;
             match invite.state {
                 InviteState::Pending => {}
@@ -1485,7 +1612,12 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
             }
             invite.state = InviteState::Revoked;
             invite.terminal_at = Some(unix_timestamp());
-            commit_candidate(store, &mut state, next).await?;
+            commit_delta(
+                store,
+                &mut state,
+                StateDelta::topology(vec![StateChange::PutInvite(Box::new(invite))]),
+            )
+            .await?;
             Ok(LocalAdminResponse::Ok)
         }
         LocalAdminRequest::RemoveClient { name } => {
@@ -1508,15 +1640,18 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
             }) {
                 return Err(ApiError::conflict("client still has pending edge invites"));
             }
-            let mut next = state.clone();
-            next.clients.retain(|item| item.endpoint_id != client.endpoint_id);
-            add_revocation(
-                &mut next,
+            let revocation = revocation_change(
+                &state,
                 &client.endpoint_id,
                 client.credential_generation,
                 client.credential_expires_at,
             );
-            commit_revocation_candidate(store, &mut state, next).await?;
+            commit_delta(
+                store,
+                &mut state,
+                StateDelta::revocation(vec![StateChange::DeleteClient(client.endpoint_id), revocation]),
+            )
+            .await?;
             Ok(LocalAdminResponse::Ok)
         }
         LocalAdminRequest::TransferEdge { edge, new_client } => {
@@ -1531,51 +1666,59 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
             {
                 return Err(ApiError::conflict("target client already has an edge with this name"));
             }
-            let mut next = state.clone();
-            let record = next
+            let mut record = state
                 .edges
-                .iter_mut()
+                .iter()
                 .find(|item| item.owner_id == old_owner && item.name == edge_name)
+                .cloned()
                 .ok_or_else(|| ApiError::bad(format!("unknown edge '{edge}'")))?;
             record.owner_id = new_owner;
-            commit_candidate(store, &mut state, next).await?;
+            commit_delta(
+                store,
+                &mut state,
+                StateDelta::topology(vec![StateChange::PutEdge(record)]),
+            )
+            .await?;
             Ok(LocalAdminResponse::Ok)
         }
         LocalAdminRequest::RemoveEdge { edge } => {
             let (owner_name, edge_name) = parse_edge_ref(&edge)?;
             let mut state = store.state.lock().await;
             let owner_id = client_id_by_name(&state, owner_name)?;
-            let mut next = state.clone();
-            let removed = next
+            let removed = state
                 .edges
                 .iter()
                 .find(|item| item.owner_id == owner_id && item.name == edge_name)
                 .cloned();
-            let before = next.edges.len();
-            next.edges
-                .retain(|item| !(item.owner_id == owner_id && item.name == edge_name));
-            if next.edges.len() == before {
-                return Err(ApiError::bad(format!("unknown edge '{edge}'")));
-            }
-            let removed = removed.expect("the length check proves an Edge was removed");
-            add_revocation(
-                &mut next,
+            let removed = removed.ok_or_else(|| ApiError::bad(format!("unknown edge '{edge}'")))?;
+            let revocation = revocation_change(
+                &state,
                 &removed.endpoint_id,
                 removed.credential_generation,
                 removed.credential_expires_at,
             );
-            commit_revocation_candidate(store, &mut state, next).await?;
+            commit_delta(
+                store,
+                &mut state,
+                StateDelta::revocation(vec![StateChange::DeleteEdge(removed.endpoint_id), revocation]),
+            )
+            .await?;
             Ok(LocalAdminResponse::Ok)
         }
         LocalAdminRequest::RemoveRelay { name } => {
             let mut state = store.state.lock().await;
-            let mut next = state.clone();
-            let before = next.relays.len();
-            next.relays.retain(|relay| relay.name != name);
-            if next.relays.len() == before {
-                return Err(ApiError::bad(format!("unknown relay '{name}'")));
-            }
-            commit_revocation_candidate(store, &mut state, next).await?;
+            let relay = state
+                .relays
+                .iter()
+                .find(|relay| relay.name == name)
+                .cloned()
+                .ok_or_else(|| ApiError::bad(format!("unknown relay '{name}'")))?;
+            commit_delta(
+                store,
+                &mut state,
+                StateDelta::revocation(vec![StateChange::DeleteRelay(relay.endpoint_id)]),
+            )
+            .await?;
             Ok(LocalAdminResponse::Ok)
         }
         LocalAdminRequest::AddProvisioner { name, endpoint_id } => {
@@ -1592,9 +1735,15 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
             {
                 return Err(ApiError::conflict("provisioner name or identity already exists"));
             }
-            let mut next = state.clone();
-            next.provisioners.push(ProvisionerRecord { name, endpoint_id });
-            commit_candidate(store, &mut state, next).await?;
+            commit_delta(
+                store,
+                &mut state,
+                StateDelta::topology(vec![StateChange::PutProvisioner(ProvisionerRecord {
+                    name,
+                    endpoint_id,
+                })]),
+            )
+            .await?;
             Ok(LocalAdminResponse::Ok)
         }
         LocalAdminRequest::RemoveProvisioner { name } => {
@@ -1614,10 +1763,12 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
             }) {
                 return Err(ApiError::conflict("provisioner still owns pending invites"));
             }
-            let mut next = state.clone();
-            next.provisioners
-                .retain(|item| item.endpoint_id != provisioner.endpoint_id);
-            commit_candidate(store, &mut state, next).await?;
+            commit_delta(
+                store,
+                &mut state,
+                StateDelta::topology(vec![StateChange::DeleteProvisioner(provisioner.endpoint_id)]),
+            )
+            .await?;
             Ok(LocalAdminResponse::Ok)
         }
     }
@@ -1633,13 +1784,15 @@ async fn local_create_invite(
     validate_name(&name).map_err(ApiError::bad)?;
     let mut state = store.state.lock().await;
     validate_invite_name(&state, &name, &kind)?;
-    let mut next = state.clone();
-    let result = create_invite(&store.key, &mut next, name, kind, ttl_secs).map_err(ApiError::bad)?;
-    next.invites
-        .last_mut()
-        .expect("create_invite always appends an invitation")
-        .managed_by = managed_by;
-    commit_candidate(store, &mut state, next).await?;
+    let (result, mut record) =
+        build_invite(&store.key, &state, name, kind, ttl_secs, random_token(32)).map_err(ApiError::bad)?;
+    record.managed_by = managed_by;
+    commit_delta(
+        store,
+        &mut state,
+        StateDelta::topology(vec![StateChange::PutInvite(Box::new(record))]),
+    )
+    .await?;
     Ok(LocalAdminResponse::Invite(result))
 }
 
@@ -1795,56 +1948,40 @@ fn print_admin_response(response: LocalAdminResponse) -> Result<()> {
     Ok(())
 }
 
-async fn commit_candidate(store: &Store, current: &mut ControlState, mut next: ControlState) -> Result<(), ApiError> {
-    next.revision = next
-        .revision
-        .checked_add(1)
-        .ok_or_else(|| ApiError::internal("revision overflow"))?;
-    persist_candidate(store, current, next, true).await
-}
-
-async fn commit_revocation_candidate(
-    store: &Store,
-    current: &mut ControlState,
-    mut next: ControlState,
-) -> Result<(), ApiError> {
-    next.revision = next
-        .revision
-        .checked_add(1)
-        .ok_or_else(|| ApiError::internal("revision overflow"))?;
-    next.relay_revision = next
-        .relay_revision
-        .checked_add(1)
-        .ok_or_else(|| ApiError::internal("Relay revision overflow"))?;
-    persist_candidate_with_notifications(store, current, next, true, true).await
-}
-
-async fn persist_candidate(
-    store: &Store,
-    current: &mut ControlState,
-    next: ControlState,
-    notify: bool,
-) -> Result<(), ApiError> {
-    persist_candidate_with_notifications(store, current, next, notify, false).await
-}
-
-async fn persist_candidate_with_notifications(
-    store: &Store,
-    current: &mut ControlState,
-    next: ControlState,
-    notify_nodes: bool,
-    notify_relays: bool,
-) -> Result<(), ApiError> {
+async fn commit_delta(store: &Store, current: &mut ControlState, delta: StateDelta) -> Result<(), ApiError> {
+    let revision = match delta.publish {
+        Publish::None => current.revision,
+        Publish::Nodes | Publish::NodesAndRelays => current
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| ApiError::internal("revision overflow"))?,
+    };
+    let relay_revision = match delta.publish {
+        Publish::None | Publish::Nodes => current.relay_revision,
+        Publish::NodesAndRelays => current
+            .relay_revision
+            .checked_add(1)
+            .ok_or_else(|| ApiError::internal("Relay revision overflow"))?,
+    };
     store
         .database
-        .apply(current.clone(), next.clone())
+        .apply_delta(
+            current.revision,
+            current.relay_revision,
+            revision,
+            relay_revision,
+            delta.clone(),
+        )
         .await
         .map_err(ApiError::internal)?;
-    *current = next;
-    if notify_nodes {
+    let publish = delta.publish;
+    delta.apply(current);
+    current.revision = revision;
+    current.relay_revision = relay_revision;
+    if matches!(publish, Publish::Nodes | Publish::NodesAndRelays) {
         store.changed.notify_waiters();
     }
-    if notify_relays {
+    if matches!(publish, Publish::NodesAndRelays) {
         store.relay_changed.notify_waiters();
     }
     Ok(())
@@ -1870,24 +2007,28 @@ fn cleanup_revocations(state: &mut ControlState, now: i64) -> bool {
     state.revocations.len() != before
 }
 
-fn add_revocation(state: &mut ControlState, endpoint_id: &str, generation: u64, expires_at: i64) {
+fn revocation_change(state: &ControlState, endpoint_id: &str, generation: u64, expires_at: i64) -> StateChange {
     let revision = state.relay_revision.saturating_add(1);
-    if let Some(existing) = state
+    let record = if let Some(existing) = state
         .revocations
-        .iter_mut()
+        .iter()
         .find(|revocation| revocation.endpoint_id == endpoint_id)
     {
-        existing.revoked_through_generation = existing.revoked_through_generation.max(generation);
-        existing.expires_at = existing.expires_at.max(expires_at);
-        existing.revision = revision;
-        return;
-    }
-    state.revocations.push(RevocationRecord {
-        endpoint_id: endpoint_id.to_owned(),
-        revoked_through_generation: generation,
-        expires_at,
-        revision,
-    });
+        RevocationRecord {
+            endpoint_id: endpoint_id.to_owned(),
+            revoked_through_generation: existing.revoked_through_generation.max(generation),
+            expires_at: existing.expires_at.max(expires_at),
+            revision,
+        }
+    } else {
+        RevocationRecord {
+            endpoint_id: endpoint_id.to_owned(),
+            revoked_through_generation: generation,
+            expires_at,
+            revision,
+        }
+    };
+    StateChange::PutRevocation(record)
 }
 
 async fn invitation_cleanup_loop(store: Arc<Store>) {
@@ -1896,27 +2037,43 @@ async fn invitation_cleanup_loop(store: Arc<Store>) {
     loop {
         interval.tick().await;
         let mut current = store.state.lock().await;
-        let mut next = current.clone();
         let now = unix_timestamp();
-        let invitations_changed = cleanup_invitations(&mut next, now);
-        let revocations_changed = cleanup_revocations(&mut next, now);
-        if (invitations_changed || revocations_changed)
-            && let Err(error) = persist_candidate(&store, &mut current, next, false).await
+        let mut changes = current
+            .invites
+            .iter()
+            .filter(|invite| {
+                let terminal = match invite.state {
+                    InviteState::Pending => invite.invite.expires_at,
+                    InviteState::Claimed | InviteState::Revoked => invite.terminal_at.unwrap_or(now),
+                };
+                now >= terminal.saturating_add(INVITATION_RETENTION_SECS)
+            })
+            .map(|invite| StateChange::DeleteInvite(invite.invite.invite_id.clone()))
+            .collect::<Vec<_>>();
+        changes.extend(
+            current
+                .revocations
+                .iter()
+                .filter(|revocation| revocation.expires_at <= now)
+                .map(|revocation| StateChange::DeleteRevocation(revocation.endpoint_id.clone())),
+        );
+        if !changes.is_empty()
+            && let Err(error) = commit_delta(&store, &mut current, StateDelta::quiet(changes)).await
         {
             tracing::warn!(message = %error.message, "Control state cleanup failed");
         }
     }
 }
 
-fn add_claimed_node(
-    state: &mut ControlState,
+fn claimed_node_change(
+    state: &ControlState,
     invite: &Invite,
     endpoint_id: EndpointId,
     managed_by: Option<&str>,
     relay_qad_port: Option<u16>,
     credential_generation: u64,
     now: i64,
-) -> Result<(), ApiError> {
+) -> Result<StateChange, ApiError> {
     match &invite.kind {
         InviteKind::Client => {
             if state
@@ -1926,14 +2083,14 @@ fn add_claimed_node(
             {
                 return Err(ApiError::conflict("client name or identity already exists"));
             }
-            state.clients.push(ClientRecord {
+            Ok(StateChange::PutClient(ClientRecord {
                 name: invite.name.clone(),
                 endpoint_id: endpoint_id.to_string(),
                 managed_by: managed_by.map(ToOwned::to_owned),
                 credential_generation,
                 credential_issued_at: now,
                 credential_expires_at: now.saturating_add(RELAY_CREDENTIAL_LIFETIME_SECS),
-            });
+            }))
         }
         InviteKind::Edge { owner_id } => {
             anyhow_client_exists(state, owner_id)?;
@@ -1942,14 +2099,14 @@ fn add_claimed_node(
             }) {
                 return Err(ApiError::conflict("edge name or identity already exists"));
             }
-            state.edges.push(EdgeRecord {
+            Ok(StateChange::PutEdge(EdgeRecord {
                 name: invite.name.clone(),
                 endpoint_id: endpoint_id.to_string(),
                 owner_id: owner_id.clone(),
                 credential_generation,
                 credential_issued_at: now,
                 credential_expires_at: now.saturating_add(RELAY_CREDENTIAL_LIFETIME_SECS),
-            });
+            }))
         }
         InviteKind::Relay { url } => {
             if state
@@ -1959,15 +2116,14 @@ fn add_claimed_node(
             {
                 return Err(ApiError::conflict("relay name, URL, or identity already exists"));
             }
-            state.relays.push(RelayRecord {
+            Ok(StateChange::PutRelay(RelayRecord {
                 name: invite.name.clone(),
                 endpoint_id: endpoint_id.to_string(),
                 url: url.clone(),
                 qad_port: relay_qad_port,
-            });
+            }))
         }
     }
-    Ok(())
 }
 
 fn signed_map(state: &ControlState, key: &SecretKey, recipient: EndpointId) -> Result<SignedNodeMap> {
@@ -2092,6 +2248,19 @@ fn create_invite_with_secret(
     ttl_secs: u64,
     secret: String,
 ) -> Result<InviteResult> {
+    let (result, record) = build_invite(key, state, name, kind, ttl_secs, secret)?;
+    state.invites.push(record);
+    Ok(result)
+}
+
+fn build_invite(
+    key: &SecretKey,
+    state: &ControlState,
+    name: String,
+    kind: InviteKind,
+    ttl_secs: u64,
+    secret: String,
+) -> Result<(InviteResult, InviteRecord)> {
     anyhow::ensure!(
         (1..=7 * 24 * 60 * 60).contains(&ttl_secs),
         "TTL must be between 1 second and 7 days"
@@ -2113,7 +2282,7 @@ fn create_invite_with_secret(
     };
     let token = JoinToken::new(invite.clone(), secret, key)?;
     let join_url = token.join_url()?;
-    state.invites.push(InviteRecord {
+    let record = InviteRecord {
         invite,
         state: InviteState::Pending,
         claimed_by: None,
@@ -2121,12 +2290,15 @@ fn create_invite_with_secret(
         managed_by: None,
         request_hash: None,
         terminal_at: None,
-    });
-    Ok(InviteResult {
-        invite_id,
-        join_url,
-        expires_at,
-    })
+    };
+    Ok((
+        InviteResult {
+            invite_id,
+            join_url,
+            expires_at,
+        },
+        record,
+    ))
 }
 
 fn invite_result(key: &SecretKey, invite: &Invite, secret: &str) -> Result<InviteResult> {
@@ -2623,25 +2795,24 @@ mod tests {
         init(dir.path().into(), "http://127.0.0.1:3350".into(), "test".into()).unwrap();
         let (lock, _control_key, database, mut current) = open_exclusive(dir.path()).unwrap();
         let key = SecretKey::generate();
-        let mut next = current.clone();
-        next.clients = vec![
-            ClientRecord {
+        let delta = StateDelta::topology(vec![
+            StateChange::PutClient(ClientRecord {
                 name: "duplicate".into(),
                 endpoint_id: key.public().to_string(),
                 managed_by: None,
                 credential_generation: 1,
                 credential_issued_at: 0,
                 credential_expires_at: i64::MAX,
-            },
-            ClientRecord {
+            }),
+            StateChange::PutClient(ClientRecord {
                 name: "duplicate".into(),
                 endpoint_id: SecretKey::generate().public().to_string(),
                 managed_by: None,
                 credential_generation: 1,
                 credential_issued_at: 0,
                 credential_expires_at: i64::MAX,
-            },
-        ];
+            }),
+        ]);
         let store = Store {
             database,
             key,
@@ -2652,8 +2823,9 @@ mod tests {
             _lock: lock,
         };
 
-        assert!(persist_candidate(&store, &mut current, next, true).await.is_err());
+        assert!(commit_delta(&store, &mut current, delta).await.is_err());
         assert_eq!(current.revision, 0);
+        assert!(current.clients.is_empty());
     }
 
     #[tokio::test]

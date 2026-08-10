@@ -21,6 +21,8 @@ The project uses semantic versioning after its first public release. Before
   credentials and a compact incremental revocation stream. New nodes can use any
   available Relay immediately, while removals still disconnect live sessions;
   seven-day credentials bound the retained revocation window.
+- Applied Control mutations as committed row deltas so routine enrollment,
+  renewal, and removal no longer clone or compare the complete topology.
 
 ## 0.5.0 - 2026-08-07
 
