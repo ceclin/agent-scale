@@ -279,6 +279,7 @@ fn main() -> Result<()> {
         Task::E2e => {
             for script in [
                 "./scripts/e2e-2b.sh",
+                "./scripts/e2e-proxy.sh",
                 "./scripts/e2e-private-relay.sh",
                 "./scripts/e2e-control.sh",
             ] {
