@@ -14,9 +14,10 @@
 use anyhow::{Context, Result};
 use iroh::endpoint::{RelayMode, presets};
 use iroh::{Endpoint, RelayMap, RelayUrl, SecretKey};
+use protocol::{ProxyDatagram, ProxyTarget};
 
 /// ALPN for the agent-scale RPC protocol.
-pub const ALPN: &[u8] = b"agent-scale/rpc/4";
+pub const ALPN: &[u8] = b"agent-scale/rpc/5";
 
 /// Valid tags in the client/edge and client/daemon frame protocols.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +68,52 @@ pub const T_RESULT: FrameTag = FrameTag::Result;
 pub const T_DATA: FrameTag = FrameTag::Data;
 
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
+pub const MAX_UDP_PAYLOAD: usize = 65_507;
+
+/// Encode one UDP packet without expanding binary payloads through JSON.
+pub fn encode_proxy_datagram(datagram: &ProxyDatagram) -> Result<Vec<u8>> {
+    let host = datagram.target.host.as_bytes();
+    anyhow::ensure!(!host.is_empty(), "proxy datagram host is empty");
+    anyhow::ensure!(host.len() <= u8::MAX as usize, "proxy datagram host is too long");
+    anyhow::ensure!(datagram.target.port != 0, "proxy datagram port is zero");
+    anyhow::ensure!(
+        datagram.payload.len() <= MAX_UDP_PAYLOAD,
+        "proxy UDP payload is too large: {}",
+        datagram.payload.len()
+    );
+    let mut encoded = Vec::with_capacity(3 + host.len() + datagram.payload.len());
+    encoded.push(host.len() as u8);
+    encoded.extend_from_slice(&datagram.target.port.to_be_bytes());
+    encoded.extend_from_slice(host);
+    encoded.extend_from_slice(&datagram.payload);
+    Ok(encoded)
+}
+
+/// Decode one UDP packet after the outer frame has established its boundary.
+pub fn decode_proxy_datagram(encoded: &[u8]) -> Result<ProxyDatagram> {
+    anyhow::ensure!(encoded.len() >= 4, "proxy datagram is truncated");
+    let host_len = encoded[0] as usize;
+    let payload_offset = 3usize.checked_add(host_len).context("proxy datagram length overflow")?;
+    anyhow::ensure!(
+        host_len != 0 && payload_offset <= encoded.len(),
+        "proxy datagram host is truncated"
+    );
+    let port = u16::from_be_bytes([encoded[1], encoded[2]]);
+    anyhow::ensure!(port != 0, "proxy datagram port is zero");
+    let host = std::str::from_utf8(&encoded[3..payload_offset])
+        .context("proxy datagram host is not UTF-8")?
+        .to_owned();
+    let payload = encoded[payload_offset..].to_vec();
+    anyhow::ensure!(
+        payload.len() <= MAX_UDP_PAYLOAD,
+        "proxy UDP payload is too large: {}",
+        payload.len()
+    );
+    Ok(ProxyDatagram {
+        target: ProxyTarget { host, port },
+        payload,
+    })
+}
 
 /// Relay URLs operated by n0 and bundled with the current iroh release.
 ///
@@ -181,6 +228,22 @@ mod tests {
     #[test]
     fn headers_reject_oversized_payloads() {
         assert!(header(T_DATA, MAX_FRAME + 1).is_err());
+    }
+
+    #[test]
+    fn proxy_datagram_codec_preserves_address_and_payload() {
+        let packet = ProxyDatagram {
+            target: ProxyTarget {
+                host: "db.internal".into(),
+                port: 5353,
+            },
+            payload: vec![0, 1, 2, 255],
+        };
+        assert_eq!(
+            decode_proxy_datagram(&encode_proxy_datagram(&packet).unwrap()).unwrap(),
+            packet
+        );
+        assert!(decode_proxy_datagram(&[1, 0, 53]).is_err());
     }
 
     #[tokio::test]

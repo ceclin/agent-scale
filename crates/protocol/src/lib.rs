@@ -27,6 +27,34 @@ pub enum EdgeReq {
     McpRemove { name: String },
     /// Connect to a named MCP server and bridge its bytes in T_DATA frames.
     McpConnect { name: String },
+    /// Connect to a TCP service reachable from the Edge, then switch the
+    /// request stream to raw byte forwarding.
+    ProxyTcpConnect {
+        target: ProxyTarget,
+        connect_timeout_secs: u64,
+    },
+    /// Create the Edge half of a framed, reliable UDP association.
+    ProxyUdpAssociate { resolve_timeout_secs: u64 },
+}
+
+/// A network target resolved by the Edge rather than the Client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyTarget {
+    pub host: String,
+    pub port: u16,
+}
+
+/// The address selected by the Edge for an outbound TCP connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyConnectResult {
+    pub bound_addr: String,
+}
+
+/// One UDP packet carried over a reliable proxy stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyDatagram {
+    pub target: ProxyTarget,
+    pub payload: Vec<u8>,
 }
 
 /// How the edge reaches a local MCP server.

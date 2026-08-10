@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const LOCAL_PROTOCOL_VERSION: u32 = 2;
 const CONFIG_SCHEMA: u32 = 1;
 
 /// Client home: $AGENT_SCALE_HOME or ~/.agent-scale.
@@ -186,6 +187,8 @@ pub struct ClientReq {
 #[derive(Serialize, Deserialize)]
 pub struct LocalRequest {
     pub version: String,
+    #[serde(default)]
+    pub protocol_version: u32,
     pub command: LocalCommand,
 }
 
@@ -206,6 +209,8 @@ pub enum DaemonAdmin {
 pub struct DaemonStatus {
     pub pid: u32,
     pub version: String,
+    #[serde(default)]
+    pub protocol_version: u32,
     pub active_requests: usize,
     pub configured_edges: usize,
 }

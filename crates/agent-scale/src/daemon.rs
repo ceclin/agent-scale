@@ -23,7 +23,8 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
 use crate::common::{
-    self, ClientOp, DaemonAdmin, DaemonStatus, EdgeCfg, LocalCommand, LocalRequest, Registry, VERSION,
+    self, ClientOp, DaemonAdmin, DaemonStatus, EdgeCfg, LOCAL_PROTOCOL_VERSION, LocalCommand, LocalRequest, Registry,
+    VERSION,
 };
 use connection_pool::get_conn;
 
@@ -385,9 +386,20 @@ async fn handle_client(
     anyhow::ensure!(tag == T_START, "expected START from client, got {tag}");
     let request: LocalRequest = serde_json::from_slice(&payload)?;
     if let LocalCommand::Admin(command) = request.command {
-        return handle_admin(command, request.version, &ctx, &admin_tx, &mut cw).await;
+        return handle_admin(
+            command,
+            request.version,
+            request.protocol_version,
+            &ctx,
+            &admin_tx,
+            &mut cw,
+        )
+        .await;
     }
-    anyhow::ensure!(request.version == VERSION, "client/daemon version mismatch");
+    anyhow::ensure!(
+        request.version == VERSION && request.protocol_version == LOCAL_PROTOCOL_VERSION,
+        "client/daemon protocol mismatch"
+    );
     let LocalCommand::Work(req) = request.command else {
         unreachable!()
     };
@@ -421,6 +433,7 @@ async fn handle_client(
 async fn handle_admin(
     command: DaemonAdmin,
     client_version: String,
+    client_protocol_version: u32,
     ctx: &Ctx,
     admin_tx: &mpsc::UnboundedSender<DaemonAdmin>,
     send: &mut crate::local_ipc::WriteHalf,
@@ -428,15 +441,19 @@ async fn handle_admin(
     let status = DaemonStatus {
         pid: std::process::id(),
         version: VERSION.into(),
+        protocol_version: LOCAL_PROTOCOL_VERSION,
         active_requests: ctx.active.load(Ordering::SeqCst).saturating_sub(1),
         configured_edges: ctx.edges.lock().await.len(),
     };
-    let response = if matches!(command, DaemonAdmin::Status | DaemonAdmin::Shutdown) || client_version == VERSION {
+    let compatible = client_version == VERSION && client_protocol_version == LOCAL_PROTOCOL_VERSION;
+    let response = if matches!(command, DaemonAdmin::Status | DaemonAdmin::Shutdown) || compatible {
         RpcResult::Ok(status)
     } else {
         RpcResult::Error(RemoteError {
             code: "version_mismatch".into(),
-            message: format!("daemon is {VERSION}, client is {client_version}"),
+            message: format!(
+                "daemon is {VERSION}/ipc-{LOCAL_PROTOCOL_VERSION}, client is {client_version}/ipc-{client_protocol_version}"
+            ),
         })
     };
     io_wire::write_frame(send, T_RESULT, &serde_json::to_vec(&response)?).await?;

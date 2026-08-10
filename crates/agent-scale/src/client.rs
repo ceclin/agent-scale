@@ -13,12 +13,13 @@ use rmcp::{ServiceExt, transport::TokioChildProcess};
 use scale_transport::{Frame, T_DATA, T_EXIT, T_RESULT, T_START, T_STDERR, T_STDOUT, io_wire};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::common::{self, ClientOp, ClientReq, LocalCommand, LocalRequest, VERSION};
+use crate::common::{self, ClientOp, ClientReq, LOCAL_PROTOCOL_VERSION, LocalCommand, LocalRequest, VERSION};
 use crate::common::{DaemonAdmin, DaemonStatus};
 
 fn work_request(edge: String, op: ClientOp) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&LocalRequest {
         version: VERSION.into(),
+        protocol_version: LOCAL_PROTOCOL_VERSION,
         command: LocalCommand::Work(ClientReq { edge, op }),
     })?)
 }
@@ -207,7 +208,7 @@ fn ensure_ok(payload: &[u8]) -> Result<()> {
 /// Connect to a live, version-matched daemon, spawning one if needed.
 async fn ensure_daemon() -> Result<crate::local_ipc::Stream> {
     if let Some(status) = daemon_admin(DaemonAdmin::Status).await? {
-        if status.version == VERSION {
+        if status.version == VERSION && status.protocol_version == LOCAL_PROTOCOL_VERSION {
             return crate::local_ipc::connect()
                 .await
                 .context("reconnect to daemon after status check");
@@ -224,6 +225,7 @@ async fn ensure_daemon() -> Result<crate::local_ipc::Stream> {
     for _ in 0..200 {
         if let Some(status) = daemon_admin(DaemonAdmin::Status).await?
             && status.version == VERSION
+            && status.protocol_version == LOCAL_PROTOCOL_VERSION
         {
             return crate::local_ipc::connect()
                 .await
@@ -249,6 +251,7 @@ pub async fn daemon_admin(command: DaemonAdmin) -> Result<Option<DaemonStatus>> 
     };
     let request = LocalRequest {
         version: VERSION.into(),
+        protocol_version: LOCAL_PROTOCOL_VERSION,
         command: LocalCommand::Admin(command),
     };
     io_wire::write_frame(&mut stream, T_START, &serde_json::to_vec(&request)?).await?;

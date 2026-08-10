@@ -258,6 +258,13 @@ async fn serve_request(
                 }
             }
         }
+        EdgeReq::ProxyTcpConnect {
+            target,
+            connect_timeout_secs,
+        } => crate::proxy::serve_tcp(send, recv, target, connect_timeout_secs).await,
+        EdgeReq::ProxyUdpAssociate { resolve_timeout_secs } => {
+            crate::proxy::serve_udp(send, recv, resolve_timeout_secs).await
+        }
         EdgeReq::PrepareDownload { path } => {
             // The control stream owns the temp tag so disconnecting either peer
             // cannot leak staged content indefinitely.
