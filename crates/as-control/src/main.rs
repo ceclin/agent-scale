@@ -214,7 +214,7 @@ enum LocalAdminResponse {
     Error(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ClientRecord {
     name: String,
     endpoint_id: String,
@@ -224,7 +224,7 @@ struct ClientRecord {
     credential_expires_at: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct EdgeRecord {
     name: String,
     endpoint_id: String,
@@ -234,7 +234,7 @@ struct EdgeRecord {
     credential_expires_at: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RelayRecord {
     name: String,
     endpoint_id: String,
@@ -242,7 +242,7 @@ struct RelayRecord {
     qad_port: Option<u16>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RevocationRecord {
     endpoint_id: String,
     revoked_through_generation: u64,
@@ -250,7 +250,7 @@ struct RevocationRecord {
     revision: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ProvisionerRecord {
     name: String,
     endpoint_id: String,
@@ -270,7 +270,7 @@ enum InviteState {
     Revoked,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct InviteRecord {
     invite: Invite,
     state: InviteState,
@@ -538,6 +538,7 @@ fn bootstrap(
         "configured Control public URL does not match durable state"
     );
 
+    let previous = state.clone();
     let relay_invite = if state.relays.is_empty() {
         state.invites.retain(|invite| {
             !matches!(invite.invite.kind, InviteKind::Relay { .. }) || invite.state != InviteState::Pending
@@ -559,7 +560,7 @@ fn bootstrap(
         );
         None
     };
-    database.replace_sync(&state)?;
+    database.apply_sync(&previous, &state)?;
     if let Some(invite) = relay_invite {
         write_invitation(&relay_invite_out, &invite.join_url)?;
     }
@@ -618,10 +619,11 @@ async fn run(dir: PathBuf, bind: SocketAddr, admin_socket: PathBuf) -> Result<()
         "unsupported state schema {}",
         state.schema
     );
+    let previous = state.clone();
     let now = unix_timestamp();
     cleanup_invitations(&mut state, now);
     cleanup_revocations(&mut state, now);
-    database.replace_sync(&state)?;
+    database.apply_sync(&previous, &state)?;
     let store = Arc::new(Store {
         database,
         key,
@@ -1833,7 +1835,11 @@ async fn persist_candidate_with_notifications(
     notify_nodes: bool,
     notify_relays: bool,
 ) -> Result<(), ApiError> {
-    store.database.replace(next.clone()).await.map_err(ApiError::internal)?;
+    store
+        .database
+        .apply(current.clone(), next.clone())
+        .await
+        .map_err(ApiError::internal)?;
     *current = next;
     if notify_nodes {
         store.changed.notify_waiters();
@@ -2396,6 +2402,11 @@ mod tests {
     use control_api::ProvisionerHttpRequest;
     use tower::ServiceExt;
 
+    fn persist_test_state(database: &db::Database, state: &ControlState) {
+        let previous = database.load().unwrap();
+        database.apply_sync(&previous, state).unwrap();
+    }
+
     async fn send_provisioner_request(
         store: Arc<Store>,
         request: ProvisionerHttpRequest,
@@ -2535,7 +2546,7 @@ mod tests {
             invite.terminal_at = Some(unix_timestamp());
             invite.claimed_by = Some(relay_id.clone());
         }
-        database.replace_sync(&state).unwrap();
+        persist_test_state(&database, &state);
         drop(database);
         drop(lock);
         std::fs::remove_file(&relay_out).unwrap();
@@ -2659,7 +2670,7 @@ mod tests {
             credential_issued_at: 0,
             credential_expires_at: i64::MAX,
         });
-        database.replace_sync(&state).unwrap();
+        persist_test_state(&database, &state);
         let store = Arc::new(Store {
             database,
             key: control_key,
@@ -2747,7 +2758,7 @@ mod tests {
             credential_issued_at: 0,
             credential_expires_at: i64::MAX,
         });
-        database.replace_sync(&state).unwrap();
+        persist_test_state(&database, &state);
         let revision = state.revision;
         let store = Arc::new(Store {
             database,
@@ -2829,7 +2840,7 @@ mod tests {
                 credential_expires_at: i64::MAX,
             },
         ];
-        database.replace_sync(&state).unwrap();
+        persist_test_state(&database, &state);
         let store = Arc::new(Store {
             database,
             key: control_key,
@@ -2942,7 +2953,7 @@ mod tests {
             name: "controller".into(),
             endpoint_id: provisioner.public().to_string(),
         });
-        database.replace_sync(&state).unwrap();
+        persist_test_state(&database, &state);
         let store = Arc::new(Store {
             database,
             key: control_key,
@@ -3082,7 +3093,7 @@ mod tests {
             name: "controller".into(),
             endpoint_id: provisioner.public().to_string(),
         });
-        database.replace_sync(&state).unwrap();
+        persist_test_state(&database, &state);
         let store = Arc::new(Store {
             database,
             key,
