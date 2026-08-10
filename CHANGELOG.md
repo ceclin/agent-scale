@@ -7,8 +7,6 @@ The project uses semantic versioning after its first public release. Before
 
 ## Unreleased
 
-## 0.6.0 - 2026-08-09
-
 - Standardized the development-side role as Client across CLI commands, signed
   APIs, persisted state, filesystem paths, and documentation; advanced the
   incompatible Control and RPC protocol versions.

@@ -11,7 +11,7 @@ Run the `Distribution` workflow manually and optionally enter a branch, tag, or
 commit in `ref`. Leaving it empty snapshots the ref selected in the workflow UI.
 No version or changelog edit is required.
 
-Snapshot archives use a version such as `0.6.0-snapshot.42.0123456789ab`, are
+Snapshot archives use a version such as `0.7.0-snapshot.42.0123456789ab`, are
 available as a single GitHub Actions artifact for 14 days, and include a
 consolidated `SHA256SUMS`. Build jobs retain their internal transfer artifacts
 for one day only. Control and Relay images receive three tags:
@@ -25,17 +25,28 @@ Snapshot publication never creates a GitHub Release and never advances
 
 ## Prepare a prerelease or release
 
-1. Set `[workspace.package].version` to an unprefixed semantic version such as
-   `0.6.0-preview.1` or `0.6.0`, then refresh `Cargo.lock`.
-2. Move the completed entries from `Unreleased` into a dated heading with the
-   exact form `## 0.6.0 - YYYY-MM-DD` in `CHANGELOG.md`.
-3. Run `cargo x lint`, `cargo x test`, and the relevant end-to-end tests.
-4. Land the release change on `main`, then create and push the matching tag,
-   such as `v0.6.0-preview.1` or `v0.6.0`.
+Set `[workspace.package].version` to the next base version immediately after a
+stable release and keep completed work under `Unreleased`. For example, after
+`v0.6.0`, advance the workspace and lockfile to `0.7.0`; snapshots then identify
+the development line without further version edits.
 
-The release workflow rejects malformed tags, tags that do not match the
-workspace version, and versions without a dated changelog heading. Do not reuse
-or move a published release tag.
+Before publishing, run `cargo x lint`, `cargo x test`, and the relevant
+end-to-end tests, then land the verified source on `main`:
+
+- A prerelease tag such as `v0.7.0-preview.1` must target the workspace base
+  version `0.7.0`. Preview numbering lives only in the tag, so later previews
+  do not require Cargo or lockfile changes and the changelog remains
+  `Unreleased`.
+- Before the stable `v0.7.0` tag, move the completed entries into the exact
+  dated heading `## 0.7.0 - YYYY-MM-DD`. The tag must exactly match the
+  workspace version.
+- After publishing the stable release, advance the workspace to the next
+  planned base version and begin a new `Unreleased` section.
+
+The release workflow rejects malformed tags, prereleases for a different base
+version, stable tags that do not match the workspace version, and stable
+versions without a dated changelog heading. Do not reuse or move a published
+release tag.
 
 A SemVer prerelease tag creates a GitHub Prerelease and advances the mutable
 `preview` image tag. A stable tag creates a normal GitHub Release and advances
