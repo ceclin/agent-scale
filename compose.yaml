@@ -1,12 +1,12 @@
 name: agent-scale
 
 x-control-image: &control-image
-  image: ${AGENT_SCALE_CONTROL_IMAGE:-ghcr.io/ceclin/agent-scale-control:latest}
+  image: ${AGENT_SCALE_CONTROL_IMAGE:-ghcr.io/ceclin/agent-scale-control:0.8.0}
 
 x-relay-image: &relay-image
-  image: ${AGENT_SCALE_RELAY_IMAGE:-ghcr.io/ceclin/agent-scale-relay:latest}
+  image: ${AGENT_SCALE_RELAY_IMAGE:-ghcr.io/ceclin/agent-scale-relay:0.8.0}
 
-x-environment: &environment
+x-control-environment: &control-environment
   AS_CONTROL_STATE_DIR: /control
 
 x-container-defaults: &container-defaults
@@ -32,69 +32,92 @@ services:
       - as-control
       - bootstrap
       - --public-url
-      - ${CONTROL_PUBLIC_URL:-http://localhost:3350}
+      - ${CONTROL_PUBLIC_URL:-https://control.example.com}
       - --audience
       - ${CONTROL_AUDIENCE:-agent-scale-local}
       - --relay-name
       - ${RELAY_NAME:-primary}
       - --relay-url
-      - ${RELAY_PUBLIC_URL:-http://localhost:3340}
+      - ${RELAY_PUBLIC_URL:-https://relay.example.com}
       - --relay-ttl-secs
       - ${RELAY_INVITE_TTL_SECS:-900}
       - --relay-invite-out
       - /bootstrap/relay.join
-    environment: *environment
+    environment: *control-environment
     volumes:
       - control-state:/control
       - bootstrap-data:/bootstrap
+    labels:
+      traefik.enable: "false"
     restart: "no"
 
   control:
     <<: [*control-image, *container-defaults]
     command: as-control run --bind 0.0.0.0:3350
-    environment: *environment
+    environment: *control-environment
     depends_on:
       bootstrap:
         condition: service_completed_successfully
-    ports:
-      - "${CONTROL_PORT:-3350}:3350"
+    expose:
+      - "3350"
     volumes:
       - control-state:/control
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:3350/healthz"]
-      interval: 2s
-      timeout: 2s
-      retries: 30
+      test: [CMD, curl, --fail, --silent, http://localhost:3350/healthz]
+      interval: 5s
+      timeout: 3s
+      retries: 20
       start_period: 5s
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.agent-scale-control.rule: Host(`${CONTROL_HOST:-control.example.com}`)
+      traefik.http.services.agent-scale-control.loadbalancer.server.port: "3350"
     restart: unless-stopped
 
   relay:
     <<: [*relay-image, *container-defaults]
-    command: >-
-      as-relay run
-      --relay-bind 0.0.0.0:3340
-      --admin-bind 0.0.0.0:3341
-      --qad-bind 0.0.0.0:${RELAY_QAD_BIND_PORT:-7842}
-      --qad-port ${RELAY_QAD_PORT:-7842}
-      --state-dir /relay
-      --join-if-needed /bootstrap/relay.join
-      --control-url http://control:3350
+    command:
+      - as-relay
+      - run
+      - --relay-bind
+      - 0.0.0.0:3340
+      - --admin-bind
+      - 0.0.0.0:3341
+      - --qad-bind
+      - 0.0.0.0:7842
+      - --qad-port
+      - ${RELAY_QAD_PORT:-7842}
+      - --state-dir
+      - /relay
+      - --join-if-needed
+      - /bootstrap/relay.join
+      - --control-url
+      - http://control:3350
     depends_on:
       bootstrap:
         condition: service_completed_successfully
+    expose:
+      - "3340"
     ports:
-      - "${RELAY_PORT:-3340}:3340"
-      - "${RELAY_QAD_PORT:-7842}:${RELAY_QAD_BIND_PORT:-7842}/udp"
-      - "127.0.0.1:${RELAY_ADMIN_PORT:-3341}:3341"
+      - target: 7842
+        published: ${RELAY_QAD_PORT:-7842}
+        protocol: udp
+        mode: host
     volumes:
       - relay-state:/relay
       - bootstrap-data:/bootstrap:ro
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:3341/healthz"]
-      interval: 2s
-      timeout: 2s
-      retries: 30
+      test: [CMD, curl, --fail, --silent, http://localhost:3341/healthz]
+      interval: 5s
+      timeout: 3s
+      retries: 20
       start_period: 5s
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.agent-scale-relay.rule: Host(`${RELAY_HOST:-relay.example.com}`)
+      traefik.http.routers.agent-scale-relay-204.rule: Host(`${RELAY_HOST:-relay.example.com}`) && Path(`/generate_204`)
+      traefik.http.routers.agent-scale-relay-204.priority: "100"
+      traefik.http.services.agent-scale-relay.loadbalancer.server.port: "3340"
     restart: unless-stopped
 
 volumes:

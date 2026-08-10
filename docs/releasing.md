@@ -38,7 +38,8 @@ end-to-end tests, then land the verified source on `main`:
   do not require Cargo or lockfile changes and the changelog remains
   `Unreleased`.
 - Before the stable `v0.7.0` tag, move the completed entries into the exact
-  dated heading `## 0.7.0 - YYYY-MM-DD`. The tag must exactly match the
+  dated heading `## 0.7.0 - YYYY-MM-DD` and update the default Control and Relay
+  image tags in `compose.yaml` to `0.7.0`. The tag must exactly match the
   workspace version.
 - After publishing the stable release, advance the workspace to the next
   planned base version and begin a new `Unreleased` section.

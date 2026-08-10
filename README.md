@@ -147,7 +147,10 @@ central ownership, or immediate revocation. `as-control` distributes signed
 authorization state; it never receives command output, transferred files, MCP
 traffic, or proxied service traffic.
 
-The included Compose stack starts one Control and one private Relay:
+The included Compose stack starts one Control and one private Relay behind
+Traefik. Configure its public Control and Relay hostnames as described in the
+[Control plane guide](docs/control-plane.md), then start it and enroll the first
+Client:
 
 ```console
 docker compose up -d --wait
@@ -166,10 +169,9 @@ agent-scale edge invite test
 as-edge join '<EDGE_INVITATION>' --install
 ```
 
-The local defaults are suitable for evaluating the stack on one machine. A
-real deployment needs externally reachable Control and Relay URLs, HTTPS, and
-the Relay UDP port. Follow the [Control plane](docs/control-plane.md) and
-[Private Relay](docs/private-relay.md) guides before exposing it publicly.
+A real deployment needs externally reachable Control and Relay URLs, HTTPS, and
+the Relay UDP port. Follow the [Private Relay](docs/private-relay.md) guide
+before exposing it publicly.
 
 ## Automate provisioning
 

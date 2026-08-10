@@ -13,7 +13,19 @@ the Client daemon.
 
 ### Docker Compose
 
-The repository's `compose.yaml` starts one Control and one enrolled Relay:
+The repository's `compose.yaml` starts one Control and one enrolled Relay behind
+Traefik. Create `.env` with the public URLs and matching router hostnames before
+starting it:
+
+```dotenv
+CONTROL_PUBLIC_URL=https://control.example.com
+CONTROL_HOST=control.example.com
+RELAY_PUBLIC_URL=https://relay.example.com
+RELAY_HOST=relay.example.com
+CONTROL_AUDIENCE=prod
+RELAY_NAME=primary
+RELAY_QAD_PORT=7842
+```
 
 ```sh
 docker compose up -d --wait
@@ -28,45 +40,41 @@ remains an explicit administration action after Control starts. The Relay runs
 starts directly from its persisted profile and revocation state, without a
 shell init script or a Control-health dependency.
 
-Released deployments pull `ghcr.io/ceclin/agent-scale-control:latest` and
-`ghcr.io/ceclin/agent-scale-relay:latest` by default. During local development,
-build the static binaries on the host and use the local override:
+The default images are pinned to the latest stable release rather than a
+mutable tag. Set `AGENT_SCALE_CONTROL_IMAGE` and `AGENT_SCALE_RELAY_IMAGE` to
+use an immutable digest, a preview, or a private registry mirror.
+
+During local development, build the static binaries on the host and use the
+local override. Set the public URLs to the directly published HTTP ports because
+the override disables Traefik routing:
 
 ```sh
 scripts/build-compose-image.sh
-docker compose -f compose.yaml -f compose.local.yaml up -d --wait
+CONTROL_PUBLIC_URL=http://localhost:3350 \
+RELAY_PUBLIC_URL=http://localhost:3340 \
+  docker compose -f compose.yaml -f compose.local.yaml up -d --wait
 agent-scale control join "$(docker compose \
   -f compose.yaml -f compose.local.yaml exec -T \
   control as-control client invite main)"
 ```
 
-The default URLs (`http://localhost:3350` and `http://localhost:3340`) are for a
-same-machine evaluation. State is kept in named Docker volumes, so subsequent
-`docker compose up -d` calls retain all identities and enrollment.
-The containers use read-only root filesystems with writable state volumes,
-drop Linux capabilities, and rotate their local JSON logs at three 10 MiB
-files per service.
+Traefik discovers Control on port 3350 and the Relay data plane on port 3340
+through Compose labels. The Relay route must preserve WebSocket upgrades. A
+higher-priority router leaves the exact `/generate_204` path available over
+plain HTTP because iroh uses it for captive-portal detection; see
+[Private Relay](private-relay.md). The Relay management listener on port 3341
+is internal to the Compose network.
 
-For use from other machines, create `.env` with externally reachable URLs:
+QAD listens on `7842/UDP` inside the Relay container and is published on
+`7842/UDP` by default. Set `RELAY_QAD_PORT` only when the public UDP port must be
+different; the Relay reports that public port to Control. Control automatically
+issues and distributes the private QAD TLS chain. You still provision DNS and
+the HTTPS certificate used by the WebSocket reverse proxy.
 
-```dotenv
-CONTROL_PUBLIC_URL=https://control.example.com
-RELAY_PUBLIC_URL=https://relay.example.com
-CONTROL_AUDIENCE=prod
-RELAY_NAME=primary
-RELAY_QAD_PORT=4433
-RELAY_QAD_BIND_PORT=7842
-```
-
-Publish those HTTPS routes through a reverse proxy. Control targets port 3350;
-the Relay data plane targets port 3340 and must preserve WebSocket upgrades.
-iroh also requires plain HTTP access to the Relay's exact `/generate_204` path;
-see [Private Relay](private-relay.md) for the redirect exception.
-The Relay management port 3341 stays bound to host loopback. Compose also maps
-the chosen public QAD UDP port to the independently configurable container bind
-port (both default to 7842). Control automatically issues and distributes the private QAD TLS chain;
-you still provision DNS and the HTTPS certificate used by the WebSocket reverse
-proxy.
+State is kept in named Docker volumes, so subsequent `docker compose up -d`
+calls retain all identities and enrollment. The containers use read-only root
+filesystems with writable state volumes, drop Linux capabilities, and rotate
+their local JSON logs at three 10 MiB files per service.
 
 Inspect or stop the stack with:
 

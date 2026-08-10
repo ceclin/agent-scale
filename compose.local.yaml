@@ -10,9 +10,19 @@ services:
     build:
       context: .
       target: control
-  control: *local-control-image
+  control:
+    <<: *local-control-image
+    ports:
+      - "${CONTROL_PORT:-3350}:3350"
+    labels:
+      traefik.enable: "false"
   relay:
     <<: *local-relay-image
     build:
       context: .
       target: relay
+    ports:
+      - "${RELAY_PORT:-3340}:3340"
+      - "127.0.0.1:${RELAY_ADMIN_PORT:-3341}:3341"
+    labels:
+      traefik.enable: "false"
