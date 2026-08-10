@@ -13,9 +13,16 @@ use iroh_blobs::BlobsProtocol;
 use iroh_blobs::store::fs::FsStore;
 use protocol::{EdgeReq, McpTransport, RemoteError, RpcResult, TransferResult};
 use scale_transport::{Frame, T_RESULT, T_START, iroh_wire};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::{Duration, timeout};
 use tracing::{info, warn};
 
 use crate::mcp_registry::RegistryStore;
+
+const MAX_PENDING_HANDSHAKES: usize = 64;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const START_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_START_PAYLOAD: usize = 64 * 1024;
 
 /// Which client(s) this edge will accept.
 #[derive(Clone)]
@@ -142,13 +149,21 @@ impl ClientPin {
 
 pub async fn serve(endpoint: Endpoint, pin: ClientPin, store: FsStore, mcp_registry: RegistryStore) -> Result<()> {
     info!("edge listening");
+    let pending_handshakes = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
     while let Some(incoming) = endpoint.accept().await {
+        let Ok(handshake_permit) = pending_handshakes.clone().try_acquire_owned() else {
+            // Refusing excess work keeps unauthenticated peers from occupying an unbounded
+            // number of handshake tasks while established clients continue normally.
+            incoming.refuse();
+            warn!("refusing connection while handshake capacity is exhausted");
+            continue;
+        };
         let pin = pin.clone();
         let store = store.clone();
         let mcp_registry = mcp_registry.clone();
         let endpoint = endpoint.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(incoming, pin, store, mcp_registry, endpoint).await {
+            if let Err(e) = handle_conn(incoming, handshake_permit, pin, store, mcp_registry, endpoint).await {
                 warn!("connection error: {e}");
             }
         });
@@ -158,18 +173,23 @@ pub async fn serve(endpoint: Endpoint, pin: ClientPin, store: FsStore, mcp_regis
 
 async fn handle_conn(
     incoming: Incoming,
+    handshake_permit: OwnedSemaphorePermit,
     pin: ClientPin,
     store: FsStore,
     mcp_registry: RegistryStore,
     endpoint: Endpoint,
 ) -> Result<()> {
-    let conn = incoming.await.context("handshake")?;
+    let conn = timeout(HANDSHAKE_TIMEOUT, incoming)
+        .await
+        .context("handshake timed out")?
+        .context("handshake")?;
     let remote = conn.remote_id();
     if !pin.authorize_and_register(&conn)? {
         warn!("rejecting unauthorized client {remote}");
         conn.close(1u32.into(), b"unauthorized");
         return Ok(());
     }
+    drop(handshake_permit);
     let stable_id = conn.stable_id();
 
     let result = if conn.alpn() == iroh_blobs::ALPN {
@@ -179,6 +199,8 @@ async fn handle_conn(
             .await
             .map_err(|e| anyhow::anyhow!("blobs accept: {e}"))
     } else {
+        // RPC uses bidirectional streams only; blob connections keep iroh-blobs' native limits.
+        conn.set_max_concurrent_uni_streams(0u32.into());
         info!("client {remote} connected");
         while let Ok((send, recv)) = conn.accept_bi().await {
             let store = store.clone();
@@ -204,7 +226,13 @@ async fn serve_request(
     endpoint: Endpoint,
     authenticated_client: iroh::EndpointId,
 ) -> Result<()> {
-    let Frame { tag, payload } = match iroh_wire::read_frame(&mut recv).await? {
+    let Frame { tag, payload } = match timeout(
+        START_TIMEOUT,
+        iroh_wire::read_frame_with_limit(&mut recv, MAX_START_PAYLOAD),
+    )
+    .await
+    .context("START frame timed out")??
+    {
         Some(f) => f,
         None => return Ok(()),
     };

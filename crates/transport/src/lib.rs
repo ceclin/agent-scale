@@ -297,6 +297,11 @@ pub mod iroh_wire {
 
     /// Returns `Ok(None)` on a clean end-of-stream.
     pub async fn read_frame(r: &mut RecvStream) -> Result<Option<Frame>> {
+        read_frame_with_limit(r, MAX_FRAME).await
+    }
+
+    /// Reads a frame while allowing the caller to apply a tighter protocol-specific limit.
+    pub async fn read_frame_with_limit(r: &mut RecvStream, max_payload: usize) -> Result<Option<Frame>> {
         let mut hdr = [0u8; 5];
         let Some(first) = r
             .read_chunk(1)
@@ -310,6 +315,7 @@ pub mod iroh_wire {
             .await
             .map_err(|error| anyhow::anyhow!("read frame header: {error}"))?;
         let (tag, n) = split_header(hdr)?;
+        anyhow::ensure!(n <= max_payload, "frame too large for this request: {n}");
         let mut buf = vec![0u8; n];
         r.read_exact(&mut buf)
             .await
