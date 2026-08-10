@@ -132,6 +132,11 @@ Stop Control and back up the entire state directory, including `control.key`,
 over the entire network. The initial Client URL is single-use and expires after
 15 minutes.
 
+The public API accepts signed requests only, including status reads. It bounds
+request headers, bodies, signature-verification work, mutation backlog, and
+concurrent long polls per identity. Overload responses may include
+`Retry-After`; the bundled clients honor it automatically.
+
 On the first development machine, use the URL printed by `client invite`:
 
 ```sh

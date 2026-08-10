@@ -19,6 +19,7 @@ const INVITE_DOMAIN: &[u8] = b"agent-scale-control-invite-v5\0";
 const CLAIM_DOMAIN: &[u8] = b"agent-scale-control-claim-v5\0";
 const EDGE_INVITE_REQUEST_DOMAIN: &[u8] = b"agent-scale-control-edge-invite-request-v5\0";
 const EDGE_REMOVE_REQUEST_DOMAIN: &[u8] = b"agent-scale-control-edge-remove-request-v5\0";
+const STATUS_REQUEST_DOMAIN: &[u8] = b"agent-scale-control-status-request-v5\0";
 const WATCH_DOMAIN: &[u8] = b"agent-scale-control-watch-v5\0";
 const MAP_DOMAIN: &[u8] = b"agent-scale-control-map-v5\0";
 pub const CONTROL_PROTOCOL_VERSION: u32 = 5;
@@ -273,6 +274,52 @@ impl EdgeRemoveRequest {
                 self.issued_at,
                 &self.name,
                 &self.endpoint_id,
+            ),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusRequest {
+    pub protocol_version: u32,
+    pub client_id: String,
+    pub audience: String,
+    pub issued_at: i64,
+    pub nonce: String,
+    pub signature: Signature,
+}
+
+impl StatusRequest {
+    pub fn sign(key: &SecretKey, audience: String, issued_at: i64, nonce: String) -> Result<Self> {
+        let mut request = Self {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            client_id: key.public().to_string(),
+            audience,
+            issued_at,
+            nonce,
+            signature: key.sign(b"placeholder"),
+        };
+        request.signature = key.sign(&request.signing_bytes()?);
+        Ok(request)
+    }
+
+    pub fn verify(&self) -> Result<EndpointId> {
+        ensure_protocol_version(self.protocol_version)?;
+        let id: EndpointId = self.client_id.parse().context("invalid client id")?;
+        id.verify(&self.signing_bytes()?, &self.signature)
+            .context("invalid status request signature")?;
+        Ok(id)
+    }
+
+    fn signing_bytes(&self) -> Result<Vec<u8>> {
+        domain_bytes(
+            STATUS_REQUEST_DOMAIN,
+            &(
+                self.protocol_version,
+                &self.client_id,
+                &self.audience,
+                self.issued_at,
+                &self.nonce,
             ),
         )
     }
@@ -569,6 +616,17 @@ mod tests {
 
         let mut tampered = request;
         tampered.endpoint_id = SecretKey::generate().public().to_string();
+        assert!(tampered.verify().is_err());
+    }
+
+    #[test]
+    fn status_request_is_bound_to_client_and_audience() {
+        let client = SecretKey::generate();
+        let request = StatusRequest::sign(&client, "prod".into(), 50, "nonce".into()).unwrap();
+        assert_eq!(request.verify().unwrap(), client.public());
+
+        let mut tampered = request;
+        tampered.audience = "other".into();
         assert!(tampered.verify().is_err());
     }
 

@@ -17,6 +17,9 @@ mod service;
 
 use service::{install as service_install, status as service_status, uninstall as service_uninstall};
 
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const CONTROL_WATCH_TIMEOUT: Duration = Duration::from_secs(90);
+
 #[derive(Parser)]
 #[command(name = "as-edge", about = "Edge agent for agent-scale")]
 struct Cli {
@@ -511,12 +514,14 @@ async fn join_control(args: JoinArgs) -> Result<()> {
     let key_path = dir.join("agent.key");
     let key = load_or_create_key(&key_path)?;
     let request = ClaimRequest::sign(token, &key, unix_timestamp(), random_nonce())?;
-    let response = control_client()
-        .post(api_url(&control_url, "v1/claim")?)
-        .json(&request)
-        .send()
-        .await
-        .context("claim edge invitation")?;
+    let response = send_control(
+        control_client()?
+            .post(api_url(&control_url, "v1/claim")?)
+            .json(&request),
+        CONTROL_REQUEST_TIMEOUT,
+    )
+    .await
+    .context("claim edge invitation")?;
     let status = response.status();
     let body = response.bytes().await?;
     anyhow::ensure!(
@@ -620,7 +625,13 @@ fn spawn_control_watch(
                 return;
             }
         };
-        let client = control_client();
+        let client = match control_client() {
+            Ok(client) => client,
+            Err(error) => {
+                warn!("cannot build Control HTTP client: {error:#}");
+                return;
+            }
+        };
         let Some(credential) = profile.map.map.relay_credential.clone() else {
             warn!("control map is missing its Relay credential");
             return;
@@ -641,7 +652,11 @@ fn spawn_control_watch(
                     return;
                 }
             };
-            match client.post(url.clone()).json(&request).send().await {
+            match send_control(client.post(url.clone()).json(&request), CONTROL_WATCH_TIMEOUT).await {
+                Ok(response) if response.status() == reqwest::StatusCode::NO_CONTENT => {
+                    backoff = 1;
+                    continue;
+                }
                 Ok(response) if response.status().is_success() => match response.json::<SignedNodeMap>().await {
                     Ok(next) => {
                         let valid = next.verify(control_id, key.public()).and_then(|()| {
@@ -750,9 +765,45 @@ async fn persist_profile(path: &Path, profile: &ControlProfile) -> Result<()> {
     Ok(())
 }
 
-fn control_client() -> reqwest::Client {
+fn control_client() -> Result<reqwest::Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    reqwest::Client::new()
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .context("build Control HTTP client")
+}
+
+async fn send_control(request: reqwest::RequestBuilder, timeout: Duration) -> Result<reqwest::Response> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        anyhow::ensure!(!remaining.is_zero(), "Control request timed out after {timeout:?}");
+        let attempt = request.try_clone().context("Control request body cannot be retried")?;
+        let response = tokio::time::timeout(remaining, attempt.send())
+            .await
+            .with_context(|| format!("Control request timed out after {timeout:?}"))??;
+        if !matches!(
+            response.status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            return Ok(response);
+        }
+        let Some(seconds) = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return Ok(response);
+        };
+        let jitter = u64::from(rand::random::<u16>()) % 1001;
+        let delay = Duration::from_secs(seconds).saturating_add(Duration::from_millis(jitter));
+        anyhow::ensure!(
+            delay < deadline.saturating_duration_since(tokio::time::Instant::now()),
+            "Control is busy"
+        );
+        tokio::time::sleep(delay).await;
+    }
 }
 fn api_url(base: &str, path: &str) -> Result<reqwest::Url> {
     reqwest::Url::parse(&format!("{}/", base.trim_end_matches('/')))?

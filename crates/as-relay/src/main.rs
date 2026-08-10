@@ -35,6 +35,8 @@ use tracing_subscriber::EnvFilter;
 
 const MAX_CLOCK_SKEW_SECS: i64 = 300;
 const DEFAULT_QAD_PORT: u16 = 7842;
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const CONTROL_WATCH_TIMEOUT: Duration = Duration::from_secs(90);
 type RevocationIndex = HashMap<EndpointId, (u64, i64)>;
 
 #[derive(Parser)]
@@ -710,10 +712,7 @@ async fn join_control(
     };
     let request = ClaimRequest::sign_with_relay_qad(token, &key, unix_timestamp(), random_nonce(), qad_port, csr_der)?;
     let url = api_url(&control_url, "v1/claim")?;
-    let response = http_client()
-        .post(url)
-        .json(&request)
-        .send()
+    let response = send_control(http_client()?.post(url).json(&request), CONTROL_REQUEST_TIMEOUT)
         .await
         .context("claim relay invitation")?;
     let status = response.status();
@@ -784,7 +783,13 @@ async fn poll_control(profile: ControlProfile, state_dir: PathBuf, state: AdminS
             return;
         }
     };
-    let client = http_client();
+    let client = match http_client() {
+        Ok(client) => client,
+        Err(error) => {
+            warn!("cannot build Control HTTP client: {error:#}");
+            return;
+        }
+    };
     let mut backoff = 1u64;
     loop {
         let known_revision = state.current.lock().await.version;
@@ -796,7 +801,11 @@ async fn poll_control(profile: ControlProfile, state_dir: PathBuf, state: AdminS
                     return;
                 }
             };
-        match client.post(url.clone()).json(&request).send().await {
+        match send_control(client.post(url.clone()).json(&request), CONTROL_WATCH_TIMEOUT).await {
+            Ok(response) if response.status() == StatusCode::NO_CONTENT => {
+                backoff = 1;
+                continue;
+            }
             Ok(response) if response.status().is_success() => match response.json::<SignedRevocationUpdate>().await {
                 Ok(signed) => {
                     let valid = signed
@@ -877,9 +886,45 @@ fn api_url(base: &str, path: &str) -> Result<reqwest::Url> {
         .context("build control API URL")
 }
 
-fn http_client() -> reqwest::Client {
+fn http_client() -> Result<reqwest::Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    reqwest::Client::new()
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .context("build Control HTTP client")
+}
+
+async fn send_control(request: reqwest::RequestBuilder, timeout: Duration) -> Result<reqwest::Response> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        anyhow::ensure!(!remaining.is_zero(), "Control request timed out after {timeout:?}");
+        let attempt = request.try_clone().context("Control request body cannot be retried")?;
+        let response = tokio::time::timeout(remaining, attempt.send())
+            .await
+            .with_context(|| format!("Control request timed out after {timeout:?}"))??;
+        if !matches!(
+            response.status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            return Ok(response);
+        }
+        let Some(seconds) = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return Ok(response);
+        };
+        let jitter = u64::from(rand::random::<u16>()) % 1001;
+        let delay = Duration::from_secs(seconds).saturating_add(Duration::from_millis(jitter));
+        anyhow::ensure!(
+            delay < deadline.saturating_duration_since(tokio::time::Instant::now()),
+            "Control is busy"
+        );
+        tokio::time::sleep(delay).await;
+    }
 }
 
 fn random_nonce() -> String {

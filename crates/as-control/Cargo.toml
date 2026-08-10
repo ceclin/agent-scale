@@ -16,6 +16,8 @@ axum = "0.8"
 base64 = { workspace = true }
 clap = { workspace = true }
 control-api = { path = "../control-api" }
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["http1", "http2", "server-auto", "service", "tokio"] }
 iroh-base = { version = "1.0.3", features = ["key"] }
 rand = { workspace = true }
 rcgen = { version = "0.14", features = ["x509-parser"] }
@@ -26,13 +28,14 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 time = "0.3"
 tokio = { workspace = true }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["timeout"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-tower = "0.5"
 
 [lints]
 workspace = true

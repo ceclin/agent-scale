@@ -164,6 +164,10 @@ For optimistic concurrency, copy the `revision` returned by `GetTopology` into
 successful mutation advances the revision, including invitation creation and
 revocation.
 
+Control returns HTTP 429 or 503 with `Retry-After` when its bounded verification
+or mutation queues are busy. Controllers should honor that delay and retry the
+same signed request; invitation request IDs preserve their normal idempotency.
+
 A typical controller loop is:
 
 1. Read the scheduler's desired workload state.

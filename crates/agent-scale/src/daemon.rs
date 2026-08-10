@@ -357,6 +357,9 @@ fn spawn_control_watcher(ctx: Ctx) {
                     }
                     backoff = 1;
                 }
+                Ok(crate::control::WatchOutcome::Unchanged) => {
+                    backoff = 1;
+                }
                 Ok(crate::control::WatchOutcome::Revoked) => {
                     warn!("client enrollment was revoked; disconnecting managed edges");
                     cfg.edges.retain(|edge| !edge.managed);

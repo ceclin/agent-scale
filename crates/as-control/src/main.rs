@@ -4,19 +4,25 @@
 mod db;
 
 use std::{
+    collections::HashMap,
+    convert::Infallible,
+    future::Future,
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    body::Bytes,
-    extract::State,
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, State},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{AUTHORIZATION, RETRY_AFTER},
+    },
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -26,7 +32,13 @@ use control_api::{
     CONTROL_PROTOCOL_VERSION, ClaimRequest, ClientInfo, ControlStatus, EdgeInfo, EdgeInviteRequest, EdgeRemoveRequest,
     Invite, InviteInfo, InviteKind, InviteResult, JoinResult, JoinToken, ManagedClientInfo, ManagedEdgeInfo, NodeMap,
     Overview, ProvisionerAction, ProvisionerRequest, ProvisionerResponse, ProvisionerTopology, RelayInfo,
-    RelayNodeInfo, SignedNodeMap, WatchRequest, action_hash, hash_secret, verify_provisioner_authorization,
+    RelayNodeInfo, SignedNodeMap, StatusRequest, WatchRequest, action_hash, hash_secret,
+    verify_provisioner_authorization,
+};
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo, TokioTimer},
+    server::conn::auto::Builder as HttpBuilder,
+    service::TowerToHyperService,
 };
 use iroh_base::{EndpointId, SecretKey};
 use rand::Rng;
@@ -39,8 +51,10 @@ use relay_api::{
     SignedRevocationUpdate,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, Notify};
-use tracing::info;
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tower::ServiceExt;
+use tower_http::timeout::RequestBodyTimeoutLayer;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
@@ -49,6 +63,13 @@ const CLOCK_SKEW_SECS: i64 = 300;
 const DEFAULT_TTL_SECS: u64 = 15 * 60;
 const RELAY_CREDENTIAL_LIFETIME_SECS: i64 = 7 * 24 * 60 * 60;
 const RELAY_CREDENTIAL_RENEW_BEFORE_SECS: i64 = 2 * 24 * 60 * 60;
+const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_BODY_TIMEOUT: Duration = Duration::from_secs(10);
+const ADMISSION_WAIT: Duration = Duration::from_secs(5);
+const VERIFY_ACTIVE: usize = 256;
+const VERIFY_WAITING: usize = 512;
+const MUTATION_WAITING: usize = 128;
+const WATCHES_PER_ENDPOINT: usize = 2;
 
 #[derive(Parser)]
 #[command(
@@ -411,7 +432,78 @@ struct Store {
     state: Mutex<ControlState>,
     changed: Notify,
     relay_changed: Notify,
+    verification_active: Arc<Semaphore>,
+    verification_waiting: Arc<Semaphore>,
+    mutation_active: Arc<Semaphore>,
+    mutation_waiting: Arc<Semaphore>,
+    watches: Arc<WatchRegistry>,
     _lock: scale_core::FileLock,
+}
+
+impl Store {
+    fn new(
+        database: db::Database,
+        key: SecretKey,
+        relay_ca: Issuer<'static, KeyPair>,
+        state: ControlState,
+        lock: scale_core::FileLock,
+    ) -> Self {
+        Self {
+            database,
+            key,
+            relay_ca,
+            state: Mutex::new(state),
+            changed: Notify::new(),
+            relay_changed: Notify::new(),
+            verification_active: Arc::new(Semaphore::new(VERIFY_ACTIVE)),
+            verification_waiting: Arc::new(Semaphore::new(VERIFY_WAITING)),
+            mutation_active: Arc::new(Semaphore::new(1)),
+            mutation_waiting: Arc::new(Semaphore::new(MUTATION_WAITING)),
+            watches: Arc::new(WatchRegistry::default()),
+            _lock: lock,
+        }
+    }
+}
+
+#[derive(Default)]
+struct WatchRegistry {
+    counts: StdMutex<HashMap<String, usize>>,
+}
+
+struct WatchGuard {
+    registry: Arc<WatchRegistry>,
+    endpoint_id: String,
+}
+
+impl WatchRegistry {
+    fn acquire(self: &Arc<Self>, endpoint_id: EndpointId) -> Result<WatchGuard, ApiError> {
+        let endpoint_id = endpoint_id.to_string();
+        let mut counts = self.counts.lock().expect("watch registry mutex poisoned");
+        let count = counts.entry(endpoint_id.clone()).or_default();
+        if *count >= WATCHES_PER_ENDPOINT {
+            return Err(ApiError::retryable(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many concurrent watches for this endpoint",
+            ));
+        }
+        *count += 1;
+        Ok(WatchGuard {
+            registry: self.clone(),
+            endpoint_id,
+        })
+    }
+}
+
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        let mut counts = self.registry.counts.lock().expect("watch registry mutex poisoned");
+        if let Some(count) = counts.get_mut(&self.endpoint_id) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.endpoint_id);
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -421,6 +513,7 @@ struct AppState(Arc<Store>);
 struct ApiError {
     status: StatusCode,
     message: String,
+    retry_after: bool,
 }
 
 impl ApiError {
@@ -428,6 +521,7 @@ impl ApiError {
         Self {
             status,
             message: error.to_string(),
+            retry_after: false,
         }
     }
     fn bad(error: impl std::fmt::Display) -> Self {
@@ -448,12 +542,68 @@ impl ApiError {
     fn internal(error: impl std::fmt::Display) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, error)
     }
+    fn retryable(status: StatusCode, error: impl std::fmt::Display) -> Self {
+        let mut value = Self::new(status, error);
+        value.retry_after = true;
+        value
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, self.message).into_response()
+        let mut response = (self.status, self.message).into_response();
+        if self.retry_after {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        response
     }
+}
+
+async fn admitted(
+    active: Arc<Semaphore>,
+    waiting: Arc<Semaphore>,
+    label: &'static str,
+) -> Result<OwnedSemaphorePermit, ApiError> {
+    let waiting = waiting
+        .try_acquire_owned()
+        .map_err(|_| ApiError::retryable(StatusCode::SERVICE_UNAVAILABLE, format!("{label} queue is full")))?;
+    let permit = tokio::time::timeout(ADMISSION_WAIT, active.acquire_owned())
+        .await
+        .map_err(|_| ApiError::retryable(StatusCode::SERVICE_UNAVAILABLE, format!("{label} queue timed out")))?
+        .map_err(|_| ApiError::internal(format!("{label} queue closed")))?;
+    drop(waiting);
+    Ok(permit)
+}
+
+async fn verification_permit(store: &Store) -> Result<OwnedSemaphorePermit, ApiError> {
+    admitted(
+        store.verification_active.clone(),
+        store.verification_waiting.clone(),
+        "signature verification",
+    )
+    .await
+}
+
+async fn run_mutation<T, F, Fut>(store: Arc<Store>, operation: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<Store>) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, ApiError>> + Send + 'static,
+{
+    let permit = admitted(
+        store.mutation_active.clone(),
+        store.mutation_waiting.clone(),
+        "mutation",
+    )
+    .await?;
+    tokio::spawn(async move {
+        let _permit = permit;
+        operation(store).await
+    })
+    .await
+    .map_err(ApiError::internal)?
 }
 
 #[tokio::main]
@@ -693,15 +843,7 @@ async fn run(dir: PathBuf, bind: SocketAddr, admin_socket: PathBuf) -> Result<()
     cleanup_invitations(&mut state, now);
     cleanup_revocations(&mut state, now);
     database.apply_sync(&previous, &state)?;
-    let store = Arc::new(Store {
-        database,
-        key,
-        relay_ca,
-        state: Mutex::new(state),
-        changed: Notify::new(),
-        relay_changed: Notify::new(),
-        _lock: lock,
-    });
+    let store = Arc::new(Store::new(database, key, relay_ca, state, lock));
     let app = public_router(store.clone());
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -718,29 +860,72 @@ async fn run(dir: PathBuf, bind: SocketAddr, admin_socket: PathBuf) -> Result<()
     let cleanup = tokio::spawn(async move { invitation_cleanup_loop(cleanup_store).await });
     let admin = tokio::spawn(serve_local_admin(admin_socket, store));
     tokio::select! {
-        result = axum::serve(listener, app) => result.context("control server"),
+        result = serve_public(listener, app) => result.context("control server"),
         result = admin => result.context("local administration task")?,
     }?;
     cleanup.abort();
     Ok(())
 }
 
+async fn serve_public(listener: tokio::net::TcpListener, app: Router) -> std::io::Result<()> {
+    loop {
+        let (stream, remote) = listener.accept().await?;
+        let service = app
+            .clone()
+            .map_request(|request: hyper::Request<hyper::body::Incoming>| request.map(Body::new));
+        tokio::spawn(async move {
+            let mut builder = HttpBuilder::new(TokioExecutor::new());
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HTTP_HEADER_TIMEOUT);
+            if let Err(error) = builder
+                .serve_connection_with_upgrades(TokioIo::new(stream), TowerToHyperService::new(service))
+                .await
+            {
+                warn!(%remote, %error, "control HTTP connection failed");
+            }
+        });
+    }
+}
+
 fn public_router(store: Arc<Store>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
-        .route("/v1/status", get(status))
-        .route("/v1/claim", post(claim))
-        .route("/v1/edge/invite", post(client_edge_invite))
-        .route("/v1/edge/remove", post(client_edge_remove))
-        .route("/v1/provisioner", post(provisioner_request))
-        .route("/v1/watch", post(watch))
-        .route("/v1/relay/watch", post(relay_watch))
+        .route("/v1/status", bounded(post(status), 16 * 1024))
+        .route("/v1/claim", bounded(post(claim), 128 * 1024))
+        .route("/v1/edge/invite", bounded(post(client_edge_invite), 16 * 1024))
+        .route("/v1/edge/remove", bounded(post(client_edge_remove), 16 * 1024))
+        .route("/v1/provisioner", bounded(post(provisioner_request), 64 * 1024))
+        .route("/v1/watch", bounded(post(watch), 16 * 1024))
+        .route("/v1/relay/watch", bounded(post(relay_watch), 16 * 1024))
         .with_state(AppState(store))
 }
 
-async fn status(State(AppState(store)): State<AppState>) -> Json<ControlStatus> {
+fn bounded(method: axum::routing::MethodRouter<AppState>, bytes: usize) -> axum::routing::MethodRouter<AppState> {
+    method
+        .layer::<_, Infallible>(DefaultBodyLimit::max(bytes))
+        .layer::<_, Infallible>(RequestBodyTimeoutLayer::new(HTTP_BODY_TIMEOUT))
+}
+
+async fn status(
+    State(AppState(store)): State<AppState>,
+    Json(request): Json<StatusRequest>,
+) -> Result<Json<ControlStatus>, ApiError> {
+    let _verification = verification_permit(&store).await?;
+    let client_id = request.verify().map_err(ApiError::unauthorized)?.to_string();
+    check_time(request.issued_at, unix_timestamp()).map_err(ApiError::unauthorized)?;
+    if request.nonce.is_empty() || request.nonce.len() > 128 {
+        return Err(ApiError::bad("nonce must contain 1-128 characters"));
+    }
     let state = store.state.lock().await;
-    Json(ControlStatus {
+    if request.audience != state.audience {
+        return Err(ApiError::unauthorized("control audience mismatch"));
+    }
+    if !state.clients.iter().any(|client| client.endpoint_id == client_id) {
+        return Err(ApiError::forbidden("client is not registered"));
+    }
+    Ok(Json(ControlStatus {
         audience: state.audience.clone(),
         control_url: state.public_url.clone(),
         control_id: store.key.public().to_string(),
@@ -748,7 +933,7 @@ async fn status(State(AppState(store)): State<AppState>) -> Json<ControlStatus> 
         clients: state.clients.len(),
         edges: state.edges.len(),
         relays: state.relays.len(),
-    })
+    }))
 }
 
 async fn claim(
@@ -756,81 +941,86 @@ async fn claim(
     Json(request): Json<ClaimRequest>,
 ) -> Result<Json<JoinResult>, ApiError> {
     let now = unix_timestamp();
+    let _verification = verification_permit(&store).await?;
     request.token.verify().map_err(ApiError::unauthorized)?;
     let endpoint_id = request.verify().map_err(ApiError::unauthorized)?;
     check_time(request.claim.issued_at, now).map_err(ApiError::unauthorized)?;
-    let mut state = store.state.lock().await;
-    validate_token_for_state(&request.token, &state, store.key.public(), now)?;
-    let index = state
-        .invites
-        .iter()
-        .position(|record| record.invite.invite_id == request.claim.invite_id)
-        .ok_or_else(|| ApiError::gone("unknown invite"))?;
-    let relay_qad_port = validate_relay_claim(
-        &state.invites[index].invite.kind,
-        request.claim.relay_qad_port,
-        request.claim.relay_tls_csr.as_deref(),
-    )?;
-    let relay_tls_certificate_der = issue_relay_tls_certificate(
-        &request.claim.relay_tls_csr,
-        &state.invites[index].invite.kind,
-        relay_qad_port,
-        &store.relay_ca,
-    )?;
-    match state.invites[index].state {
-        InviteState::Pending => {}
-        InviteState::Claimed if state.invites[index].claimed_by.as_deref() == Some(&request.claim.endpoint_id) => {
-            if let Some(relay) = state
-                .relays
-                .iter()
-                .find(|relay| relay.endpoint_id == request.claim.endpoint_id)
-                && relay.qad_port != relay_qad_port
-            {
-                return Err(ApiError::conflict("Relay QAD port differs from its enrolled value"));
+    drop(_verification);
+    run_mutation(store, move |store| async move {
+        let mut state = store.state.lock().await;
+        validate_token_for_state(&request.token, &state, store.key.public(), now)?;
+        let index = state
+            .invites
+            .iter()
+            .position(|record| record.invite.invite_id == request.claim.invite_id)
+            .ok_or_else(|| ApiError::gone("unknown invite"))?;
+        let relay_qad_port = validate_relay_claim(
+            &state.invites[index].invite.kind,
+            request.claim.relay_qad_port,
+            request.claim.relay_tls_csr.as_deref(),
+        )?;
+        let relay_tls_certificate_der = issue_relay_tls_certificate(
+            &request.claim.relay_tls_csr,
+            &state.invites[index].invite.kind,
+            relay_qad_port,
+            &store.relay_ca,
+        )?;
+        match state.invites[index].state {
+            InviteState::Pending => {}
+            InviteState::Claimed if state.invites[index].claimed_by.as_deref() == Some(&request.claim.endpoint_id) => {
+                if let Some(relay) = state
+                    .relays
+                    .iter()
+                    .find(|relay| relay.endpoint_id == request.claim.endpoint_id)
+                    && relay.qad_port != relay_qad_port
+                {
+                    return Err(ApiError::conflict("Relay QAD port differs from its enrolled value"));
+                }
+                let map = signed_map(&state, &store.key, endpoint_id).map_err(ApiError::internal)?;
+                return Ok(Json(JoinResult {
+                    name: state.invites[index].invite.name.clone(),
+                    kind: state.invites[index].invite.kind.clone(),
+                    map,
+                    relay_tls_certificate_der,
+                }));
             }
-            let map = signed_map(&state, &store.key, endpoint_id).map_err(ApiError::internal)?;
-            return Ok(Json(JoinResult {
-                name: state.invites[index].invite.name.clone(),
-                kind: state.invites[index].invite.kind.clone(),
-                map,
-                relay_tls_certificate_der,
-            }));
+            InviteState::Claimed => return Err(ApiError::conflict("invite was already claimed")),
+            InviteState::Revoked => return Err(ApiError::gone("invite was revoked")),
         }
-        InviteState::Claimed => return Err(ApiError::conflict("invite was already claimed")),
-        InviteState::Revoked => return Err(ApiError::gone("invite was revoked")),
-    }
-    let invite = state.invites[index].invite.clone();
-    let managed_by = state.invites[index].managed_by.clone();
-    let credential_generation = state
-        .revision
-        .checked_add(1)
-        .ok_or_else(|| ApiError::internal("revision overflow"))?;
-    let node_change = claimed_node_change(
-        &state,
-        &invite,
-        endpoint_id,
-        managed_by.as_deref(),
-        relay_qad_port,
-        credential_generation,
-        now,
-    )?;
-    let mut invite_record = state.invites[index].clone();
-    invite_record.state = InviteState::Claimed;
-    invite_record.claimed_by = Some(endpoint_id.to_string());
-    invite_record.terminal_at = Some(now);
-    commit_delta(
-        &store,
-        &mut state,
-        StateDelta::topology(vec![node_change, StateChange::PutInvite(Box::new(invite_record))]),
-    )
-    .await?;
-    let map = signed_map(&state, &store.key, endpoint_id).map_err(ApiError::internal)?;
-    Ok(Json(JoinResult {
-        name: invite.name,
-        kind: invite.kind,
-        map,
-        relay_tls_certificate_der,
-    }))
+        let invite = state.invites[index].invite.clone();
+        let managed_by = state.invites[index].managed_by.clone();
+        let credential_generation = state
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| ApiError::internal("revision overflow"))?;
+        let node_change = claimed_node_change(
+            &state,
+            &invite,
+            endpoint_id,
+            managed_by.as_deref(),
+            relay_qad_port,
+            credential_generation,
+            now,
+        )?;
+        let mut invite_record = state.invites[index].clone();
+        invite_record.state = InviteState::Claimed;
+        invite_record.claimed_by = Some(endpoint_id.to_string());
+        invite_record.terminal_at = Some(now);
+        commit_delta(
+            &store,
+            &mut state,
+            StateDelta::topology(vec![node_change, StateChange::PutInvite(Box::new(invite_record))]),
+        )
+        .await?;
+        let map = signed_map(&state, &store.key, endpoint_id).map_err(ApiError::internal)?;
+        Ok(Json(JoinResult {
+            name: invite.name,
+            kind: invite.kind,
+            map,
+            relay_tls_certificate_der,
+        }))
+    })
+    .await
 }
 
 fn issue_relay_tls_certificate(
@@ -902,96 +1092,108 @@ async fn client_edge_invite(
     State(AppState(store)): State<AppState>,
     Json(request): Json<EdgeInviteRequest>,
 ) -> Result<Json<InviteResult>, ApiError> {
+    let verification = verification_permit(&store).await?;
     let client_id = request.verify().map_err(ApiError::unauthorized)?;
     check_time(request.issued_at, unix_timestamp()).map_err(ApiError::unauthorized)?;
     validate_name(&request.name).map_err(ApiError::bad)?;
     if request.request_id.is_empty() || request.request_id.len() > 128 {
         return Err(ApiError::bad("request id must contain 1-128 characters"));
     }
-    let mut state = store.state.lock().await;
-    if request.audience != state.audience {
-        return Err(ApiError::unauthorized("control audience mismatch"));
-    }
-    let managed_by = state
-        .clients
-        .iter()
-        .find(|client| client.endpoint_id == client_id.to_string())
-        .map(|client| client.managed_by.clone())
-        .ok_or_else(|| ApiError::forbidden("client is not registered"))?;
-    if state
-        .invites
-        .iter()
-        .any(|invite| invite.request_id.as_deref() == Some(&request.request_id))
-    {
-        return Err(ApiError::conflict("edge invitation request was already used"));
-    }
-    let kind = InviteKind::Edge {
-        owner_id: client_id.to_string(),
-    };
-    validate_invite_name(&state, &request.name, &kind)?;
-    let (result, mut record) = build_invite(
-        &store.key,
-        &state,
-        request.name,
-        kind,
-        request.ttl_secs,
-        random_token(32),
-    )
-    .map_err(ApiError::bad)?;
-    record.request_id = Some(request.request_id);
-    record.managed_by = managed_by;
-    commit_delta(
-        &store,
-        &mut state,
-        StateDelta::topology(vec![StateChange::PutInvite(Box::new(record))]),
-    )
-    .await?;
-    Ok(Json(result))
+    drop(verification);
+    run_mutation(store, move |store| async move {
+        let mut state = store.state.lock().await;
+        if request.audience != state.audience {
+            return Err(ApiError::unauthorized("control audience mismatch"));
+        }
+        let managed_by = state
+            .clients
+            .iter()
+            .find(|client| client.endpoint_id == client_id.to_string())
+            .map(|client| client.managed_by.clone())
+            .ok_or_else(|| ApiError::forbidden("client is not registered"))?;
+        if state
+            .invites
+            .iter()
+            .any(|invite| invite.request_id.as_deref() == Some(&request.request_id))
+        {
+            return Err(ApiError::conflict("edge invitation request was already used"));
+        }
+        let kind = InviteKind::Edge {
+            owner_id: client_id.to_string(),
+        };
+        validate_invite_name(&state, &request.name, &kind)?;
+        let (result, mut record) = build_invite(
+            &store.key,
+            &state,
+            request.name,
+            kind,
+            request.ttl_secs,
+            random_token(32),
+        )
+        .map_err(ApiError::bad)?;
+        record.request_id = Some(request.request_id);
+        record.managed_by = managed_by;
+        commit_delta(
+            &store,
+            &mut state,
+            StateDelta::topology(vec![StateChange::PutInvite(Box::new(record))]),
+        )
+        .await?;
+        Ok(Json(result))
+    })
+    .await
 }
 
 async fn client_edge_remove(
     State(AppState(store)): State<AppState>,
     Json(request): Json<EdgeRemoveRequest>,
 ) -> Result<Json<SignedNodeMap>, ApiError> {
+    let verification = verification_permit(&store).await?;
     let client_endpoint = request.verify().map_err(ApiError::unauthorized)?;
     check_time(request.issued_at, unix_timestamp()).map_err(ApiError::unauthorized)?;
     validate_name(&request.name).map_err(ApiError::bad)?;
     if request.nonce.is_empty() || request.nonce.len() > 128 {
         return Err(ApiError::bad("nonce must contain 1-128 characters"));
     }
-    let client_id = client_endpoint.to_string();
-    let mut state = store.state.lock().await;
-    if request.audience != state.audience {
-        return Err(ApiError::unauthorized("control audience mismatch"));
-    }
-    if !state.clients.iter().any(|client| client.endpoint_id == client_id) {
-        return Err(ApiError::forbidden("client is not registered"));
-    }
-    let removed = state
-        .edges
-        .iter()
-        .find(|edge| edge.owner_id == client_id && edge.name == request.name && edge.endpoint_id == request.endpoint_id)
-        .cloned();
-    let Some(removed) = removed else {
-        return Err(ApiError::bad(format!(
-            "unknown edge '{}' with the expected identity",
-            request.name
-        )));
-    };
-    let revocation = revocation_change(
-        &state,
-        &removed.endpoint_id,
-        removed.credential_generation,
-        removed.credential_expires_at,
-    );
-    commit_delta(
-        &store,
-        &mut state,
-        StateDelta::revocation(vec![StateChange::DeleteEdge(removed.endpoint_id), revocation]),
-    )
-    .await?;
-    let map = signed_map(&state, &store.key, client_endpoint).map_err(ApiError::internal)?;
-    Ok(Json(map))
+    drop(verification);
+    run_mutation(store, move |store| async move {
+        let client_id = client_endpoint.to_string();
+        let mut state = store.state.lock().await;
+        if request.audience != state.audience {
+            return Err(ApiError::unauthorized("control audience mismatch"));
+        }
+        if !state.clients.iter().any(|client| client.endpoint_id == client_id) {
+            return Err(ApiError::forbidden("client is not registered"));
+        }
+        let removed = state
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.owner_id == client_id && edge.name == request.name && edge.endpoint_id == request.endpoint_id
+            })
+            .cloned();
+        let Some(removed) = removed else {
+            return Err(ApiError::bad(format!(
+                "unknown edge '{}' with the expected identity",
+                request.name
+            )));
+        };
+        let revocation = revocation_change(
+            &state,
+            &removed.endpoint_id,
+            removed.credential_generation,
+            removed.credential_expires_at,
+        );
+        commit_delta(
+            &store,
+            &mut state,
+            StateDelta::revocation(vec![StateChange::DeleteEdge(removed.endpoint_id), revocation]),
+        )
+        .await?;
+        let map = signed_map(&state, &store.key, client_endpoint).map_err(ApiError::internal)?;
+        Ok(Json(map))
+    })
+    .await
 }
 
 async fn provisioner_request(
@@ -999,9 +1201,7 @@ async fn provisioner_request(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<ProvisionerResponse>, ApiError> {
-    if body.len() > 64 * 1024 {
-        return Err(ApiError::bad("provisioner request body exceeds 64 KiB"));
-    }
+    let verification = verification_permit(&store).await?;
     let authorization = headers
         .get(AUTHORIZATION)
         .ok_or_else(|| ApiError::unauthorized("missing provisioner authorization"))?
@@ -1014,24 +1214,34 @@ async fn provisioner_request(
     request.verify_protocol().map_err(ApiError::bad)?;
     check_time(request.issued_at, unix_timestamp()).map_err(ApiError::unauthorized)?;
     validate_request_id(&request.request_id).map_err(ApiError::bad)?;
-
-    let mut state = store.state.lock().await;
-    if request.audience != state.audience {
-        return Err(ApiError::unauthorized("control audience mismatch"));
-    }
-    if !state.provisioners.iter().any(|item| item.endpoint_id == provisioner_id) {
-        return Err(ApiError::forbidden("provisioner is not registered"));
-    }
+    drop(verification);
 
     if matches!(request.action, ProvisionerAction::GetTopology) {
+        let state = store.state.lock().await;
+        authorize_provisioner(&state, &request.audience, &provisioner_id)?;
         return Ok(Json(ProvisionerResponse::Topology(provisioner_topology(
             &state,
             &provisioner_id,
         ))));
     }
 
-    let response = dispatch_provisioner_mutation(&store, &mut state, &provisioner_id, &request).await?;
-    Ok(Json(response))
+    run_mutation(store, move |store| async move {
+        let mut state = store.state.lock().await;
+        authorize_provisioner(&state, &request.audience, &provisioner_id)?;
+        let response = dispatch_provisioner_mutation(&store, &mut state, &provisioner_id, &request).await?;
+        Ok(Json(response))
+    })
+    .await
+}
+
+fn authorize_provisioner(state: &ControlState, audience: &str, provisioner_id: &str) -> Result<(), ApiError> {
+    if audience != state.audience {
+        return Err(ApiError::unauthorized("control audience mismatch"));
+    }
+    if !state.provisioners.iter().any(|item| item.endpoint_id == provisioner_id) {
+        return Err(ApiError::forbidden("provisioner is not registered"));
+    }
+    Ok(())
 }
 
 async fn dispatch_provisioner_mutation(
@@ -1307,44 +1517,35 @@ fn check_expected_revision(state: &ControlState, expected: Option<u64>) -> Resul
 async fn watch(
     State(AppState(store)): State<AppState>,
     Json(request): Json<WatchRequest>,
-) -> Result<Json<SignedNodeMap>, ApiError> {
+) -> Result<Response, ApiError> {
+    let verification = verification_permit(&store).await?;
     let endpoint_id = request.verify().map_err(ApiError::unauthorized)?;
     check_time(request.issued_at, unix_timestamp()).map_err(ApiError::unauthorized)?;
-    if !renew_relay_credential_if_needed(&store, endpoint_id).await? {
-        wait_for_revision(&store, endpoint_id, request.known_revision).await?;
+    drop(verification);
+    let _watch = store.watches.acquire(endpoint_id)?;
+    if !renew_relay_credential_if_needed(&store, endpoint_id).await?
+        && !wait_for_revision(&store, endpoint_id, request.known_revision).await?
+    {
+        return Ok(StatusCode::NO_CONTENT.into_response());
     }
     let state = store.state.lock().await;
-    Ok(Json(
-        signed_map(&state, &store.key, endpoint_id).map_err(ApiError::internal)?,
-    ))
+    Ok(Json(signed_map(&state, &store.key, endpoint_id).map_err(ApiError::internal)?).into_response())
 }
 
 async fn relay_watch(
     State(AppState(store)): State<AppState>,
     Json(request): Json<WatchRequest>,
-) -> Result<Json<SignedRevocationUpdate>, ApiError> {
+) -> Result<Response, ApiError> {
+    let verification = verification_permit(&store).await?;
     let endpoint_id = request.verify().map_err(ApiError::unauthorized)?;
     check_time(request.issued_at, unix_timestamp()).map_err(ApiError::unauthorized)?;
     validate_qad_port(request.relay_qad_port).map_err(ApiError::bad)?;
-    {
-        let mut state = store.state.lock().await;
-        let index = state
-            .relays
-            .iter()
-            .position(|relay| relay.endpoint_id == endpoint_id.to_string())
-            .ok_or_else(|| ApiError::forbidden("relay is not registered"))?;
-        if state.relays[index].qad_port != request.relay_qad_port {
-            let mut relay = state.relays[index].clone();
-            relay.qad_port = request.relay_qad_port;
-            commit_delta(
-                &store,
-                &mut state,
-                StateDelta::topology(vec![StateChange::PutRelay(relay)]),
-            )
-            .await?;
-        }
+    drop(verification);
+    let _watch = store.watches.acquire(endpoint_id)?;
+    update_relay_qad_port_if_needed(&store, endpoint_id, request.relay_qad_port).await?;
+    if !wait_for_relay_revision(&store, endpoint_id, request.known_revision).await? {
+        return Ok(StatusCode::NO_CONTENT.into_response());
     }
-    wait_for_relay_revision(&store, endpoint_id, request.known_revision).await?;
     let state = store.state.lock().await;
     anyhow_relay_exists(&state, endpoint_id)?;
     let now = unix_timestamp();
@@ -1365,69 +1566,119 @@ async fn relay_watch(
             })
             .collect(),
     };
-    Ok(Json(
-        SignedRevocationUpdate::sign(update, &store.key).map_err(ApiError::internal)?,
-    ))
+    Ok(Json(SignedRevocationUpdate::sign(update, &store.key).map_err(ApiError::internal)?).into_response())
+}
+
+async fn update_relay_qad_port_if_needed(
+    store: &Arc<Store>,
+    endpoint_id: EndpointId,
+    qad_port: Option<u16>,
+) -> Result<(), ApiError> {
+    let endpoint = endpoint_id.to_string();
+    {
+        let state = store.state.lock().await;
+        let relay = state
+            .relays
+            .iter()
+            .find(|relay| relay.endpoint_id == endpoint)
+            .ok_or_else(|| ApiError::forbidden("relay is not registered"))?;
+        if relay.qad_port == qad_port {
+            return Ok(());
+        }
+    }
+    run_mutation(store.clone(), move |store| async move {
+        let mut state = store.state.lock().await;
+        let index = state
+            .relays
+            .iter()
+            .position(|relay| relay.endpoint_id == endpoint)
+            .ok_or_else(|| ApiError::forbidden("relay is not registered"))?;
+        if state.relays[index].qad_port != qad_port {
+            let mut relay = state.relays[index].clone();
+            relay.qad_port = qad_port;
+            commit_delta(
+                &store,
+                &mut state,
+                StateDelta::topology(vec![StateChange::PutRelay(relay)]),
+            )
+            .await?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 async fn renew_relay_credential_if_needed(store: &Arc<Store>, endpoint_id: EndpointId) -> Result<bool, ApiError> {
     let now = unix_timestamp();
     let renew_at = now.saturating_add(RELAY_CREDENTIAL_RENEW_BEFORE_SECS);
     let endpoint = endpoint_id.to_string();
-    let mut state = store.state.lock().await;
-    let expires_at = state
-        .clients
-        .iter()
-        .find(|record| record.endpoint_id == endpoint)
-        .map(|record| record.credential_expires_at)
-        .or_else(|| {
-            state
-                .edges
-                .iter()
-                .find(|record| record.endpoint_id == endpoint)
-                .map(|record| record.credential_expires_at)
-        });
-    let Some(expires_at) = expires_at else {
-        anyhow_node_exists(&state, endpoint_id)?;
-        return Ok(false);
-    };
-    if expires_at > renew_at {
-        return Ok(false);
+    {
+        let state = store.state.lock().await;
+        let expires_at = state
+            .clients
+            .iter()
+            .find(|record| record.endpoint_id == endpoint)
+            .map(|record| record.credential_expires_at)
+            .or_else(|| {
+                state
+                    .edges
+                    .iter()
+                    .find(|record| record.endpoint_id == endpoint)
+                    .map(|record| record.credential_expires_at)
+            });
+        let Some(expires_at) = expires_at else {
+            anyhow_node_exists(&state, endpoint_id)?;
+            return Ok(false);
+        };
+        if expires_at > renew_at {
+            return Ok(false);
+        }
     }
-    let change = if let Some(record) = state.clients.iter().find(|record| record.endpoint_id == endpoint) {
-        let mut record = record.clone();
-        record.credential_issued_at = now;
-        record.credential_expires_at = now.saturating_add(RELAY_CREDENTIAL_LIFETIME_SECS);
-        StateChange::PutClient(record)
-    } else if let Some(record) = state.edges.iter().find(|record| record.endpoint_id == endpoint) {
-        let mut record = record.clone();
-        record.credential_issued_at = now;
-        record.credential_expires_at = now.saturating_add(RELAY_CREDENTIAL_LIFETIME_SECS);
-        StateChange::PutEdge(record)
-    } else {
-        return Ok(false);
-    };
-    commit_delta(store, &mut state, StateDelta::quiet(vec![change])).await?;
-    Ok(true)
+    run_mutation(store.clone(), move |store| async move {
+        let mut state = store.state.lock().await;
+        let change = if let Some(record) = state.clients.iter().find(|record| record.endpoint_id == endpoint) {
+            if record.credential_expires_at > renew_at {
+                return Ok(false);
+            }
+            let mut record = record.clone();
+            record.credential_issued_at = now;
+            record.credential_expires_at = now.saturating_add(RELAY_CREDENTIAL_LIFETIME_SECS);
+            StateChange::PutClient(record)
+        } else if let Some(record) = state.edges.iter().find(|record| record.endpoint_id == endpoint) {
+            if record.credential_expires_at > renew_at {
+                return Ok(false);
+            }
+            let mut record = record.clone();
+            record.credential_issued_at = now;
+            record.credential_expires_at = now.saturating_add(RELAY_CREDENTIAL_LIFETIME_SECS);
+            StateChange::PutEdge(record)
+        } else {
+            anyhow_node_exists(&state, endpoint_id)?;
+            return Ok(false);
+        };
+        commit_delta(&store, &mut state, StateDelta::quiet(vec![change])).await?;
+        Ok(true)
+    })
+    .await
 }
 
-async fn wait_for_revision(store: &Arc<Store>, endpoint_id: EndpointId, known: u64) -> Result<(), ApiError> {
+async fn wait_for_revision(store: &Arc<Store>, endpoint_id: EndpointId, known: u64) -> Result<bool, ApiError> {
     loop {
         let notified = store.changed.notified();
         {
             let state = store.state.lock().await;
             anyhow_node_exists(&state, endpoint_id)?;
             if state.revision > known {
-                return Ok(());
+                return Ok(true);
             }
         }
         if tokio::time::timeout(Duration::from_secs(30), notified).await.is_err() {
-            return Ok(());
+            return Ok(false);
         }
     }
 }
 
-async fn wait_for_relay_revision(store: &Arc<Store>, endpoint_id: EndpointId, known: u64) -> Result<(), ApiError> {
+async fn wait_for_relay_revision(store: &Arc<Store>, endpoint_id: EndpointId, known: u64) -> Result<bool, ApiError> {
     loop {
         let notified = store.relay_changed.notified();
         {
@@ -1437,11 +1688,11 @@ async fn wait_for_relay_revision(store: &Arc<Store>, endpoint_id: EndpointId, kn
                 return Err(ApiError::bad("Relay revision is ahead of Control"));
             }
             if state.relay_revision > known {
-                return Ok(());
+                return Ok(true);
             }
         }
         if tokio::time::timeout(Duration::from_secs(30), notified).await.is_err() {
-            return Ok(());
+            return Ok(false);
         }
     }
 }
@@ -2776,15 +3027,13 @@ mod tests {
                 credential_expires_at: i64::MAX,
             }),
         ]);
-        let store = Store {
+        let store = Store::new(
             database,
             key,
-            relay_ca: load_relay_ca(dir.path()).unwrap().1,
-            state: Mutex::new(current.clone()),
-            changed: Notify::new(),
-            relay_changed: Notify::new(),
-            _lock: lock,
-        };
+            load_relay_ca(dir.path()).unwrap().1,
+            current.clone(),
+            lock,
+        );
 
         assert!(commit_delta(&store, &mut current, delta).await.is_err());
         assert_eq!(current.revision, 0);
@@ -2806,15 +3055,13 @@ mod tests {
             credential_expires_at: i64::MAX,
         });
         persist_test_state(&database, &state);
-        let store = Arc::new(Store {
+        let store = Arc::new(Store::new(
             database,
-            key: control_key,
-            relay_ca: load_relay_ca(dir.path()).unwrap().1,
-            state: Mutex::new(state),
-            changed: Notify::new(),
-            relay_changed: Notify::new(),
-            _lock: lock,
-        });
+            control_key,
+            load_relay_ca(dir.path()).unwrap().1,
+            state,
+            lock,
+        ));
 
         let stranger = SecretKey::generate();
         let unauthorized = EdgeInviteRequest::sign(
@@ -2895,15 +3142,13 @@ mod tests {
         });
         persist_test_state(&database, &state);
         let revision = state.revision;
-        let store = Arc::new(Store {
+        let store = Arc::new(Store::new(
             database,
-            key: control_key,
-            relay_ca: load_relay_ca(dir.path()).unwrap().1,
-            state: Mutex::new(state),
-            changed: Notify::new(),
-            relay_changed: Notify::new(),
-            _lock: lock,
-        });
+            control_key,
+            load_relay_ca(dir.path()).unwrap().1,
+            state,
+            lock,
+        ));
 
         let unauthorized = EdgeRemoveRequest::sign(
             &other_client,
@@ -2976,15 +3221,13 @@ mod tests {
             },
         ];
         persist_test_state(&database, &state);
-        let store = Arc::new(Store {
+        let store = Arc::new(Store::new(
             database,
-            key: control_key,
-            relay_ca: load_relay_ca(dir.path()).unwrap().1,
-            state: Mutex::new(state),
-            changed: Notify::new(),
-            relay_changed: Notify::new(),
-            _lock: lock,
-        });
+            control_key,
+            load_relay_ca(dir.path()).unwrap().1,
+            state,
+            lock,
+        ));
 
         let topology_request = ProvisionerRequest::sign(
             &provisioner,
@@ -3089,15 +3332,13 @@ mod tests {
             endpoint_id: provisioner.public().to_string(),
         });
         persist_test_state(&database, &state);
-        let store = Arc::new(Store {
+        let store = Arc::new(Store::new(
             database,
-            key: control_key,
-            relay_ca: load_relay_ca(dir.path()).unwrap().1,
-            state: Mutex::new(state),
-            changed: Notify::new(),
-            relay_changed: Notify::new(),
-            _lock: lock,
-        });
+            control_key,
+            load_relay_ca(dir.path()).unwrap().1,
+            state,
+            lock,
+        ));
 
         let client_secret = "c".repeat(43);
         let client_invite = ProvisionerRequest::sign(
@@ -3229,15 +3470,13 @@ mod tests {
             endpoint_id: provisioner.public().to_string(),
         });
         persist_test_state(&database, &state);
-        let store = Arc::new(Store {
+        let store = Arc::new(Store::new(
             database,
             key,
-            relay_ca: load_relay_ca(dir.path()).unwrap().1,
-            state: Mutex::new(state),
-            changed: Notify::new(),
-            relay_changed: Notify::new(),
-            _lock: lock,
-        });
+            load_relay_ca(dir.path()).unwrap().1,
+            state,
+            lock,
+        ));
         let invite = ProvisionerRequest::sign(
             &provisioner,
             "test".into(),
@@ -3258,15 +3497,13 @@ mod tests {
         drop(store);
 
         let (lock, key, database, state) = open_exclusive(dir.path()).unwrap();
-        let store = Arc::new(Store {
+        let store = Arc::new(Store::new(
             database,
             key,
-            relay_ca: load_relay_ca(dir.path()).unwrap().1,
-            state: Mutex::new(state),
-            changed: Notify::new(),
-            relay_changed: Notify::new(),
-            _lock: lock,
-        });
+            load_relay_ca(dir.path()).unwrap().1,
+            state,
+            lock,
+        ));
         let topology = ProvisionerRequest::sign(
             &provisioner,
             "test".into(),

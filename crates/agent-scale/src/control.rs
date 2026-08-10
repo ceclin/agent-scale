@@ -1,18 +1,21 @@
 //! Keeps Control-signed topology separate from user-edited simple-mode config.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use control_api::{
     ClaimRequest, ControlStatus, EdgeInviteRequest, EdgeRemoveRequest, InviteKind, InviteResult, JoinResult, JoinToken,
-    SignedNodeMap, WatchRequest,
+    SignedNodeMap, StatusRequest, WatchRequest,
 };
 use rand::Rng;
 use reqwest::{Client, Url};
 use serde::de::DeserializeOwned;
 
 use crate::common::{self, Config, ControlCfg, EdgeCfg};
+
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const CONTROL_WATCH_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub async fn join(join_url: String) -> Result<()> {
     let mut config = common::config_transaction()?;
@@ -34,12 +37,12 @@ pub async fn join(join_url: String) -> Result<()> {
     };
     let key = common::load_or_create_key()?;
     let request = ClaimRequest::sign(token, &key, unix_timestamp(), random_token(16))?;
-    let response = client()
-        .post(api_url(&control_url, "v1/claim")?)
-        .json(&request)
-        .send()
-        .await
-        .context("claim client invitation")?;
+    let response = send(
+        client()?.post(api_url(&control_url, "v1/claim")?).json(&request),
+        CONTROL_REQUEST_TIMEOUT,
+    )
+    .await
+    .context("claim client invitation")?;
     let status = response.status();
     let body = response.bytes().await?;
     anyhow::ensure!(
@@ -66,11 +69,14 @@ pub async fn join(join_url: String) -> Result<()> {
 pub async fn status() -> Result<()> {
     let config = common::load_config_or_default()?;
     let control = config.control.as_ref().context("client is not enrolled in control")?;
-    let response = client()
-        .get(api_url(&control.url, "v1/status")?)
-        .send()
-        .await
-        .context("query control status")?;
+    let key = common::load_or_create_key()?;
+    let request = StatusRequest::sign(&key, control.audience.clone(), unix_timestamp(), random_token(16))?;
+    let response = send(
+        client()?.post(api_url(&control.url, "v1/status")?).json(&request),
+        CONTROL_REQUEST_TIMEOUT,
+    )
+    .await
+    .context("query control status")?;
     let status: ControlStatus = decode_response(response).await?;
     anyhow::ensure!(status.control_id == control.control_id, "control identity mismatch");
     anyhow::ensure!(status.audience == control.audience, "control audience mismatch");
@@ -94,12 +100,12 @@ pub async fn edge_invite(name: String, ttl_secs: u64) -> Result<()> {
         name,
         ttl_secs,
     )?;
-    let response = client()
-        .post(api_url(&control.url, "v1/edge/invite")?)
-        .json(&request)
-        .send()
-        .await
-        .context("create edge invitation")?;
+    let response = send(
+        client()?.post(api_url(&control.url, "v1/edge/invite")?).json(&request),
+        CONTROL_REQUEST_TIMEOUT,
+    )
+    .await
+    .context("create edge invitation")?;
     let result: InviteResult = decode_response(response).await?;
     println!("{}", result.join_url);
     Ok(())
@@ -123,12 +129,12 @@ pub async fn edge_remove(name: String) -> Result<()> {
         name.clone(),
         edge.endpoint_id,
     )?;
-    let response = client()
-        .post(api_url(&control.url, "v1/edge/remove")?)
-        .json(&request)
-        .send()
-        .await
-        .context("remove managed edge")?;
+    let response = send(
+        client()?.post(api_url(&control.url, "v1/edge/remove")?).json(&request),
+        CONTROL_REQUEST_TIMEOUT,
+    )
+    .await
+    .context("remove managed edge")?;
     let map: SignedNodeMap = decode_response(response).await?;
     let control_id = control.control_id.parse().context("invalid cached control id")?;
     map.verify(control_id, key.public())?;
@@ -163,6 +169,7 @@ pub async fn sync_config(config: &mut Config) -> Result<()> {
 
 pub enum WatchOutcome {
     Updated,
+    Unchanged,
     Revoked,
 }
 
@@ -177,12 +184,15 @@ pub async fn watch_config(config: &mut Config) -> Result<WatchOutcome> {
     let control = config.control.clone().context("client is not enrolled in control")?;
     let key = common::load_or_create_key()?;
     let request = WatchRequest::sign(&key, revision, unix_timestamp(), random_token(16))?;
-    let response = client()
-        .post(api_url(&control.url, "v1/watch")?)
-        .json(&request)
-        .send()
-        .await
-        .context("watch control map")?;
+    let response = send(
+        client()?.post(api_url(&control.url, "v1/watch")?).json(&request),
+        CONTROL_WATCH_TIMEOUT,
+    )
+    .await
+    .context("watch control map")?;
+    if response.status() == reqwest::StatusCode::NO_CONTENT {
+        return Ok(WatchOutcome::Unchanged);
+    }
     if matches!(
         response.status(),
         reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::GONE
@@ -205,12 +215,12 @@ async fn sync_config_at(config: &mut Config, known_revision: u64) -> Result<()> 
     let control = config.control.clone().context("client is not enrolled in control")?;
     let key = common::load_or_create_key()?;
     let request = WatchRequest::sign(&key, known_revision, unix_timestamp(), random_token(16))?;
-    let response = client()
-        .post(api_url(&control.url, "v1/watch")?)
-        .json(&request)
-        .send()
-        .await
-        .context("watch control map")?;
+    let response = send(
+        client()?.post(api_url(&control.url, "v1/watch")?).json(&request),
+        CONTROL_WATCH_TIMEOUT,
+    )
+    .await
+    .context("watch control map")?;
     let map: SignedNodeMap = decode_response(response).await?;
     let control_id = control.control_id.parse().context("invalid cached control id")?;
     map.verify(control_id, key.public())?;
@@ -276,9 +286,45 @@ fn api_url(base: &str, path: &str) -> Result<Url> {
         .join(path)
         .context("build control API URL")
 }
-fn client() -> Client {
+fn client() -> Result<Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    Client::new()
+    Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .context("build Control HTTP client")
+}
+
+async fn send(request: reqwest::RequestBuilder, timeout: Duration) -> Result<reqwest::Response> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        anyhow::ensure!(!remaining.is_zero(), "Control request timed out after {timeout:?}");
+        let attempt = request.try_clone().context("Control request body cannot be retried")?;
+        let response = tokio::time::timeout(remaining, attempt.send())
+            .await
+            .with_context(|| format!("Control request timed out after {timeout:?}"))??;
+        if !matches!(
+            response.status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            return Ok(response);
+        }
+        let Some(seconds) = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return Ok(response);
+        };
+        let jitter = u64::from(rand::random::<u16>()) % 1001;
+        let delay = Duration::from_secs(seconds).saturating_add(Duration::from_millis(jitter));
+        anyhow::ensure!(
+            delay < deadline.saturating_duration_since(tokio::time::Instant::now()),
+            "Control is busy"
+        );
+        tokio::time::sleep(delay).await;
+    }
 }
 fn unix_timestamp() -> i64 {
     SystemTime::now()
