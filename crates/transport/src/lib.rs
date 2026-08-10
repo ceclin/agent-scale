@@ -92,9 +92,13 @@ pub fn relay_urls_or_default(values: &[String]) -> Result<Vec<RelayUrl>> {
         .collect()
 }
 
-/// Construct the exact Relay/QAD settings distributed in a signed Control map.
-pub fn managed_relay_config(url: RelayUrl, qad_port: Option<u16>) -> iroh::RelayConfig {
-    iroh::RelayConfig::new(url, qad_port.map(iroh_relay::RelayQuicConfig::new))
+/// Keeps QAD and credential wiring identical for managed Clients and Edges.
+pub fn managed_relay_config(url: RelayUrl, qad_port: Option<u16>, credential: Option<&str>) -> iroh::RelayConfig {
+    let config = iroh::RelayConfig::new(url, qad_port.map(iroh_relay::RelayQuicConfig::new));
+    match credential {
+        Some(credential) => config.with_auth_token(credential),
+        None => config,
+    }
 }
 
 /// Build a relay-only-capable endpoint: minimal preset (ring crypto provider,
@@ -153,9 +157,10 @@ mod tests {
     #[test]
     fn managed_relay_uses_the_control_qad_port() {
         let url: RelayUrl = "https://relay.example.com".parse().unwrap();
-        let enabled = managed_relay_config(url.clone(), Some(4433));
+        let enabled = managed_relay_config(url.clone(), Some(4433), Some("credential"));
         assert_eq!(enabled.quic.as_ref().map(|quic| quic.port), Some(4433));
-        let disabled = managed_relay_config(url, None);
+        assert_eq!(enabled.auth_token.as_deref(), Some("credential"));
+        let disabled = managed_relay_config(url, None, None);
         assert!(disabled.quic.is_none());
     }
 

@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS metadata (
     audience TEXT NOT NULL CHECK (length(audience) > 0),
     public_url TEXT NOT NULL CHECK (length(public_url) > 0),
     relay_ca_der BLOB NOT NULL CHECK (length(relay_ca_der) > 0),
-    revision INTEGER NOT NULL CHECK (revision >= 0)
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    relay_revision INTEGER NOT NULL CHECK (relay_revision > 0)
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS provisioners (
@@ -24,14 +25,27 @@ ON provisioners(name) WHERE active = 1;
 CREATE TABLE IF NOT EXISTS clients (
     endpoint_id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
-    managed_by TEXT REFERENCES provisioners(endpoint_id) ON DELETE RESTRICT
+    managed_by TEXT REFERENCES provisioners(endpoint_id) ON DELETE RESTRICT,
+    credential_generation INTEGER NOT NULL CHECK (credential_generation > 0),
+    credential_issued_at INTEGER NOT NULL,
+    credential_expires_at INTEGER NOT NULL CHECK (credential_expires_at > credential_issued_at)
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS edges (
     endpoint_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     owner_id TEXT NOT NULL REFERENCES clients(endpoint_id) ON DELETE RESTRICT,
+    credential_generation INTEGER NOT NULL CHECK (credential_generation > 0),
+    credential_issued_at INTEGER NOT NULL,
+    credential_expires_at INTEGER NOT NULL CHECK (credential_expires_at > credential_issued_at),
     UNIQUE(owner_id, name)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS relay_revocations (
+    endpoint_id TEXT PRIMARY KEY,
+    revoked_through_generation INTEGER NOT NULL CHECK (revoked_through_generation > 0),
+    expires_at INTEGER NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision > 0)
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS relays (

@@ -21,7 +21,6 @@ iroh = "1.0.3"
 iroh-blobs = "0.103"
 protocol = { package = "scale-protocol", path = "../protocol" }
 rand = { workspace = true }
-relay-api = { path = "../relay-api" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 rmcp = { version = "3.1", default-features = false, features = [
   "client",

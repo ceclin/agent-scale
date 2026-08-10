@@ -378,6 +378,12 @@ async fn run_iroh_edge(args: &RunArgs) -> Result<()> {
         );
     }
     let (relays, relay_ca_der) = if let Some(profile) = profile.as_ref() {
+        let credential = profile
+            .map
+            .map
+            .relay_credential
+            .as_deref()
+            .context("control map is missing its Relay credential")?;
         profile
             .map
             .map
@@ -388,7 +394,11 @@ async fn run_iroh_edge(args: &RunArgs) -> Result<()> {
                     .url
                     .parse::<iroh::RelayUrl>()
                     .map_err(|error| anyhow::anyhow!("bad relay in control map: {error}"))?;
-                Ok(scale_transport::managed_relay_config(url, relay.qad_port))
+                Ok(scale_transport::managed_relay_config(
+                    url,
+                    relay.qad_port,
+                    Some(credential),
+                ))
             })
             .collect::<Result<Vec<_>>>()
             .map(|relays| (relays, Some(profile.map.map.relay_ca_der.clone())))?
@@ -611,8 +621,17 @@ fn spawn_control_watch(
             }
         };
         let client = control_client();
-        let mut current_relays: HashSet<String> =
-            profile.map.map.relays.iter().map(|relay| relay.url.clone()).collect();
+        let Some(credential) = profile.map.map.relay_credential.clone() else {
+            warn!("control map is missing its Relay credential");
+            return;
+        };
+        let mut current_relays: std::collections::HashMap<String, (Option<u16>, String)> = profile
+            .map
+            .map
+            .relays
+            .iter()
+            .map(|relay| (relay.url.clone(), (relay.qad_port, credential.clone())))
+            .collect();
         let mut backoff = 1u64;
         loop {
             let request = match WatchRequest::sign(&key, profile.map.map.revision, unix_timestamp(), random_nonce()) {
@@ -673,19 +692,35 @@ fn spawn_control_watch(
 async fn apply_control_map(
     endpoint: &iroh::Endpoint,
     pin: &iroh_edge::ClientPin,
-    current_relays: &mut HashSet<String>,
+    current_relays: &mut std::collections::HashMap<String, (Option<u16>, String)>,
     map: &SignedNodeMap,
 ) -> Result<()> {
-    let next_relays: HashSet<String> = map.map.relays.iter().map(|relay| relay.url.clone()).collect();
-    for value in next_relays.difference(current_relays) {
+    let credential = map
+        .map
+        .relay_credential
+        .as_deref()
+        .context("control map is missing its Relay credential")?;
+    let next_relays: std::collections::HashMap<String, (Option<u16>, String)> = map
+        .map
+        .relays
+        .iter()
+        .map(|relay| (relay.url.clone(), (relay.qad_port, credential.to_owned())))
+        .collect();
+    for (value, (qad_port, credential)) in &next_relays {
+        if current_relays.get(value) == Some(&(*qad_port, credential.clone())) {
+            continue;
+        }
         let url: iroh::RelayUrl = value
             .parse()
             .map_err(|error| anyhow::anyhow!("invalid relay {value}: {error}"))?;
         endpoint
-            .insert_relay(url.clone(), std::sync::Arc::new(iroh::RelayConfig::from(url)))
+            .insert_relay(
+                url.clone(),
+                std::sync::Arc::new(scale_transport::managed_relay_config(url, *qad_port, Some(credential))),
+            )
             .await;
     }
-    for value in current_relays.difference(&next_relays) {
+    for value in current_relays.keys().filter(|value| !next_relays.contains_key(*value)) {
         if let Ok(url) = value.parse::<iroh::RelayUrl>() {
             endpoint.remove_relay(&url).await;
         }

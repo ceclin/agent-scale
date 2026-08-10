@@ -24,7 +24,7 @@ Compose uses the native `as-control bootstrap` command to initialize durable
 state and atomically write the Relay enrollment invitation. Client enrollment
 remains an explicit administration action after Control starts. The Relay runs
 `as-relay run --join-if-needed`; it enrolls itself on the first start and later
-starts directly from its persisted profile and membership snapshot, without a
+starts directly from its persisted profile and revocation state, without a
 shell init script or a Control-health dependency.
 
 Released deployments pull `ghcr.io/ceclin/agent-scale-control:latest` and
@@ -245,8 +245,9 @@ as-relay run \
   --state-dir /var/lib/agent-scale-relay
 ```
 
-The relay pulls control-signed membership over HTTPS and immediately disconnects
-revoked EndpointIds. Its data-plane route still needs a TLS reverse proxy with
+Clients and Edges present Control-signed, EndpointId-bound credentials to every
+Relay. The Relay verifies admission locally, pulls only signed revocation deltas over
+HTTPS, and immediately disconnects revoked EndpointIds. Its data-plane route still needs a TLS reverse proxy with
 WebSocket upgrades. The admin listener defaults to loopback and is only needed
 for local health/status inspection. Publish `4433/udp` to the example local
 QAD port `7842/udp`; these ports do not need to be equal.

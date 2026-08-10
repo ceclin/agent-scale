@@ -1,11 +1,13 @@
-//! Pulls complete Control-signed membership so the public Relay API never needs
-//! a remote mutation endpoint.
+//! Verifies Control-signed admission credentials locally and pulls only revocations.
 
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -25,7 +27,7 @@ use iroh_relay::server::{
     Access, AccessControl, ClientRequest, QuicConfig, RelayConfig, Server, ServerConfig, clients::Clients,
 };
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
-use relay_api::{MembershipSnapshot, RELAY_PROTOCOL_VERSION, RelayStatus, SignedSnapshot};
+use relay_api::{RELAY_PROTOCOL_VERSION, RelayStatus, RevocationUpdate, SignedRelayCredential, SignedRevocationUpdate};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -33,6 +35,7 @@ use tracing_subscriber::EnvFilter;
 
 const MAX_CLOCK_SKEW_SECS: i64 = 300;
 const DEFAULT_QAD_PORT: u16 = 7842;
+type RevocationIndex = HashMap<EndpointId, (u64, i64)>;
 
 #[derive(Parser)]
 #[command(name = "as-relay", about = "Dynamically managed private iroh relay")]
@@ -75,7 +78,7 @@ enum Command {
         /// Enroll without QAD, or require an existing QAD-disabled profile.
         #[arg(long)]
         no_qad: bool,
-        /// Directory containing the durable membership snapshot.
+        /// Directory containing durable Relay state.
         #[arg(long)]
         state_dir: Option<PathBuf>,
         /// Enroll from this invitation file when no Control profile exists.
@@ -100,20 +103,68 @@ struct RunOptions {
 
 #[derive(Debug, Clone)]
 struct DynamicAccess {
-    allowed: Arc<ArcSwap<HashSet<EndpointId>>>,
+    audience: Arc<str>,
+    authority_id: EndpointId,
+    revoked: Arc<ArcSwap<RevocationIndex>>,
+    enrollment_revoked: Arc<AtomicBool>,
 }
 
 impl AccessControl for DynamicAccess {
     async fn on_connect(&self, request: &ClientRequest) -> Access {
-        if self.allowed.load().contains(&request.endpoint_id()) {
-            Access::Allow
-        } else {
-            warn!(endpoint_id = %request.endpoint_id(), "denied relay access");
-            Access::Deny {
-                reason: Some("endpoint is not authorized".into()),
+        let endpoint_id = request.endpoint_id();
+        if self.enrollment_revoked.load(Ordering::Acquire) {
+            return Access::Deny {
+                reason: Some("Relay enrollment is revoked".into()),
+            };
+        }
+        match validate_credential(
+            request.auth_token().as_deref(),
+            endpoint_id,
+            self.authority_id,
+            &self.audience,
+            &self.revoked.load(),
+            unix_timestamp(),
+        ) {
+            Ok(()) => Access::Allow,
+            Err(error) => {
+                warn!(%endpoint_id, %error, "denied relay access");
+                Access::Deny {
+                    reason: Some("endpoint is not authorized".into()),
+                }
             }
         }
     }
+}
+
+fn validate_credential(
+    token: Option<&str>,
+    endpoint_id: EndpointId,
+    authority_id: EndpointId,
+    audience: &str,
+    revoked: &RevocationIndex,
+    now: i64,
+) -> Result<()> {
+    let token = token.context("missing Relay credential")?;
+    let signed = SignedRelayCredential::decode(token)?;
+    signed.verify(authority_id)?;
+    signed.credential.validate()?;
+    anyhow::ensure!(signed.credential.audience == audience, "credential audience mismatch");
+    anyhow::ensure!(
+        signed.credential.endpoint_id()? == endpoint_id,
+        "credential endpoint mismatch"
+    );
+    anyhow::ensure!(
+        signed.credential.issued_at <= now.saturating_add(MAX_CLOCK_SKEW_SECS),
+        "credential is not valid yet"
+    );
+    anyhow::ensure!(signed.credential.expires_at > now, "credential expired");
+    let revoked_through = revoked
+        .get(&endpoint_id)
+        .filter(|(_, expires_at)| *expires_at > now)
+        .map(|(generation, _)| *generation)
+        .unwrap_or(0);
+    anyhow::ensure!(signed.credential.generation > revoked_through, "credential was revoked");
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -121,9 +172,11 @@ struct AdminState {
     audience: Arc<str>,
     authority_id: EndpointId,
     state_path: Arc<PathBuf>,
-    current: Arc<Mutex<MembershipSnapshot>>,
-    allowed: Arc<ArcSwap<HashSet<EndpointId>>>,
+    current: Arc<Mutex<RevocationUpdate>>,
+    revoked: Arc<ArcSwap<RevocationIndex>>,
     clients: Clients,
+    enrollment_revoked: Arc<AtomicBool>,
+    enrollment_revoked_path: Arc<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -267,12 +320,21 @@ async fn run(options: RunOptions) -> Result<()> {
     let authority_id = profile.control_id.parse().context("invalid profile control id")?;
     let audience = profile.audience.clone();
     anyhow::ensure!(!audience.trim().is_empty(), "audience must not be empty");
-    let state_path = state_dir.join("membership.json");
-    let snapshot = load_or_initialize(&state_path, &audience).await?;
-    let ids = validate_snapshot(&snapshot, &audience)?;
-    let allowed = Arc::new(ArcSwap::from_pointee(ids));
+    let state_path = state_dir.join("revocations.json");
+    let enrollment_revoked_path = state_dir.join("enrollment-revoked");
+    anyhow::ensure!(
+        !enrollment_revoked_path.exists(),
+        "Relay enrollment was revoked; remove this state directory and enroll a new Relay identity"
+    );
+    let revocation_state = load_or_initialize(&state_path, &audience).await?;
+    let revocations = validate_revocations(&revocation_state, &audience)?;
+    let revoked = Arc::new(ArcSwap::from_pointee(revocations));
+    let enrollment_revoked = Arc::new(AtomicBool::new(false));
     let access = DynamicAccess {
-        allowed: allowed.clone(),
+        audience: audience.clone().into(),
+        authority_id,
+        revoked: revoked.clone(),
+        enrollment_revoked: enrollment_revoked.clone(),
     };
 
     let mut relay_config = RelayConfig::new(relay_bind);
@@ -294,9 +356,11 @@ async fn run(options: RunOptions) -> Result<()> {
         audience: audience.clone().into(),
         authority_id,
         state_path: Arc::new(state_path),
-        current: Arc::new(Mutex::new(snapshot)),
-        allowed,
+        current: Arc::new(Mutex::new(revocation_state)),
+        revoked,
         clients,
+        enrollment_revoked,
+        enrollment_revoked_path: Arc::new(enrollment_revoked_path),
     };
     let app = Router::new()
         .route("/healthz", get(health))
@@ -413,36 +477,43 @@ fn requested_qad_port(port: Option<u16>, disabled: bool, default_port: u16) -> R
     Ok(Some(port))
 }
 
-async fn load_or_initialize(path: &Path, audience: &str) -> Result<MembershipSnapshot> {
+async fn load_or_initialize(path: &Path, audience: &str) -> Result<RevocationUpdate> {
     match tokio::fs::read(path).await {
         Ok(data) => serde_json::from_slice(&data).with_context(|| format!("parse {}", path.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let snapshot = MembershipSnapshot {
+            let state = RevocationUpdate {
                 protocol_version: RELAY_PROTOCOL_VERSION,
                 audience: audience.into(),
                 version: 0,
                 issued_at: unix_timestamp(),
-                members: Vec::new(),
+                revocations: Vec::new(),
             };
-            persist_snapshot(path, &snapshot).await?;
-            Ok(snapshot)
+            persist_revocation_state(path, &state).await?;
+            Ok(state)
         }
         Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
     }
 }
 
-fn validate_snapshot(snapshot: &MembershipSnapshot, audience: &str) -> Result<HashSet<EndpointId>> {
-    anyhow::ensure!(snapshot.audience == audience, "snapshot audience mismatch");
-    let ids: HashSet<_> = snapshot.endpoint_ids()?.into_iter().collect();
+fn validate_revocations(update: &RevocationUpdate, audience: &str) -> Result<RevocationIndex> {
+    update.validate()?;
+    anyhow::ensure!(update.audience == audience, "revocation audience mismatch");
+    let entries = update.entries()?;
+    let ids: RevocationIndex = update
+        .revocations
+        .iter()
+        .zip(entries)
+        .map(|(revocation, (endpoint_id, generation))| (endpoint_id, (generation, revocation.expires_at)))
+        .collect();
     anyhow::ensure!(
-        ids.len() == snapshot.members.len(),
-        "snapshot contains duplicate endpoint ids"
+        ids.len() == update.revocations.len(),
+        "revocation update contains duplicate endpoint ids"
     );
     Ok(ids)
 }
 
-async fn persist_snapshot(path: &Path, snapshot: &MembershipSnapshot) -> Result<()> {
-    let data = serde_json::to_vec_pretty(snapshot)?;
+async fn persist_revocation_state(path: &Path, state: &RevocationUpdate) -> Result<()> {
+    let data = serde_json::to_vec_pretty(state)?;
     let tmp = path.with_extension("json.tmp");
     let mut file = tokio::fs::File::create(&tmp)
         .await
@@ -462,62 +533,122 @@ async fn health() -> StatusCode {
 }
 
 async fn status(State(state): State<AdminState>) -> Json<RelayStatus> {
-    let snapshot = state.current.lock().await;
+    let current = state.current.lock().await;
     Json(RelayStatus {
         audience: state.audience.to_string(),
         control_id: state.authority_id.to_string(),
-        version: snapshot.version,
-        members: snapshot.members.len(),
+        version: current.version,
+        revocations: current.revocations.len(),
     })
 }
 
-async fn update_snapshot(
+async fn apply_revocation_update(
     State(state): State<AdminState>,
-    Json(signed): Json<SignedSnapshot>,
+    Json(signed): Json<SignedRevocationUpdate>,
 ) -> Result<Json<RelayStatus>, ApiError> {
     signed.verify(state.authority_id).map_err(ApiError::unauthorized)?;
-    let next_ids = validate_snapshot(&signed.snapshot, &state.audience).map_err(ApiError::bad_request)?;
+    let delta = validate_revocations(&signed.update, &state.audience).map_err(ApiError::bad_request)?;
     let mut current = state.current.lock().await;
 
-    if signed.snapshot.version < current.version {
+    if signed.update.version < current.version {
         return Err(ApiError::conflict(format!(
-            "snapshot version {} is older than current version {}",
-            signed.snapshot.version, current.version
+            "revocation version {} is older than current version {}",
+            signed.update.version, current.version
         )));
     }
-    if signed.snapshot.version == current.version {
-        if signed.snapshot == *current {
+    if signed.update.version == current.version {
+        let already_applied = signed
+            .update
+            .revocations
+            .iter()
+            .all(|revocation| current.revocations.iter().any(|existing| existing == revocation));
+        if already_applied {
+            let now = unix_timestamp();
+            if current
+                .revocations
+                .iter()
+                .any(|revocation| revocation.expires_at <= now)
+            {
+                let mut pruned = current.clone();
+                pruned.revocations.retain(|revocation| revocation.expires_at > now);
+                let active = validate_revocations(&pruned, &state.audience).map_err(ApiError::bad_request)?;
+                persist_revocation_state(&state.state_path, &pruned)
+                    .await
+                    .map_err(ApiError::internal)?;
+                state.revoked.store(Arc::new(active));
+                *current = pruned;
+            }
             return Ok(Json(relay_status(&state, &current)));
         }
-        return Err(ApiError::conflict("snapshot version already has different content"));
+        return Err(ApiError::conflict("revocation version already has different content"));
     }
-    let age = unix_timestamp().saturating_sub(signed.snapshot.issued_at).abs();
+    let age = unix_timestamp().saturating_sub(signed.update.issued_at).abs();
     if age > MAX_CLOCK_SKEW_SECS {
         return Err(ApiError::unauthorized(
-            "snapshot timestamp is outside the 5 minute window",
+            "revocation timestamp is outside the 5 minute window",
         ));
     }
 
-    persist_snapshot(&state.state_path, &signed.snapshot)
+    if signed
+        .update
+        .revocations
+        .iter()
+        .any(|revocation| revocation.revision <= current.version)
+    {
+        return Err(ApiError::conflict("revocation update overlaps the applied revision"));
+    }
+
+    let now = unix_timestamp();
+    let mut merged: HashMap<EndpointId, relay_api::Revocation> = current
+        .revocations
+        .iter()
+        .filter(|revocation| revocation.expires_at > now)
+        .filter_map(|revocation| revocation.endpoint_id.parse().ok().map(|id| (id, revocation.clone())))
+        .collect();
+    for revocation in &signed.update.revocations {
+        let endpoint_id = revocation.endpoint_id.parse().map_err(ApiError::bad_request)?;
+        if let Some(existing) = merged.get(&endpoint_id)
+            && revocation.revoked_through_generation < existing.revoked_through_generation
+        {
+            return Err(ApiError::conflict("revocation generation moved backwards"));
+        }
+        merged.insert(endpoint_id, revocation.clone());
+    }
+    let mut revocations: Vec<_> = merged.into_values().collect();
+    revocations.sort_by(|a, b| a.endpoint_id.cmp(&b.endpoint_id));
+    let accumulated = RevocationUpdate {
+        protocol_version: RELAY_PROTOCOL_VERSION,
+        audience: signed.update.audience.clone(),
+        version: signed.update.version,
+        issued_at: signed.update.issued_at,
+        revocations,
+    };
+    let next_revocations = validate_revocations(&accumulated, &state.audience).map_err(ApiError::bad_request)?;
+    persist_revocation_state(&state.state_path, &accumulated)
         .await
         .map_err(ApiError::internal)?;
-    let old_ids = state.allowed.load_full();
-    state.allowed.store(Arc::new(next_ids.clone()));
-    for removed in old_ids.difference(&next_ids) {
-        if state.clients.disconnect(*removed, None) {
-            info!(endpoint_id = %removed, "disconnected revoked relay client");
+    let old_revocations = state.revoked.load_full();
+    state.revoked.store(Arc::new(next_revocations.clone()));
+    for (endpoint_id, (generation, expires_at)) in delta {
+        let old_generation = old_revocations
+            .get(&endpoint_id)
+            .filter(|(_, old_expires_at)| *old_expires_at > now)
+            .map(|(generation, _)| *generation)
+            .unwrap_or(0);
+        if expires_at > now && old_generation < generation && state.clients.disconnect(endpoint_id, None) {
+            info!(%endpoint_id, "disconnected revoked relay client");
         }
     }
-    *current = signed.snapshot;
+    *current = accumulated;
     Ok(Json(relay_status(&state, &current)))
 }
 
-fn relay_status(state: &AdminState, snapshot: &MembershipSnapshot) -> RelayStatus {
+fn relay_status(state: &AdminState, current: &RevocationUpdate) -> RelayStatus {
     RelayStatus {
         audience: state.audience.to_string(),
         control_id: state.authority_id.to_string(),
-        version: snapshot.version,
-        members: snapshot.members.len(),
+        version: current.version,
+        revocations: current.revocations.len(),
     }
 }
 
@@ -666,21 +797,21 @@ async fn poll_control(profile: ControlProfile, state_dir: PathBuf, state: AdminS
                 }
             };
         match client.post(url.clone()).json(&request).send().await {
-            Ok(response) if response.status().is_success() => match response.json::<SignedSnapshot>().await {
+            Ok(response) if response.status().is_success() => match response.json::<SignedRevocationUpdate>().await {
                 Ok(signed) => {
                     let valid = signed
                         .verify(control_id)
-                        .and_then(|()| validate_snapshot(&signed.snapshot, &profile.audience).map(|_| ()));
+                        .and_then(|()| validate_revocations(&signed.update, &profile.audience).map(|_| ()));
                     if let Err(error) = valid {
-                        warn!("control returned invalid relay membership: {error:#}");
-                    } else if let Err(error) = update_snapshot(State(state.clone()), Json(signed)).await {
-                        warn!("cannot apply control membership: {}", error.message);
+                        warn!("control returned invalid Relay revocations: {error:#}");
+                    } else if let Err(error) = apply_revocation_update(State(state.clone()), Json(signed)).await {
+                        warn!("cannot apply Control revocations: {}", error.message);
                     } else {
                         backoff = 1;
                         continue;
                     }
                 }
-                Err(error) => warn!("cannot decode relay membership: {error}"),
+                Err(error) => warn!("cannot decode Relay revocations: {error}"),
             },
             Ok(response) if response.status() == StatusCode::FORBIDDEN || response.status() == StatusCode::GONE => {
                 warn!("relay enrollment was revoked; disconnecting all clients");
@@ -696,11 +827,16 @@ async fn poll_control(profile: ControlProfile, state_dir: PathBuf, state: AdminS
 }
 
 async fn revoke_all(state: &AdminState) {
-    let old = state.allowed.load_full();
-    state.allowed.store(Arc::new(HashSet::new()));
-    for endpoint_id in old.iter() {
-        state.clients.disconnect(*endpoint_id, None);
+    state.enrollment_revoked.store(true, Ordering::Release);
+    let path = state.enrollment_revoked_path.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || scale_core::atomic_write(path.as_path(), b"revoked\n"))
+        .await
+        .context("join Relay revocation marker writer")
+        .and_then(|result| result)
+    {
+        warn!(%error, "cannot persist Relay enrollment revocation");
     }
+    state.clients.shutdown().await;
 }
 
 fn load_profile(state_dir: &Path) -> Result<ControlProfile> {
@@ -845,93 +981,122 @@ mod tests {
         server.shutdown().await.unwrap();
     }
 
+    fn credential_token(control: &SecretKey, endpoint_id: EndpointId, generation: u64, expires_at: i64) -> String {
+        SignedRelayCredential::sign(
+            relay_api::RelayCredential {
+                protocol_version: RELAY_PROTOCOL_VERSION,
+                audience: "test".into(),
+                control_id: control.public().to_string(),
+                endpoint_id: endpoint_id.to_string(),
+                kind: relay_api::RelaySubjectKind::Edge,
+                generation,
+                issued_at: 100,
+                expires_at,
+            },
+            control,
+        )
+        .unwrap()
+        .encode()
+        .unwrap()
+    }
+
     #[test]
-    fn validation_requires_unique_members() {
-        let client = iroh_base::SecretKey::generate().public();
-        let edge = iroh_base::SecretKey::generate().public();
-        let mut snapshot = MembershipSnapshot {
-            protocol_version: RELAY_PROTOCOL_VERSION,
-            audience: "test".into(),
-            version: 1,
-            issued_at: unix_timestamp(),
-            members: vec![relay_api::RelayMember {
-                name: "edge".into(),
-                endpoint_id: edge.to_string(),
-            }],
-        };
-        assert!(validate_snapshot(&snapshot, "test").is_ok());
-        snapshot.members.push(relay_api::RelayMember {
-            name: "client".into(),
-            endpoint_id: client.to_string(),
-        });
-        assert!(validate_snapshot(&snapshot, "test").is_ok());
-        snapshot.members.push(relay_api::RelayMember {
-            name: "duplicate".into(),
-            endpoint_id: edge.to_string(),
-        });
-        assert!(validate_snapshot(&snapshot, "test").is_err());
+    fn credentials_are_endpoint_bound_and_revocable() {
+        let control = SecretKey::generate();
+        let endpoint = SecretKey::generate().public();
+        let other = SecretKey::generate().public();
+        let token = credential_token(&control, endpoint, 3, 1_000);
+
+        validate_credential(Some(&token), endpoint, control.public(), "test", &HashMap::new(), 200).unwrap();
+        assert!(validate_credential(Some(&token), other, control.public(), "test", &HashMap::new(), 200,).is_err());
+        assert!(
+            validate_credential(
+                Some(&token),
+                endpoint,
+                control.public(),
+                "test",
+                &HashMap::from([(endpoint, (3, 1_000))]),
+                200,
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
     async fn signed_updates_are_monotonic_and_durable() {
         let control_key = iroh_base::SecretKey::generate();
         let control_id = control_key.public();
-        let client_id = iroh_base::SecretKey::generate().public();
-        let initial = MembershipSnapshot {
+        let initial = RevocationUpdate {
             protocol_version: RELAY_PROTOCOL_VERSION,
             audience: "test".into(),
             version: 0,
             issued_at: unix_timestamp(),
-            members: vec![relay_api::RelayMember {
-                name: "client".into(),
-                endpoint_id: client_id.to_string(),
-            }],
+            revocations: vec![],
         };
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("membership.json");
-        persist_snapshot(&path, &initial).await.unwrap();
-        let allowed = Arc::new(ArcSwap::from_pointee(validate_snapshot(&initial, "test").unwrap()));
+        let path = dir.path().join("revocations.json");
+        persist_revocation_state(&path, &initial).await.unwrap();
+        let revoked = Arc::new(ArcSwap::from_pointee(HashMap::new()));
         let state = AdminState {
             audience: Arc::from("test"),
             authority_id: control_id,
             state_path: Arc::new(path.clone()),
             current: Arc::new(Mutex::new(initial)),
-            allowed,
+            revoked,
             clients: Clients::default(),
+            enrollment_revoked: Arc::new(AtomicBool::new(false)),
+            enrollment_revoked_path: Arc::new(dir.path().join("enrollment-revoked")),
         };
         let edge_id = iroh_base::SecretKey::generate().public();
-        let next = MembershipSnapshot {
+        let next = RevocationUpdate {
             protocol_version: RELAY_PROTOCOL_VERSION,
             audience: "test".into(),
             version: 1,
             issued_at: unix_timestamp(),
-            members: vec![
-                relay_api::RelayMember {
-                    name: "client".into(),
-                    endpoint_id: client_id.to_string(),
-                },
-                relay_api::RelayMember {
-                    name: "edge".into(),
-                    endpoint_id: edge_id.to_string(),
-                },
-            ],
+            revocations: vec![relay_api::Revocation {
+                endpoint_id: edge_id.to_string(),
+                revoked_through_generation: 4,
+                expires_at: unix_timestamp() + 60,
+                revision: 1,
+            }],
         };
-        let signed = SignedSnapshot::sign(next.clone(), &control_key).unwrap();
-        let applied = update_snapshot(State(state.clone()), Json(signed.clone()))
+        let signed = SignedRevocationUpdate::sign(next.clone(), &control_key).unwrap();
+        let applied = apply_revocation_update(State(state.clone()), Json(signed.clone()))
             .await
             .unwrap();
         assert_eq!(applied.0.version, 1);
-        assert!(state.allowed.load().contains(&edge_id));
-        let persisted: MembershipSnapshot = serde_json::from_slice(&tokio::fs::read(path).await.unwrap()).unwrap();
+        assert_eq!(state.revoked.load().get(&edge_id).map(|value| value.0), Some(4));
+        let persisted: RevocationUpdate = serde_json::from_slice(&tokio::fs::read(path).await.unwrap()).unwrap();
         assert_eq!(persisted, next);
 
-        // Exact retries are idempotent, but a different payload at the same
-        // version cannot overwrite durable state.
-        let _ = update_snapshot(State(state.clone()), Json(signed)).await.unwrap();
+        let _ = apply_revocation_update(State(state.clone()), Json(signed))
+            .await
+            .unwrap();
         let mut conflicting = next;
-        conflicting.members.pop();
-        let conflict = SignedSnapshot::sign(conflicting, &control_key).unwrap();
-        let error = update_snapshot(State(state), Json(conflict)).await.unwrap_err();
+        conflicting.revocations[0].revoked_through_generation = 5;
+        let conflict = SignedRevocationUpdate::sign(conflicting, &control_key).unwrap();
+        let error = apply_revocation_update(State(state.clone()), Json(conflict))
+            .await
+            .unwrap_err();
         assert_eq!(error.status, StatusCode::CONFLICT);
+
+        let other_id = SecretKey::generate().public();
+        let delta = RevocationUpdate {
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            audience: "test".into(),
+            version: 2,
+            issued_at: unix_timestamp(),
+            revocations: vec![relay_api::Revocation {
+                endpoint_id: other_id.to_string(),
+                revoked_through_generation: 1,
+                expires_at: unix_timestamp() + 60,
+                revision: 2,
+            }],
+        };
+        let signed = SignedRevocationUpdate::sign(delta, &control_key).unwrap();
+        let _ = apply_revocation_update(State(state.clone()), Json(signed))
+            .await
+            .unwrap();
+        assert_eq!(state.current.lock().await.revocations.len(), 2);
     }
 }

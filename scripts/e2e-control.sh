@@ -87,7 +87,12 @@ client_b_join=$("${control[@]}" client invite client-b)
 AGENT_SCALE_HOME="$work/client-b" target/debug/agent-scale control join "$client_b_join" >/dev/null
 "${control[@]}" edge transfer client-a/box client-b
 
-output=$(AGENT_SCALE_HOME="$work/client-b" target/debug/agent-scale -e box exec -- sh -c 'printf transferred')
+output=
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  if output=$(AGENT_SCALE_HOME="$work/client-b" target/debug/agent-scale -e box exec -- sh -c 'printf transferred' 2>/dev/null) \
+      && [[ "$output" == "transferred" ]]; then break; fi
+  sleep 0.25
+done
 [[ "$output" == "transferred" ]]
 AGENT_SCALE_HOME="$work/client-b" target/debug/agent-scale -e box mcp ls | grep -q '^echo:'
 
@@ -120,13 +125,6 @@ new_edge_id=$("${control[@]}" edge ls | awk '/endpoint_id:/ { print $2; exit }')
 AGENT_SCALE_HOME="$work/client-b" target/debug/agent-scale edge rm box
 "${control[@]}" client rm client-b
 "${control[@]}" client rm client-a
-
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-  members=$(curl -fsS "http://127.0.0.1:$relay_admin_port/v1/status")
-  if [[ "$members" == *'"members":0'* ]]; then break; fi
-  sleep 0.1
-done
-[[ "$members" == *'"members":0'* ]]
 
 status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$control_url/v1/admin/overview")
 [[ "$status" == "404" ]]

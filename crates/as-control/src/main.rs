@@ -34,16 +34,21 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose,
 };
-use relay_api::{MembershipSnapshot, RELAY_PROTOCOL_VERSION, RelayMember, SignedSnapshot};
+use relay_api::{
+    RELAY_PROTOCOL_VERSION, RelayCredential, RelaySubjectKind, Revocation, RevocationUpdate, SignedRelayCredential,
+    SignedRevocationUpdate,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
-const STATE_SCHEMA: u32 = 5;
+const STATE_SCHEMA: u32 = 6;
 const CLOCK_SKEW_SECS: i64 = 300;
 const DEFAULT_TTL_SECS: u64 = 15 * 60;
+const RELAY_CREDENTIAL_LIFETIME_SECS: i64 = 30 * 24 * 60 * 60;
+const RELAY_CREDENTIAL_RENEW_BEFORE_SECS: i64 = 7 * 24 * 60 * 60;
 
 #[derive(Parser)]
 #[command(
@@ -214,6 +219,9 @@ struct ClientRecord {
     name: String,
     endpoint_id: String,
     managed_by: Option<String>,
+    credential_generation: u64,
+    credential_issued_at: i64,
+    credential_expires_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +229,9 @@ struct EdgeRecord {
     name: String,
     endpoint_id: String,
     owner_id: String,
+    credential_generation: u64,
+    credential_issued_at: i64,
+    credential_expires_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -229,6 +240,14 @@ struct RelayRecord {
     endpoint_id: String,
     url: String,
     qad_port: Option<u16>,
+}
+
+#[derive(Debug, Clone)]
+struct RevocationRecord {
+    endpoint_id: String,
+    revoked_through_generation: u64,
+    expires_at: i64,
+    revision: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -269,11 +288,13 @@ struct ControlState {
     public_url: String,
     relay_ca_der: Vec<u8>,
     revision: u64,
+    relay_revision: u64,
     clients: Vec<ClientRecord>,
     edges: Vec<EdgeRecord>,
     relays: Vec<RelayRecord>,
     invites: Vec<InviteRecord>,
     provisioners: Vec<ProvisionerRecord>,
+    revocations: Vec<RevocationRecord>,
 }
 
 struct Store {
@@ -282,6 +303,7 @@ struct Store {
     relay_ca: Issuer<'static, KeyPair>,
     state: Mutex<ControlState>,
     changed: Notify,
+    relay_changed: Notify,
     _lock: scale_core::FileLock,
 }
 
@@ -426,11 +448,13 @@ fn init(dir: PathBuf, public_url: String, audience: String) -> Result<()> {
         public_url,
         relay_ca_der,
         revision: 0,
+        relay_revision: 1,
         clients: vec![],
         edges: vec![],
         relays: vec![],
         invites: vec![],
         provisioners: vec![],
+        revocations: vec![],
     };
     db::Database::create(&database_path(&dir), &state)?;
     println!("initialized control {}", key.public());
@@ -494,11 +518,13 @@ fn bootstrap(
             public_url: public_url.clone(),
             relay_ca_der,
             revision: 0,
+            relay_revision: 1,
             clients: vec![],
             edges: vec![],
             relays: vec![],
             invites: vec![],
             provisioners: vec![],
+            revocations: vec![],
         };
         let database = db::Database::create(&database_path(&dir), &state)?;
         (key, database, state)
@@ -592,7 +618,9 @@ async fn run(dir: PathBuf, bind: SocketAddr, admin_socket: PathBuf) -> Result<()
         "unsupported state schema {}",
         state.schema
     );
-    cleanup_invitations(&mut state, unix_timestamp());
+    let now = unix_timestamp();
+    cleanup_invitations(&mut state, now);
+    cleanup_revocations(&mut state, now);
     database.replace_sync(&state)?;
     let store = Arc::new(Store {
         database,
@@ -600,6 +628,7 @@ async fn run(dir: PathBuf, bind: SocketAddr, admin_socket: PathBuf) -> Result<()
         relay_ca,
         state: Mutex::new(state),
         changed: Notify::new(),
+        relay_changed: Notify::new(),
         _lock: lock,
     });
     let app = public_router(store.clone());
@@ -702,7 +731,19 @@ async fn claim(
     let mut next = state.clone();
     let invite = next.invites[index].invite.clone();
     let managed_by = next.invites[index].managed_by.clone();
-    add_claimed_node(&mut next, &invite, endpoint_id, managed_by.as_deref(), relay_qad_port)?;
+    let credential_generation = next
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| ApiError::internal("revision overflow"))?;
+    add_claimed_node(
+        &mut next,
+        &invite,
+        endpoint_id,
+        managed_by.as_deref(),
+        relay_qad_port,
+        credential_generation,
+        now,
+    )?;
     next.invites[index].state = InviteState::Claimed;
     next.invites[index].claimed_by = Some(endpoint_id.to_string());
     next.invites[index].terminal_at = Some(now);
@@ -849,6 +890,11 @@ async fn client_edge_remove(
         return Err(ApiError::forbidden("client is not registered"));
     }
     let mut next = state.clone();
+    let removed = next
+        .edges
+        .iter()
+        .find(|edge| edge.owner_id == client_id && edge.name == request.name && edge.endpoint_id == request.endpoint_id)
+        .cloned();
     let before = next.edges.len();
     next.edges.retain(|edge| {
         !(edge.owner_id == client_id && edge.name == request.name && edge.endpoint_id == request.endpoint_id)
@@ -859,7 +905,14 @@ async fn client_edge_remove(
             request.name
         )));
     }
-    commit_candidate(&store, &mut state, next).await?;
+    let removed = removed.expect("the length check proves an Edge was removed");
+    add_revocation(
+        &mut next,
+        &removed.endpoint_id,
+        removed.credential_generation,
+        removed.credential_expires_at,
+    );
+    commit_revocation_candidate(&store, &mut state, next).await?;
     let map = signed_map(&state, &store.key, client_endpoint).map_err(ApiError::internal)?;
     Ok(Json(map))
 }
@@ -986,23 +1039,36 @@ async fn dispatch_provisioner_mutation(
             check_expected_revision(state, request.expected_revision)?;
             let mut next = state.clone();
             next.clients.retain(|item| item.endpoint_id != client.endpoint_id);
-            commit_candidate(store, state, next).await?;
+            add_revocation(
+                &mut next,
+                &client.endpoint_id,
+                client.credential_generation,
+                client.credential_expires_at,
+            );
+            commit_revocation_candidate(store, state, next).await?;
             provisioner_ok(state)
         }
         ProvisionerAction::RemoveEdge { owner, name } => {
             let owner_id = managed_client_id(state, owner, provisioner_id)?;
-            let exists = state
+            let edge = state
                 .edges
                 .iter()
-                .any(|item| item.owner_id == owner_id && item.name == *name);
-            if !exists {
+                .find(|item| item.owner_id == owner_id && item.name == *name)
+                .cloned();
+            let Some(edge) = edge else {
                 return provisioner_ok(state);
-            }
+            };
             check_expected_revision(state, request.expected_revision)?;
             let mut next = state.clone();
             next.edges
                 .retain(|item| !(item.owner_id == owner_id && item.name == *name));
-            commit_candidate(store, state, next).await?;
+            add_revocation(
+                &mut next,
+                &edge.endpoint_id,
+                edge.credential_generation,
+                edge.credential_expires_at,
+            );
+            commit_revocation_candidate(store, state, next).await?;
             provisioner_ok(state)
         }
         ProvisionerAction::TransferEdge {
@@ -1163,7 +1229,9 @@ async fn watch(
 ) -> Result<Json<SignedNodeMap>, ApiError> {
     let endpoint_id = request.verify().map_err(ApiError::unauthorized)?;
     check_time(request.issued_at, unix_timestamp()).map_err(ApiError::unauthorized)?;
-    wait_for_revision(&store, endpoint_id, request.known_revision, false).await?;
+    if !renew_relay_credential_if_needed(&store, endpoint_id).await? {
+        wait_for_revision(&store, endpoint_id, request.known_revision).await?;
+    }
     let state = store.state.lock().await;
     Ok(Json(
         signed_map(&state, &store.key, endpoint_id).map_err(ApiError::internal)?,
@@ -1173,7 +1241,7 @@ async fn watch(
 async fn relay_watch(
     State(AppState(store)): State<AppState>,
     Json(request): Json<WatchRequest>,
-) -> Result<Json<SignedSnapshot>, ApiError> {
+) -> Result<Json<SignedRevocationUpdate>, ApiError> {
     let endpoint_id = request.verify().map_err(ApiError::unauthorized)?;
     check_time(request.issued_at, unix_timestamp()).map_err(ApiError::unauthorized)?;
     validate_qad_port(request.relay_qad_port).map_err(ApiError::bad)?;
@@ -1190,51 +1258,94 @@ async fn relay_watch(
             commit_candidate(&store, &mut state, next).await?;
         }
     }
-    wait_for_revision(&store, endpoint_id, request.known_revision, true).await?;
+    wait_for_relay_revision(&store, endpoint_id, request.known_revision).await?;
     let state = store.state.lock().await;
     anyhow_relay_exists(&state, endpoint_id)?;
-    let mut members = Vec::with_capacity(state.clients.len() + state.edges.len());
-    members.extend(state.clients.iter().map(|client| RelayMember {
-        name: format!("client/{}", client.name),
-        endpoint_id: client.endpoint_id.clone(),
-    }));
-    members.extend(state.edges.iter().map(|edge| RelayMember {
-        name: format!(
-            "edge/{}/{}",
-            client_name(&state, &edge.owner_id).unwrap_or("unknown"),
-            edge.name
-        ),
-        endpoint_id: edge.endpoint_id.clone(),
-    }));
-    members.sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
-    let snapshot = MembershipSnapshot {
+    let now = unix_timestamp();
+    let update = RevocationUpdate {
         protocol_version: RELAY_PROTOCOL_VERSION,
         audience: state.audience.clone(),
-        version: state.revision,
-        issued_at: unix_timestamp(),
-        members,
+        version: state.relay_revision,
+        issued_at: now,
+        revocations: state
+            .revocations
+            .iter()
+            .filter(|revocation| revocation.revision > request.known_revision)
+            .map(|revocation| Revocation {
+                endpoint_id: revocation.endpoint_id.clone(),
+                revoked_through_generation: revocation.revoked_through_generation,
+                expires_at: revocation.expires_at,
+                revision: revocation.revision,
+            })
+            .collect(),
     };
     Ok(Json(
-        SignedSnapshot::sign(snapshot, &store.key).map_err(ApiError::internal)?,
+        SignedRevocationUpdate::sign(update, &store.key).map_err(ApiError::internal)?,
     ))
 }
 
-async fn wait_for_revision(
-    store: &Arc<Store>,
-    endpoint_id: EndpointId,
-    known: u64,
-    relay: bool,
-) -> Result<(), ApiError> {
+async fn renew_relay_credential_if_needed(store: &Arc<Store>, endpoint_id: EndpointId) -> Result<bool, ApiError> {
+    let now = unix_timestamp();
+    let renew_at = now.saturating_add(RELAY_CREDENTIAL_RENEW_BEFORE_SECS);
+    let endpoint = endpoint_id.to_string();
+    let mut state = store.state.lock().await;
+    let expires_at = state
+        .clients
+        .iter()
+        .find(|record| record.endpoint_id == endpoint)
+        .map(|record| record.credential_expires_at)
+        .or_else(|| {
+            state
+                .edges
+                .iter()
+                .find(|record| record.endpoint_id == endpoint)
+                .map(|record| record.credential_expires_at)
+        });
+    let Some(expires_at) = expires_at else {
+        anyhow_node_exists(&state, endpoint_id)?;
+        return Ok(false);
+    };
+    if expires_at > renew_at {
+        return Ok(false);
+    }
+    let mut next = state.clone();
+    if let Some(record) = next.clients.iter_mut().find(|record| record.endpoint_id == endpoint) {
+        record.credential_issued_at = now;
+        record.credential_expires_at = now.saturating_add(RELAY_CREDENTIAL_LIFETIME_SECS);
+    } else if let Some(record) = next.edges.iter_mut().find(|record| record.endpoint_id == endpoint) {
+        record.credential_issued_at = now;
+        record.credential_expires_at = now.saturating_add(RELAY_CREDENTIAL_LIFETIME_SECS);
+    }
+    persist_candidate(store, &mut state, next, false).await?;
+    Ok(true)
+}
+
+async fn wait_for_revision(store: &Arc<Store>, endpoint_id: EndpointId, known: u64) -> Result<(), ApiError> {
     loop {
         let notified = store.changed.notified();
         {
             let state = store.state.lock().await;
-            if relay {
-                anyhow_relay_exists(&state, endpoint_id)?;
-            } else {
-                anyhow_node_exists(&state, endpoint_id)?;
-            }
+            anyhow_node_exists(&state, endpoint_id)?;
             if state.revision > known {
+                return Ok(());
+            }
+        }
+        if tokio::time::timeout(Duration::from_secs(30), notified).await.is_err() {
+            return Ok(());
+        }
+    }
+}
+
+async fn wait_for_relay_revision(store: &Arc<Store>, endpoint_id: EndpointId, known: u64) -> Result<(), ApiError> {
+    loop {
+        let notified = store.relay_changed.notified();
+        {
+            let state = store.state.lock().await;
+            anyhow_relay_exists(&state, endpoint_id)?;
+            if known > state.relay_revision {
+                return Err(ApiError::bad("Relay revision is ahead of Control"));
+            }
+            if state.relay_revision > known {
                 return Ok(());
             }
         }
@@ -1397,7 +1508,13 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
             }
             let mut next = state.clone();
             next.clients.retain(|item| item.endpoint_id != client.endpoint_id);
-            commit_candidate(store, &mut state, next).await?;
+            add_revocation(
+                &mut next,
+                &client.endpoint_id,
+                client.credential_generation,
+                client.credential_expires_at,
+            );
+            commit_revocation_candidate(store, &mut state, next).await?;
             Ok(LocalAdminResponse::Ok)
         }
         LocalAdminRequest::TransferEdge { edge, new_client } => {
@@ -1427,13 +1544,25 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
             let mut state = store.state.lock().await;
             let owner_id = client_id_by_name(&state, owner_name)?;
             let mut next = state.clone();
+            let removed = next
+                .edges
+                .iter()
+                .find(|item| item.owner_id == owner_id && item.name == edge_name)
+                .cloned();
             let before = next.edges.len();
             next.edges
                 .retain(|item| !(item.owner_id == owner_id && item.name == edge_name));
             if next.edges.len() == before {
                 return Err(ApiError::bad(format!("unknown edge '{edge}'")));
             }
-            commit_candidate(store, &mut state, next).await?;
+            let removed = removed.expect("the length check proves an Edge was removed");
+            add_revocation(
+                &mut next,
+                &removed.endpoint_id,
+                removed.credential_generation,
+                removed.credential_expires_at,
+            );
+            commit_revocation_candidate(store, &mut state, next).await?;
             Ok(LocalAdminResponse::Ok)
         }
         LocalAdminRequest::RemoveRelay { name } => {
@@ -1444,7 +1573,7 @@ async fn dispatch_local_admin(store: &Arc<Store>, request: LocalAdminRequest) ->
             if next.relays.len() == before {
                 return Err(ApiError::bad(format!("unknown relay '{name}'")));
             }
-            commit_candidate(store, &mut state, next).await?;
+            commit_revocation_candidate(store, &mut state, next).await?;
             Ok(LocalAdminResponse::Ok)
         }
         LocalAdminRequest::AddProvisioner { name, endpoint_id } => {
@@ -1672,16 +1801,45 @@ async fn commit_candidate(store: &Store, current: &mut ControlState, mut next: C
     persist_candidate(store, current, next, true).await
 }
 
+async fn commit_revocation_candidate(
+    store: &Store,
+    current: &mut ControlState,
+    mut next: ControlState,
+) -> Result<(), ApiError> {
+    next.revision = next
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| ApiError::internal("revision overflow"))?;
+    next.relay_revision = next
+        .relay_revision
+        .checked_add(1)
+        .ok_or_else(|| ApiError::internal("Relay revision overflow"))?;
+    persist_candidate_with_notifications(store, current, next, true, true).await
+}
+
 async fn persist_candidate(
     store: &Store,
     current: &mut ControlState,
     next: ControlState,
     notify: bool,
 ) -> Result<(), ApiError> {
+    persist_candidate_with_notifications(store, current, next, notify, false).await
+}
+
+async fn persist_candidate_with_notifications(
+    store: &Store,
+    current: &mut ControlState,
+    next: ControlState,
+    notify_nodes: bool,
+    notify_relays: bool,
+) -> Result<(), ApiError> {
     store.database.replace(next.clone()).await.map_err(ApiError::internal)?;
     *current = next;
-    if notify {
+    if notify_nodes {
         store.changed.notify_waiters();
+    }
+    if notify_relays {
+        store.relay_changed.notify_waiters();
     }
     Ok(())
 }
@@ -1700,6 +1858,32 @@ fn cleanup_invitations(state: &mut ControlState, now: i64) -> bool {
     state.invites.len() != before
 }
 
+fn cleanup_revocations(state: &mut ControlState, now: i64) -> bool {
+    let before = state.revocations.len();
+    state.revocations.retain(|revocation| revocation.expires_at > now);
+    state.revocations.len() != before
+}
+
+fn add_revocation(state: &mut ControlState, endpoint_id: &str, generation: u64, expires_at: i64) {
+    let revision = state.relay_revision.saturating_add(1);
+    if let Some(existing) = state
+        .revocations
+        .iter_mut()
+        .find(|revocation| revocation.endpoint_id == endpoint_id)
+    {
+        existing.revoked_through_generation = existing.revoked_through_generation.max(generation);
+        existing.expires_at = existing.expires_at.max(expires_at);
+        existing.revision = revision;
+        return;
+    }
+    state.revocations.push(RevocationRecord {
+        endpoint_id: endpoint_id.to_owned(),
+        revoked_through_generation: generation,
+        expires_at,
+        revision,
+    });
+}
+
 async fn invitation_cleanup_loop(store: Arc<Store>) {
     let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
     interval.tick().await;
@@ -1707,10 +1891,13 @@ async fn invitation_cleanup_loop(store: Arc<Store>) {
         interval.tick().await;
         let mut current = store.state.lock().await;
         let mut next = current.clone();
-        if cleanup_invitations(&mut next, unix_timestamp())
+        let now = unix_timestamp();
+        let invitations_changed = cleanup_invitations(&mut next, now);
+        let revocations_changed = cleanup_revocations(&mut next, now);
+        if (invitations_changed || revocations_changed)
             && let Err(error) = persist_candidate(&store, &mut current, next, false).await
         {
-            tracing::warn!(message = %error.message, "invitation cleanup failed");
+            tracing::warn!(message = %error.message, "Control state cleanup failed");
         }
     }
 }
@@ -1721,6 +1908,8 @@ fn add_claimed_node(
     endpoint_id: EndpointId,
     managed_by: Option<&str>,
     relay_qad_port: Option<u16>,
+    credential_generation: u64,
+    now: i64,
 ) -> Result<(), ApiError> {
     match &invite.kind {
         InviteKind::Client => {
@@ -1735,6 +1924,9 @@ fn add_claimed_node(
                 name: invite.name.clone(),
                 endpoint_id: endpoint_id.to_string(),
                 managed_by: managed_by.map(ToOwned::to_owned),
+                credential_generation,
+                credential_issued_at: now,
+                credential_expires_at: now.saturating_add(RELAY_CREDENTIAL_LIFETIME_SECS),
             });
         }
         InviteKind::Edge { owner_id } => {
@@ -1748,6 +1940,9 @@ fn add_claimed_node(
                 name: invite.name.clone(),
                 endpoint_id: endpoint_id.to_string(),
                 owner_id: owner_id.clone(),
+                credential_generation,
+                credential_issued_at: now,
+                credential_expires_at: now.saturating_add(RELAY_CREDENTIAL_LIFETIME_SECS),
             });
         }
         InviteKind::Relay { url } => {
@@ -1780,13 +1975,25 @@ fn signed_map(state: &ControlState, key: &SecretKey, recipient: EndpointId) -> R
             qad_port: relay.qad_port,
         })
         .collect();
-    let (allowed_clients, edges) =
+    let (relay_credential, allowed_clients, edges) =
         if let Some(edge) = state.edges.iter().find(|edge| edge.endpoint_id == recipient_string) {
-            (vec![edge.owner_id.clone()], vec![])
-        } else if state
+            (
+                Some(sign_relay_credential(
+                    state,
+                    key,
+                    recipient,
+                    RelaySubjectKind::Edge,
+                    edge.credential_generation,
+                    edge.credential_issued_at,
+                    edge.credential_expires_at,
+                )?),
+                vec![edge.owner_id.clone()],
+                vec![],
+            )
+        } else if let Some(client) = state
             .clients
             .iter()
-            .any(|client| client.endpoint_id == recipient_string)
+            .find(|client| client.endpoint_id == recipient_string)
         {
             let edges = state
                 .edges
@@ -1799,9 +2006,21 @@ fn signed_map(state: &ControlState, key: &SecretKey, recipient: EndpointId) -> R
                     owner_name: client_name(state, &edge.owner_id).unwrap_or("unknown").to_string(),
                 })
                 .collect();
-            (vec![], edges)
+            (
+                Some(sign_relay_credential(
+                    state,
+                    key,
+                    recipient,
+                    RelaySubjectKind::Client,
+                    client.credential_generation,
+                    client.credential_issued_at,
+                    client.credential_expires_at,
+                )?),
+                vec![],
+                edges,
+            )
         } else if state.relays.iter().any(|relay| relay.endpoint_id == recipient_string) {
-            (vec![], vec![])
+            (None, vec![], vec![])
         } else {
             anyhow::bail!("node is not registered")
         };
@@ -1815,12 +2034,38 @@ fn signed_map(state: &ControlState, key: &SecretKey, recipient: EndpointId) -> R
             issued_at: unix_timestamp(),
             recipient_id: recipient_string,
             relays,
+            relay_credential,
             relay_ca_der: state.relay_ca_der.clone(),
             allowed_clients,
             edges,
         },
         key,
     )
+}
+
+fn sign_relay_credential(
+    state: &ControlState,
+    key: &SecretKey,
+    endpoint_id: EndpointId,
+    kind: RelaySubjectKind,
+    generation: u64,
+    issued_at: i64,
+    expires_at: i64,
+) -> Result<String> {
+    SignedRelayCredential::sign(
+        RelayCredential {
+            protocol_version: RELAY_PROTOCOL_VERSION,
+            audience: state.audience.clone(),
+            control_id: key.public().to_string(),
+            endpoint_id: endpoint_id.to_string(),
+            kind,
+            generation,
+            issued_at,
+            expires_at,
+        },
+        key,
+    )?
+    .encode()
 }
 
 fn create_invite(
@@ -2323,26 +2568,37 @@ mod tests {
             public_url: "http://127.0.0.1:1".into(),
             relay_ca_der: vec![1, 2, 3],
             revision: 3,
+            relay_revision: 1,
             clients: vec![
                 ClientRecord {
                     name: "a".into(),
                     endpoint_id: a.public().to_string(),
                     managed_by: None,
+                    credential_generation: 1,
+                    credential_issued_at: 0,
+                    credential_expires_at: i64::MAX,
                 },
                 ClientRecord {
                     name: "b".into(),
                     endpoint_id: b.public().to_string(),
                     managed_by: None,
+                    credential_generation: 1,
+                    credential_issued_at: 0,
+                    credential_expires_at: i64::MAX,
                 },
             ],
             edges: vec![EdgeRecord {
                 name: "box".into(),
                 endpoint_id: edge.public().to_string(),
                 owner_id: b.public().to_string(),
+                credential_generation: 1,
+                credential_issued_at: 0,
+                credential_expires_at: i64::MAX,
             }],
             relays: vec![],
             invites: vec![],
             provisioners: vec![],
+            revocations: vec![],
         };
         let edge_map = signed_map(&state, &key, edge.public()).unwrap();
         assert_eq!(edge_map.map.allowed_clients, vec![b.public().to_string()]);
@@ -2362,11 +2618,17 @@ mod tests {
                 name: "duplicate".into(),
                 endpoint_id: key.public().to_string(),
                 managed_by: None,
+                credential_generation: 1,
+                credential_issued_at: 0,
+                credential_expires_at: i64::MAX,
             },
             ClientRecord {
                 name: "duplicate".into(),
                 endpoint_id: SecretKey::generate().public().to_string(),
                 managed_by: None,
+                credential_generation: 1,
+                credential_issued_at: 0,
+                credential_expires_at: i64::MAX,
             },
         ];
         let store = Store {
@@ -2375,6 +2637,7 @@ mod tests {
             relay_ca: load_relay_ca(dir.path()).unwrap().1,
             state: Mutex::new(current.clone()),
             changed: Notify::new(),
+            relay_changed: Notify::new(),
             _lock: lock,
         };
 
@@ -2392,6 +2655,9 @@ mod tests {
             name: "main".into(),
             endpoint_id: client.public().to_string(),
             managed_by: None,
+            credential_generation: 1,
+            credential_issued_at: 0,
+            credential_expires_at: i64::MAX,
         });
         database.replace_sync(&state).unwrap();
         let store = Arc::new(Store {
@@ -2400,6 +2666,7 @@ mod tests {
             relay_ca: load_relay_ca(dir.path()).unwrap().1,
             state: Mutex::new(state),
             changed: Notify::new(),
+            relay_changed: Notify::new(),
             _lock: lock,
         });
 
@@ -2459,17 +2726,26 @@ mod tests {
                 name: "main".into(),
                 endpoint_id: client.public().to_string(),
                 managed_by: None,
+                credential_generation: 1,
+                credential_issued_at: 0,
+                credential_expires_at: i64::MAX,
             },
             ClientRecord {
                 name: "other".into(),
                 endpoint_id: other_client.public().to_string(),
                 managed_by: None,
+                credential_generation: 1,
+                credential_issued_at: 0,
+                credential_expires_at: i64::MAX,
             },
         ];
         state.edges.push(EdgeRecord {
             name: "box".into(),
             endpoint_id: edge.public().to_string(),
             owner_id: client.public().to_string(),
+            credential_generation: 1,
+            credential_issued_at: 0,
+            credential_expires_at: i64::MAX,
         });
         database.replace_sync(&state).unwrap();
         let revision = state.revision;
@@ -2479,6 +2755,7 @@ mod tests {
             relay_ca: load_relay_ca(dir.path()).unwrap().1,
             state: Mutex::new(state),
             changed: Notify::new(),
+            relay_changed: Notify::new(),
             _lock: lock,
         });
 
@@ -2539,11 +2816,17 @@ mod tests {
                 name: "job-a".into(),
                 endpoint_id: client.public().to_string(),
                 managed_by: Some(provisioner.public().to_string()),
+                credential_generation: 1,
+                credential_issued_at: 0,
+                credential_expires_at: i64::MAX,
             },
             ClientRecord {
                 name: "job-b".into(),
                 endpoint_id: other_client.public().to_string(),
                 managed_by: Some(other_provisioner.public().to_string()),
+                credential_generation: 1,
+                credential_issued_at: 0,
+                credential_expires_at: i64::MAX,
             },
         ];
         database.replace_sync(&state).unwrap();
@@ -2553,6 +2836,7 @@ mod tests {
             relay_ca: load_relay_ca(dir.path()).unwrap().1,
             state: Mutex::new(state),
             changed: Notify::new(),
+            relay_changed: Notify::new(),
             _lock: lock,
         });
 
@@ -2665,6 +2949,7 @@ mod tests {
             relay_ca: load_relay_ca(dir.path()).unwrap().1,
             state: Mutex::new(state),
             changed: Notify::new(),
+            relay_changed: Notify::new(),
             _lock: lock,
         });
 
@@ -2735,11 +3020,13 @@ mod tests {
             public_url: "http://127.0.0.1:1".into(),
             relay_ca_der: vec![1, 2, 3],
             revision: 1,
+            relay_revision: 1,
             clients: vec![],
             edges: vec![],
             relays: vec![],
             invites: vec![],
             provisioners: vec![],
+            revocations: vec![],
         };
         create_invite(&key, &mut state, "job".into(), InviteKind::Client, 1).unwrap();
         state.invites[0].invite.expires_at = unix_timestamp() - 1;
@@ -2756,11 +3043,13 @@ mod tests {
             public_url: "http://127.0.0.1:1".into(),
             relay_ca_der: vec![1, 2, 3],
             revision: 9,
+            relay_revision: 1,
             clients: vec![],
             edges: vec![],
             relays: vec![],
             invites: vec![],
             provisioners: vec![],
+            revocations: vec![],
         };
         for name in ["recent-expired", "old-expired", "recent-claimed", "old-revoked"] {
             create_invite(&key, &mut state, name.into(), InviteKind::Client, 60).unwrap();
@@ -2800,6 +3089,7 @@ mod tests {
             relay_ca: load_relay_ca(dir.path()).unwrap().1,
             state: Mutex::new(state),
             changed: Notify::new(),
+            relay_changed: Notify::new(),
             _lock: lock,
         });
         let invite = ProvisionerRequest::sign(
@@ -2828,6 +3118,7 @@ mod tests {
             relay_ca: load_relay_ca(dir.path()).unwrap().1,
             state: Mutex::new(state),
             changed: Notify::new(),
+            relay_changed: Notify::new(),
             _lock: lock,
         });
         let topology = ProvisionerRequest::sign(

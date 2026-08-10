@@ -229,11 +229,11 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8(signed.body).unwrap(),
-            r#"{"protocol_version":4,"audience":"prod","request_id":"request-1","issued_at":1700000000,"expected_revision":7,"action":{"action":"remove_client","name":"job-1"}}"#
+            r#"{"protocol_version":5,"audience":"prod","request_id":"request-1","issued_at":1700000000,"expected_revision":7,"action":{"action":"remove_client","name":"job-1"}}"#
         );
         assert_eq!(
             signed.authorization,
-            "AgentScale-Ed25519 ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c:7feb27e70f4a4569db5c8f299b6056eb3d84bc74d0897fe498996e0a6119b4b05af57a820eeb4236de88cb16a077ad2fdc0d155baa0cda0513484ae4ce07e90f"
+            "AgentScale-Ed25519 ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c:24274f4ebc682d361d4abad5689cf83bc824e0774c6664514d8b86ac169dd4fe1f65a14065318e8f7d20cecdc6a4af63ec2828458c9b67f92ef035bdb78acd04"
         );
     }
 }

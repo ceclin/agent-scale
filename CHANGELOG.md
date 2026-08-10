@@ -17,6 +17,9 @@ The project uses semantic versioning after its first public release. Before
   distributes its dedicated CA through the signed topology.
 - Allowed enrolled Clients to remove their own Control-managed Edges through
   signed, identity-bound requests.
+- Replaced replicated Relay membership lists with EndpointId-bound admission
+  credentials and a compact incremental revocation stream. New nodes can use any
+  available Relay immediately, while removals still disconnect live sessions.
 
 ## 0.5.0 - 2026-08-07
 

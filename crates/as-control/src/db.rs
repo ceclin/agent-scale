@@ -9,8 +9,8 @@ use control_api::{Invite, InviteKind};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::{
-    ClientRecord, ControlState, EdgeRecord, InviteRecord, InviteState, ProvisionerRecord, RelayRecord, STATE_SCHEMA,
-    unix_timestamp,
+    ClientRecord, ControlState, EdgeRecord, InviteRecord, InviteState, ProvisionerRecord,
+    RELAY_CREDENTIAL_LIFETIME_SECS, RelayRecord, RevocationRecord, STATE_SCHEMA, unix_timestamp,
 };
 
 const MIGRATION_1: &str = include_str!("schema.sql");
@@ -86,15 +86,75 @@ impl Database {
                 [unix_timestamp()],
             )?;
         }
+        let applied: bool = transaction
+            .query_row("SELECT 1 FROM migrations WHERE version = 3", [], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        if !applied {
+            let now = unix_timestamp();
+            let expires_at = now.saturating_add(RELAY_CREDENTIAL_LIFETIME_SECS);
+            if !has_column(&transaction, "metadata", "relay_revision")? {
+                transaction.execute(
+                    "ALTER TABLE metadata ADD COLUMN relay_revision INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )?;
+            }
+            if !has_column(&transaction, "clients", "credential_generation")? {
+                transaction.execute(
+                    "ALTER TABLE clients ADD COLUMN credential_generation INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )?;
+                transaction.execute(
+                    "ALTER TABLE clients ADD COLUMN credential_issued_at INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+                transaction.execute(
+                    "ALTER TABLE clients ADD COLUMN credential_expires_at INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )?;
+                transaction.execute(
+                    "UPDATE clients SET credential_generation = max(1, (SELECT revision FROM metadata WHERE id = 1)), credential_issued_at = ?1, credential_expires_at = ?2",
+                    params![now, expires_at],
+                )?;
+            }
+            if !has_column(&transaction, "edges", "credential_generation")? {
+                transaction.execute(
+                    "ALTER TABLE edges ADD COLUMN credential_generation INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )?;
+                transaction.execute(
+                    "ALTER TABLE edges ADD COLUMN credential_issued_at INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+                transaction.execute(
+                    "ALTER TABLE edges ADD COLUMN credential_expires_at INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )?;
+                transaction.execute(
+                    "UPDATE edges SET credential_generation = max(1, (SELECT revision FROM metadata WHERE id = 1)), credential_issued_at = ?1, credential_expires_at = ?2",
+                    params![now, expires_at],
+                )?;
+            }
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS relay_revocations (
+                    endpoint_id TEXT PRIMARY KEY,
+                    revoked_through_generation INTEGER NOT NULL CHECK (revoked_through_generation > 0),
+                    expires_at INTEGER NOT NULL,
+                    revision INTEGER NOT NULL CHECK (revision > 0)
+                ) STRICT;",
+            )?;
+            transaction.execute("UPDATE metadata SET schema_version = ?1", [STATE_SCHEMA])?;
+            transaction.execute("INSERT INTO migrations(version, applied_at) VALUES (3, ?1)", [now])?;
+        }
         transaction.commit()?;
         Ok(())
     }
 
     pub fn load(&self) -> Result<ControlState> {
         let connection = self.connection.lock().expect("database mutex poisoned");
-        let (schema, audience, public_url, relay_ca_der, revision) = connection
+        let (schema, audience, public_url, relay_ca_der, revision, relay_revision) = connection
             .query_row(
-                "SELECT schema_version, audience, public_url, relay_ca_der, revision FROM metadata WHERE id = 1",
+                "SELECT schema_version, audience, public_url, relay_ca_der, revision, relay_revision FROM metadata WHERE id = 1",
                 [],
                 |row| {
                     Ok((
@@ -103,12 +163,14 @@ impl Database {
                         row.get(2)?,
                         row.get(3)?,
                         row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
                     ))
                 },
             )
             .context("database is not initialized; run `as-control init` to initialize a new network")?;
         anyhow::ensure!(schema == STATE_SCHEMA, "unsupported state schema {schema}");
         let revision = u64::try_from(revision).context("negative control revision")?;
+        let relay_revision = u64::try_from(relay_revision).context("negative Relay revision")?;
 
         let provisioners = query_all(
             &connection,
@@ -122,23 +184,31 @@ impl Database {
         )?;
         let clients = query_all(
             &connection,
-            "SELECT name, endpoint_id, managed_by FROM clients ORDER BY name",
+            "SELECT name, endpoint_id, managed_by, credential_generation, credential_issued_at, credential_expires_at FROM clients ORDER BY name",
             |row| {
                 Ok(ClientRecord {
                     name: row.get(0)?,
                     endpoint_id: row.get(1)?,
                     managed_by: row.get(2)?,
+                    credential_generation: u64::try_from(row.get::<_, i64>(3)?)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, 0))?,
+                    credential_issued_at: row.get(4)?,
+                    credential_expires_at: row.get(5)?,
                 })
             },
         )?;
         let edges = query_all(
             &connection,
-            "SELECT name, endpoint_id, owner_id FROM edges ORDER BY owner_id, name",
+            "SELECT name, endpoint_id, owner_id, credential_generation, credential_issued_at, credential_expires_at FROM edges ORDER BY owner_id, name",
             |row| {
                 Ok(EdgeRecord {
                     name: row.get(0)?,
                     endpoint_id: row.get(1)?,
                     owner_id: row.get(2)?,
+                    credential_generation: u64::try_from(row.get::<_, i64>(3)?)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, 0))?,
+                    credential_issued_at: row.get(4)?,
+                    credential_expires_at: row.get(5)?,
                 })
             },
         )?;
@@ -184,17 +254,33 @@ impl Database {
                 })
             },
         )?;
+        let revocations = query_all(
+            &connection,
+            "SELECT endpoint_id, revoked_through_generation, expires_at, revision FROM relay_revocations ORDER BY endpoint_id",
+            |row| {
+                Ok(RevocationRecord {
+                    endpoint_id: row.get(0)?,
+                    revoked_through_generation: u64::try_from(row.get::<_, i64>(1)?)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, 0))?,
+                    expires_at: row.get(2)?,
+                    revision: u64::try_from(row.get::<_, i64>(3)?)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, 0))?,
+                })
+            },
+        )?;
         Ok(ControlState {
             schema,
             audience,
             public_url,
             relay_ca_der,
             revision,
+            relay_revision,
             clients,
             edges,
             relays,
             invites,
             provisioners,
+            revocations,
         })
     }
 
@@ -212,15 +298,36 @@ impl Database {
                 state.revision
             );
         }
+        let stored_relay_revision: Option<i64> = transaction
+            .query_row("SELECT relay_revision FROM metadata WHERE id = 1", [], |row| row.get(0))
+            .optional()?;
+        if let Some(stored_relay_revision) = stored_relay_revision {
+            let stored_relay_revision =
+                u64::try_from(stored_relay_revision).context("negative stored Relay revision")?;
+            anyhow::ensure!(
+                state.relay_revision == stored_relay_revision
+                    || state.relay_revision == stored_relay_revision.saturating_add(1),
+                "Relay revision must remain unchanged or advance atomically by one"
+            );
+        }
+        anyhow::ensure!(
+            state
+                .revocations
+                .iter()
+                .all(|revocation| revocation.revision <= state.relay_revision),
+            "revocation record is ahead of the Relay revision"
+        );
         transaction.execute("DELETE FROM invitations", [])?;
         transaction.execute("DELETE FROM edges", [])?;
         transaction.execute("DELETE FROM clients", [])?;
         transaction.execute("DELETE FROM relays", [])?;
+        transaction.execute("DELETE FROM relay_revocations", [])?;
         transaction.execute("UPDATE provisioners SET active = 0", [])?;
         let revision = i64::try_from(state.revision).context("control revision exceeds SQLite range")?;
+        let relay_revision = i64::try_from(state.relay_revision).context("Relay revision exceeds SQLite range")?;
         transaction.execute(
-            "INSERT INTO metadata(id, schema_version, audience, public_url, relay_ca_der, revision) VALUES (1, ?1, ?2, ?3, ?4, ?5) ON CONFLICT(id) DO UPDATE SET schema_version=excluded.schema_version, audience=excluded.audience, public_url=excluded.public_url, relay_ca_der=excluded.relay_ca_der, revision=excluded.revision",
-            params![state.schema, state.audience, state.public_url, state.relay_ca_der, revision],
+            "INSERT INTO metadata(id, schema_version, audience, public_url, relay_ca_der, revision, relay_revision) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(id) DO UPDATE SET schema_version=excluded.schema_version, audience=excluded.audience, public_url=excluded.public_url, relay_ca_der=excluded.relay_ca_der, revision=excluded.revision, relay_revision=excluded.relay_revision",
+            params![state.schema, state.audience, state.public_url, state.relay_ca_der, revision, relay_revision],
         )?;
         for item in &state.provisioners {
             transaction.execute(
@@ -229,21 +336,34 @@ impl Database {
             )?;
         }
         for item in &state.clients {
+            let credential_generation = i64::try_from(item.credential_generation)
+                .context("Client credential generation exceeds SQLite range")?;
             transaction.execute(
-                "INSERT INTO clients(endpoint_id, name, managed_by) VALUES (?1, ?2, ?3)",
-                params![item.endpoint_id, item.name, item.managed_by],
+                "INSERT INTO clients(endpoint_id, name, managed_by, credential_generation, credential_issued_at, credential_expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![item.endpoint_id, item.name, item.managed_by, credential_generation, item.credential_issued_at, item.credential_expires_at],
             )?;
         }
         for item in &state.edges {
+            let credential_generation =
+                i64::try_from(item.credential_generation).context("Edge credential generation exceeds SQLite range")?;
             transaction.execute(
-                "INSERT INTO edges(endpoint_id, name, owner_id) VALUES (?1, ?2, ?3)",
-                params![item.endpoint_id, item.name, item.owner_id],
+                "INSERT INTO edges(endpoint_id, name, owner_id, credential_generation, credential_issued_at, credential_expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![item.endpoint_id, item.name, item.owner_id, credential_generation, item.credential_issued_at, item.credential_expires_at],
             )?;
         }
         for item in &state.relays {
             transaction.execute(
                 "INSERT INTO relays(endpoint_id, name, url, qad_port) VALUES (?1, ?2, ?3, ?4)",
                 params![item.endpoint_id, item.name, item.url, item.qad_port],
+            )?;
+        }
+        for item in &state.revocations {
+            let revoked_through_generation = i64::try_from(item.revoked_through_generation)
+                .context("revoked credential generation exceeds SQLite range")?;
+            let revision = i64::try_from(item.revision).context("revocation revision exceeds SQLite range")?;
+            transaction.execute(
+                "INSERT INTO relay_revocations(endpoint_id, revoked_through_generation, expires_at, revision) VALUES (?1, ?2, ?3, ?4)",
+                params![item.endpoint_id, revoked_through_generation, item.expires_at, revision],
             )?;
         }
         for item in &state.invites {
@@ -320,11 +440,13 @@ mod tests {
             public_url: "http://127.0.0.1:3350".into(),
             relay_ca_der: vec![1, 2, 3],
             revision: 0,
+            relay_revision: 1,
             clients: vec![],
             edges: vec![],
             relays: vec![],
             invites: vec![],
             provisioners: vec![],
+            revocations: vec![],
         }
     }
 
@@ -361,6 +483,9 @@ mod tests {
             name: "box".into(),
             endpoint_id: SecretKey::generate().public().to_string(),
             owner_id: SecretKey::generate().public().to_string(),
+            credential_generation: 1,
+            credential_issued_at: 0,
+            credential_expires_at: i64::MAX,
         });
         assert!(database.replace_sync(&invalid).is_err());
         let loaded = database.load().unwrap();
@@ -373,11 +498,17 @@ mod tests {
                 name: "same".into(),
                 endpoint_id: SecretKey::generate().public().to_string(),
                 managed_by: None,
+                credential_generation: 1,
+                credential_issued_at: 0,
+                credential_expires_at: i64::MAX,
             },
             ClientRecord {
                 name: "same".into(),
                 endpoint_id: SecretKey::generate().public().to_string(),
                 managed_by: None,
+                credential_generation: 1,
+                credential_issued_at: 0,
+                credential_expires_at: i64::MAX,
             },
         ];
         assert!(database.replace_sync(&invalid).is_err());

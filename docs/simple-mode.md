@@ -37,7 +37,7 @@ as-edge service status test
 ## Custom Relay
 
 Simple mode can use an ordinary custom or development relay without adding a
-control plane. It cannot administer a private relay allowlist. Pass the same
+control plane. It cannot issue credentials for a private Relay. Pass the same
 relay URL on both machines:
 
 ```sh

@@ -3,7 +3,7 @@
 Every private `as-relay` deployment, including a single-user personal relay,
 uses `as-control` as its authorization authority. Simple mode remains available
 for the official iroh relay network and ordinary custom relay URLs, but it does
-not administer a private relay allowlist.
+not issue credentials for a private Relay.
 
 ## Enroll and Run a Relay
 
@@ -41,11 +41,19 @@ as-relay run \
 ```
 
 Once `control.json` exists, the invitation file and Control URL are ignored;
-the Relay can restart from its verified offline snapshot while Control is down.
+the Relay can restart from its cached, verified revocation state while Control is down.
 
 `as-relay run` requires the Control profile created by `as-relay join`. There is
-no Client-signed initialization mode and no remote snapshot mutation endpoint.
-The relay actively long-polls Control for complete, signed membership snapshots.
+no Client-signed initialization mode and no remote state mutation endpoint.
+Clients and Edges receive EndpointId-bound credentials in their signed NodeMaps;
+the Relay verifies those credentials locally and long-polls Control only for
+signed, revisioned revocation deltas. Enrollment therefore does not wait for
+every Relay to acknowledge a new topology revision, and iroh remains free to
+select the best Relay from the complete catalog.
+
+Adding a Client or Edge sends no authorization update to Relays. A removal
+sends one small delta to each enrolled Relay, so this path scales with the Relay
+count rather than the total Client and Edge population.
 
 `--qad-port` is the externally reachable UDP port that the Relay reports to
 Control; Control persists it and distributes it to Clients and Edges in the
@@ -85,18 +93,21 @@ Relay ahead of any HTTPS redirect; the Relay returns `204 No Content` with the
 matching `X-Iroh-Response`. Redirecting it causes a false captive-portal report.
 This is an iroh requirement, not an agent-scale management endpoint.
 
-## Membership and Failure Behavior
+## Authorization and Failure Behavior
 
-Control derives relay membership from its committed Client, Edge, and Relay
-topology. Accepted snapshots are flushed and atomically renamed before becoming
-active. Removed EndpointIds are disconnected immediately.
+Credentials are valid for 30 days and are renewed through the normal Control
+watch before their final seven days. Each credential is bound to the Control
+audience, EndpointId, subject kind, and generation. Removing a Client or Edge
+adds a signed generation tombstone; Relays merge and persist the delta
+before activating it and disconnect that EndpointId immediately.
 
-The relay keeps the last verified snapshot in
-`/var/lib/agent-scale-relay/membership.json`. If Control is temporarily
-unavailable, existing authorized connections and relay restarts continue from
-that snapshot; new allocations and authorization changes wait for Control to
-return. Removing the relay with `as-control relay rm prod-sg` causes its watcher
-to fail closed and disconnect all clients.
+The Relay keeps the last verified state in
+`/var/lib/agent-scale-relay/revocations.json`. If Control is temporarily
+unavailable, unexpired credentials continue to work across Relay restarts;
+enrollment, renewal, and revocation changes wait for Control to return. Removing
+the Relay with `as-control relay rm prod-sg` durably marks that enrollment as
+revoked and disconnects all clients. Re-enrollment requires a fresh Relay state
+directory and identity.
 
 Relay authorization controls relay resource use. Edge command access remains
 independently protected by the Edge's pinned Client identity.

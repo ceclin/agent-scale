@@ -73,7 +73,7 @@ until output=$(AGENT_SCALE_HOME="$CLIENT_HOME" AGENT_SCALE_DIAL_SECS=2 \
     sleep 0.1
 done
 
-# Control downtime must not prevent a Relay restart from its last verified snapshot.
+# Control downtime must not prevent a Relay restart from its cached revocations.
 kill "$control_pid"; wait "$control_pid" >/dev/null 2>&1 || true; control_pid=
 kill "$relay_pid"; wait "$relay_pid" >/dev/null 2>&1 || true; relay_pid=
 "$BIN/as-relay" run --relay-bind 127.0.0.1:35340 --admin-bind 127.0.0.1:35341 \
@@ -83,8 +83,8 @@ kill "$relay_pid"; wait "$relay_pid" >/dev/null 2>&1 || true; relay_pid=
 relay_pid=$!
 
 i=0
-until curl -fsS "$RELAY_ADMIN_URL/v1/status" 2>/dev/null | grep '"members":2' >/dev/null; do
-    i=$((i + 1)); [ "$i" -lt 100 ] || { echo "relay did not restore its snapshot" >&2; exit 1; }
+until curl -fsS "$RELAY_ADMIN_URL/v1/status" 2>/dev/null | grep '"revocations":0' >/dev/null; do
+    i=$((i + 1)); [ "$i" -lt 100 ] || { echo "relay did not restore its revocation state" >&2; exit 1; }
     sleep 0.05
 done
 
@@ -111,7 +111,7 @@ done
 
 "$BIN/as-control" edge rm client/test >/dev/null
 i=0
-until curl -fsS "$RELAY_ADMIN_URL/v1/status" 2>/dev/null | grep '"members":1' >/dev/null; do
+until curl -fsS "$RELAY_ADMIN_URL/v1/status" 2>/dev/null | grep '"revocations":1' >/dev/null; do
     i=$((i + 1)); [ "$i" -lt 100 ] || { echo "relay did not apply revocation" >&2; exit 1; }
     sleep 0.05
 done

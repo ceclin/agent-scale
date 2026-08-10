@@ -50,7 +50,6 @@ dependencies = [
  "iroh",
  "iroh-blobs",
  "rand",
- "relay-api",
  "reqwest",
  "rmcp",
  "rustls",
@@ -3688,6 +3687,7 @@ name = "relay-api"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "iroh-base",
  "serde",
  "serde_json",

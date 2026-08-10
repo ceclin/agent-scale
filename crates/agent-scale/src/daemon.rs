@@ -47,6 +47,8 @@ fn idle_secs() -> u64 {
         .unwrap_or(10_800)
 }
 
+type RelayRuntimeConfig = (Option<u16>, Option<String>);
+
 #[derive(Clone)]
 struct Ctx {
     endpoint: Endpoint,
@@ -59,7 +61,7 @@ struct Ctx {
     /// In-flight client handlers; the daemon won't idle out while > 0.
     active: Arc<AtomicUsize>,
     /// Relay URLs currently installed in the live iroh endpoint.
-    known_relays: Arc<Mutex<HashMap<String, Option<u16>>>>,
+    known_relays: Arc<Mutex<HashMap<String, RelayRuntimeConfig>>>,
 }
 
 /// Increments the active-handler count for its lifetime (RAII so it decrements
@@ -98,6 +100,12 @@ pub async fn run() -> Result<()> {
         }
     }
     if let Some(control) = &cfg.control {
+        let credential = control
+            .map
+            .map
+            .relay_credential
+            .as_deref()
+            .context("control map is missing its Relay credential")?;
         for relay in &control.map.map.relays {
             let url = relay
                 .url
@@ -105,7 +113,7 @@ pub async fn run() -> Result<()> {
                 .with_context(|| format!("bad managed relay {}", relay.url))?;
             relays.insert(
                 relay.url.clone(),
-                scale_transport::managed_relay_config(url, relay.qad_port),
+                scale_transport::managed_relay_config(url, relay.qad_port, Some(credential)),
             );
         }
     }
@@ -113,7 +121,12 @@ pub async fn run() -> Result<()> {
     let known_relays = Arc::new(Mutex::new(
         relays
             .iter()
-            .map(|(url, config)| (url.clone(), config.quic.as_ref().map(|quic| quic.port)))
+            .map(|(url, config)| {
+                (
+                    url.clone(),
+                    (config.quic.as_ref().map(|quic| quic.port), config.auth_token.clone()),
+                )
+            })
             .collect(),
     ));
     // The daemon also *accepts* blobs connections (so edges can fetch during
@@ -238,23 +251,24 @@ async fn reload_edges(ctx: &Ctx) {
             return;
         }
     };
-    let mut desired_relays: HashMap<String, Option<u16>> = cfg
+    let mut desired_relays: HashMap<String, RelayRuntimeConfig> = cfg
         .edges
         .iter()
         .flat_map(|edge| edge.relays.iter().cloned())
-        .map(|url| (url, Some(7842)))
+        .map(|url| (url, (Some(7842), None)))
         .collect();
     if let Some(control) = &cfg.control {
+        let credential = control.map.map.relay_credential.clone();
         for relay in &control.map.map.relays {
-            desired_relays.insert(relay.url.clone(), relay.qad_port);
+            desired_relays.insert(relay.url.clone(), (relay.qad_port, credential.clone()));
         }
     }
     {
         let mut current = ctx.known_relays.lock().await;
         let added: Vec<_> = desired_relays
             .iter()
-            .filter(|(url, port)| current.get(*url) != Some(*port))
-            .map(|(url, port)| (url.clone(), *port))
+            .filter(|(url, config)| current.get(*url) != Some(*config))
+            .map(|(url, config)| (url.clone(), config.clone()))
             .collect();
         let removed: Vec<_> = current
             .keys()
@@ -263,16 +277,20 @@ async fn reload_edges(ctx: &Ctx) {
             .collect();
         // Install replacements before removing old relays so an address always
         // has the best chance of retaining a relay path during map rotation.
-        for (value, qad_port) in added {
+        for (value, (qad_port, credential)) in added {
             match value.parse::<iroh::RelayUrl>() {
                 Ok(url) => {
                     ctx.endpoint
                         .insert_relay(
                             url.clone(),
-                            Arc::new(scale_transport::managed_relay_config(url, qad_port)),
+                            Arc::new(scale_transport::managed_relay_config(
+                                url,
+                                qad_port,
+                                credential.as_deref(),
+                            )),
                         )
                         .await;
-                    current.insert(value, qad_port);
+                    current.insert(value, (qad_port, credential));
                 }
                 Err(error) => warn!("reload: invalid relay {value}: {error}"),
             }

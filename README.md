@@ -13,7 +13,7 @@ change incompatibly before 1.0.
 | --- | --- | --- |
 | `agent-scale` | Linux, macOS, or Windows x86-64 developer machine | CLI and auto-started local daemon |
 | `as-edge` | Linux or macOS x86-64/ARM64, or Windows x86-64 | Authenticated command, transfer, and MCP endpoint |
-| `as-relay` | Linux relay host | Private iroh relay with signed dynamic membership |
+| `as-relay` | Linux relay host | Private iroh relay with signed admission credentials |
 | `as-control` | Linux control host | Multi-client enrollment and signed desired state |
 
 Versioned archives for all four binaries and the multi-architecture Control and
@@ -22,7 +22,7 @@ a consolidated `SHA256SUMS`; see the [release guide](docs/releasing.md) for the
 target matrix and verification command.
 
 The client and edge pin each other's Ed25519 `EndpointId`. QUIC provides mutual
-transport authentication; relay membership and control-plane maps are signed.
+transport authentication; Relay admission credentials and control-plane maps are signed.
 If Control is temporarily unavailable, enrolled nodes continue with their last
 verified map. A definitive revocation response removes authorization and closes
 live connections.
@@ -74,7 +74,7 @@ See [simple mode](docs/simple-mode.md) and the
 - content-addressed, verified, disk-backed upload and download;
 - built-in full `fd` and `rg` CLIs in the single `as-edge` multicall binary;
 - transparent stdio, Streamable HTTP, and legacy SSE MCP proxying;
-- Control-signed private relay membership with offline snapshot recovery;
+- locally verified private Relay credentials with offline revocation recovery;
 - configurable Relay QAD UDP ports with Control-issued private TLS certificates;
 - optional multi-client enrollment and hot-reloaded desired state;
 - scheduler-neutral Provisioner API for isolated Client-to-Edge reconciliation.

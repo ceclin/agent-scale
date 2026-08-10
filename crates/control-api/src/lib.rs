@@ -15,13 +15,13 @@ use iroh_base::{EndpointId, SecretKey, Signature};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
-const INVITE_DOMAIN: &[u8] = b"agent-scale-control-invite-v4\0";
-const CLAIM_DOMAIN: &[u8] = b"agent-scale-control-claim-v4\0";
-const EDGE_INVITE_REQUEST_DOMAIN: &[u8] = b"agent-scale-control-edge-invite-request-v4\0";
-const EDGE_REMOVE_REQUEST_DOMAIN: &[u8] = b"agent-scale-control-edge-remove-request-v4\0";
-const WATCH_DOMAIN: &[u8] = b"agent-scale-control-watch-v4\0";
-const MAP_DOMAIN: &[u8] = b"agent-scale-control-map-v4\0";
-pub const CONTROL_PROTOCOL_VERSION: u32 = 4;
+const INVITE_DOMAIN: &[u8] = b"agent-scale-control-invite-v5\0";
+const CLAIM_DOMAIN: &[u8] = b"agent-scale-control-claim-v5\0";
+const EDGE_INVITE_REQUEST_DOMAIN: &[u8] = b"agent-scale-control-edge-invite-request-v5\0";
+const EDGE_REMOVE_REQUEST_DOMAIN: &[u8] = b"agent-scale-control-edge-remove-request-v5\0";
+const WATCH_DOMAIN: &[u8] = b"agent-scale-control-watch-v5\0";
+const MAP_DOMAIN: &[u8] = b"agent-scale-control-map-v5\0";
+pub const CONTROL_PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -400,6 +400,9 @@ pub struct NodeMap {
     pub issued_at: i64,
     pub recipient_id: String,
     pub relays: Vec<RelayInfo>,
+    /// Relays authenticate to Control directly, so only Client and Edge maps carry this credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_credential: Option<String>,
     /// DER-encoded private CA certificate used only for managed Relay TLS.
     pub relay_ca_der: Vec<u8>,
     #[serde(default)]
@@ -595,6 +598,7 @@ mod tests {
                 issued_at: 1,
                 recipient_id: a.public().to_string(),
                 relays: vec![],
+                relay_credential: None,
                 relay_ca_der: vec![1, 2, 3],
                 allowed_clients: vec![],
                 edges: vec![],
