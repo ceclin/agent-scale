@@ -1,129 +1,222 @@
 # agent-scale
 
-Run commands, move files, access private services, and use MCP servers on remote
-Linux, macOS, and Windows test machines over authenticated, direct
-[iroh](https://iroh.computer/) connections.
-There is no shared command server and neither endpoint needs an inbound port.
+Use your development machine to run commands, transfer files, reach private
+services, and connect to MCP servers on remote test machines.
 
-agent-scale is pre-release software. Its configuration and wire protocols may
-change incompatibly before 1.0.
+agent-scale connects the two machines over authenticated
+[iroh](https://iroh.computer/) peer-to-peer transport. Test machines do not
+need public IP addresses or inbound ports. A Relay helps the peers find each
+other and carries encrypted traffic when a direct path is unavailable.
 
-## Components
+> agent-scale is pre-release software. Configuration and network protocols may
+> change incompatibly before 1.0.
 
-| Binary | Runs on | Purpose |
+## Choose a setup
+
+| | Simple mode | Managed mode |
 | --- | --- | --- |
-| `agent-scale` | Linux, macOS, or Windows x86-64 developer machine | CLI and auto-started local daemon |
-| `as-edge` | Linux or macOS x86-64/ARM64, or Windows x86-64 | Authenticated command, transfer, and MCP endpoint |
-| `as-relay` | Linux relay host | Private iroh relay with signed admission credentials |
-| `as-control` | Linux control host | Multi-client enrollment and signed desired state |
+| Best for | Trying agent-scale, personal use, and a small static set of machines | Teams, private infrastructure, and dynamically allocated machines |
+| Infrastructure | None; uses iroh's public Relays by default | One Control and one or more private Relays |
+| Enrollment | Copy an Edge EndpointId; optionally use trust on first use | One-time Client, Edge, and Relay invitations |
+| Lifecycle | Manage Edges directly from one Client | Central ownership, immediate revocation, and Provisioner automation |
 
-Versioned archives for all four binaries and the multi-architecture Control and
-Relay images are published by GitHub Releases. Each release includes
-a consolidated `SHA256SUMS`; see the [release guide](docs/releasing.md) for the
-target matrix and verification command.
+Start with simple mode if you are unsure. Both modes use the same Client and
+Edge commands after enrollment.
 
-The client and edge pin each other's Ed25519 `EndpointId`. QUIC provides mutual
-transport authentication; Relay admission credentials and control-plane maps are signed.
-If Control is temporarily unavailable, enrolled nodes continue with their last
-verified map. A definitive revocation response removes authorization and closes
-live connections.
+## Install
 
-## Quick start
+Download the archive for your platform from
+[GitHub Releases](https://github.com/ceclin/agent-scale/releases):
 
-Build the workspace with the latest stable Rust toolchain:
+- install `agent-scale` on your development machine;
+- install `as-edge` on every test machine you want to access.
+
+Extract the executable and place it somewhere on `PATH`. Each release includes
+`SHA256SUMS`; from the download directory, verify an archive with:
 
 ```console
-git clone https://github.com/ceclin/agent-scale.git
-cd agent-scale
-cargo x init
-cargo build --release -p agent-scale -p as-edge
+sha256sum --check --ignore-missing SHA256SUMS
 ```
 
-Start an edge and copy its printed ID:
+On Windows, use `Get-FileHash -Algorithm SHA256 <archive>` in PowerShell and
+compare it with the corresponding entry in `SHA256SUMS`.
+
+Linux and macOS builds are available for x86-64 and ARM64. Windows builds are
+available for x86-64. Windows support is experimental and has not yet been
+validated through the complete workflow on a physical Windows development
+machine.
+
+Control and private Relay deployments use the separately published
+`as-control` and `as-relay` Linux binaries, or these multi-architecture images:
+
+```text
+ghcr.io/ceclin/agent-scale-control:<version>
+ghcr.io/ceclin/agent-scale-relay:<version>
+```
+
+## Connect your first test machine
+
+Simple mode needs no Control deployment and uses iroh's public relays. On the
+test machine, create an Edge identity and start it:
 
 ```console
-# Test machine
 as-edge id test
-as-edge run test --relay https://your-relay.example
+as-edge run test
 ```
 
-Register it and execute a command:
+Copy the printed EndpointId, then register it on your development machine:
 
 ```console
-# Developer machine
-agent-scale edge add test EDGE_ID --relay https://your-relay.example
+agent-scale edge add test <EDGE_ENDPOINT_ID>
+agent-scale -e test exec -- uname -a
+```
+
+The first authenticated Client to connect is trusted and persistently pinned by
+the Edge. If you prefer to pin it before the first connection, run
+`agent-scale keygen` and pass the printed ID to `as-edge run test --client
+<CLIENT_ENDPOINT_ID>`.
+
+The Client starts its local connection manager automatically; there is no
+daemon to launch by hand. To keep a simple-mode Edge running after logout, stop
+the foreground process with Ctrl-C and install its current-user service:
+
+```console
+as-edge service install test
+as-edge service status test
+```
+
+The service does not require root or Administrator privileges. See
+[Simple mode](docs/simple-mode.md) for custom Relay configuration and identity
+management.
+
+## Use an Edge
+
+Commands stream stdout and stderr as they run. Ctrl-C cancels the remote child:
+
+```console
 agent-scale -e test exec -- cargo test
+agent-scale -e test exec -- rg TODO /work/project
 ```
 
-On a Windows development machine, download the Windows x86-64 `agent-scale`
-archive, place `agent-scale.exe` on `PATH`, and run the same Client commands
-from PowerShell. The background daemon is auto-started without a console window
-and communicates through a current-user-local Named Pipe; it does not install a
-service, require Administrator privileges, or open a listening network port.
-Windows Client support is currently experimental: its build and local IPC tests
-are wired into CI, but the complete Client-to-Edge workflow has not yet been
-validated on a real Windows development host.
-
-Without `--client`, an edge uses trust on first use and durably pins the first
-client before authorizing it. Pass `--client ENDPOINT_ID` for an explicit pin.
-See [simple mode](docs/simple-mode.md) and the
-[control-plane guide](docs/control-plane.md) for complete setup.
-
-## Capabilities
-
-- live stdout/stderr command streaming with cancellation propagation;
-- content-addressed, verified, disk-backed upload and download;
-- built-in full `fd` and `rg` CLIs in the single `as-edge` multicall binary;
-- transparent stdio, Streamable HTTP, and legacy SSE MCP proxying;
-- daemon-owned fixed TCP forwarding and no-auth SOCKS5 CONNECT/UDP proxying;
-- locally verified private Relay credentials with offline revocation recovery;
-- configurable Relay QAD UDP ports with Control-issued private TLS certificates;
-- optional multi-client enrollment and hot-reloaded desired state;
-- scheduler-neutral Provisioner API for isolated Client-to-Edge reconciliation.
-
-More detail is in [service proxying](docs/proxy.md), [MCP](docs/mcp.md),
-[private relay](docs/private-relay.md), and [control plane](docs/control-plane.md).
-External controllers should also see the [Provisioner API](docs/provisioner-api.md).
-
-## Development
-
-Repository tasks follow the FastLabs-style `cargo x` entry point:
+Transfer files in either direction:
 
 ```console
-cargo x init
-cargo x lint
-cargo x test
-cargo x build
-cargo x e2e
-cargo x zigbuild x86_64-unknown-linux-musl
+agent-scale -e test upload ./build.zip /tmp/build.zip
+agent-scale -e test download /tmp/results.json ./results.json
 ```
 
-`cargo x init` checks out the pinned fd and ripgrep revisions into the ignored
-`.upstreams/` build-input cache. Those upstream trees are never tracked or
-modified by repository tooling; wrapper builds copy their sources to Cargo's
-`OUT_DIR` before adapting the entry points. Other `cargo x` tasks initialize the
-cache automatically.
+Reach a database or another service visible only from the test machine:
 
-End-to-end tests are intentionally local-only. Run `cargo x e2e` when changing
-transport or lifecycle behavior. Local Linux cross-builds use `cargo x zigbuild
-[TARGET...]` with Cargo's default release profile (no LTO, 16 codegen units);
-`cargo x dist` selects full LTO with one codegen unit. Official distributions
-are built natively on x86-64 and ARM64 Linux, Windows, and macOS runners.
+```console
+agent-scale -e test proxy start tcp database \
+  --listen 127.0.0.1:15432 \
+  --target postgres.internal:5432
+```
 
-`cargo x lint` checks formatting, strict Clippy, documentation, generated
-wrapper manifests, TOML formatting, spelling, and dependency policy. The build
-script never modifies tracked source: fd/ripgrep adapters are generated under
-Cargo's `OUT_DIR`.
+Applications on your development machine can now connect to
+`127.0.0.1:15432`. A SOCKS5 proxy is also available for dynamic TCP and UDP
+destinations. Local listeners are intentionally unauthenticated, so bind them
+to loopback unless you intend to share Edge network access. See
+[Service proxying](docs/proxy.md).
 
-This project intentionally supports the latest stable Rust release only; it
-does not declare an MSRV. Supported deployment targets are listed in
-[CONTRIBUTING.md](CONTRIBUTING.md).
+## Use remote MCP servers
 
-## Security
+Register a server that runs on, or is locally reachable from, an Edge:
 
-Do not publish suspected vulnerabilities in a public issue. Follow
-[SECURITY.md](SECURITY.md) to report them privately.
+```console
+agent-scale -e test mcp add debugger -- lldb-mcp
+agent-scale -e test mcp add database --http http://127.0.0.1:8080/mcp
+agent-scale -e test mcp check debugger
+```
 
-## License
+Synchronize the selected Edge's servers into the current project:
+
+```console
+agent-scale -e test mcp sync --client codex --client claude
+```
+
+agent-scale writes project-scoped proxy entries while preserving handwritten
+configuration. The MCP client sees an ordinary stdio server; agent-scale
+bridges stdio, Streamable HTTP, and legacy SSE transports over the Edge
+connection. See [Remote MCP servers](docs/mcp.md).
+
+## Run a managed private network
+
+Use managed mode when you need multiple Clients, private Relays, invitations,
+central ownership, or immediate revocation. `as-control` distributes signed
+authorization state; it never receives command output, transferred files, MCP
+traffic, or proxied service traffic.
+
+The included Compose stack starts one Control and one private Relay:
+
+```console
+docker compose up -d --wait
+agent-scale control join "$(docker compose exec -T \
+  control as-control client invite laptop)"
+```
+
+Create an Edge invitation from the enrolled Client and redeem it on the test
+machine:
+
+```console
+# Development machine
+agent-scale edge invite test
+
+# Test machine, using the invitation printed above
+as-edge join '<EDGE_INVITATION>' --install
+```
+
+The local defaults are suitable for evaluating the stack on one machine. A
+real deployment needs externally reachable Control and Relay URLs, HTTPS, and
+the Relay UDP port. Follow the [Control plane](docs/control-plane.md) and
+[Private Relay](docs/private-relay.md) guides before exposing it publicly.
+
+## Automate provisioning
+
+The Provisioner API connects agent-scale to systems that create test machines
+on demand, such as CI workers, VM managers, Kubernetes controllers, or an
+internal scheduler. Register each controller's Ed25519 identity on the Control
+host:
+
+```console
+as-control provisioner add lab-controller <CONTROLLER_ENDPOINT_ID>
+```
+
+The controller can then use signed HTTPS requests to read its isolated
+Client-to-Edge partition, create repeatable enrollment invitations, revoke
+unused invitations, and remove or transfer identities during cleanup. Request
+IDs make invitation retries idempotent, and topology revisions support safe
+reconciliation after controller restarts.
+
+Control manages authorization and enrollment only. The Provisioner remains
+responsible for allocating machines, delivering join invitations, starting
+Edges, and deleting workloads. The API is language-independent and does not
+require embedding agent-scale or Rust code. See the
+[Provisioner API](docs/provisioner-api.md) for the request format, signing
+example, and reconciliation lifecycle.
+
+## Security model
+
+- Client and Edge identities are Ed25519 keys. Each connection authenticates
+  both peers, and dialing uses the expected public EndpointId.
+- Relays forward end-to-end encrypted iroh traffic and cannot impersonate a
+  Client or Edge or read application payloads.
+- In managed mode, Relay admission and topology are signed by Control. A
+  definitive revocation disconnects live sessions.
+- Existing enrolled nodes can continue using the last verified authorization
+  map while Control is temporarily unavailable.
+- Identities and configuration live under `~/.agent-scale` by default. Back up
+  the complete Control and Relay state directories for durable deployments.
+
+Report suspected vulnerabilities privately by following [SECURITY.md](SECURITY.md).
+
+## More information
+
+- [Simple mode](docs/simple-mode.md)
+- [Control plane](docs/control-plane.md)
+- [Private Relay](docs/private-relay.md)
+- [Service proxying](docs/proxy.md)
+- [Remote MCP servers](docs/mcp.md)
+- [Contributing](CONTRIBUTING.md)
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
