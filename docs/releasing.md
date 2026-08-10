@@ -76,6 +76,15 @@ from the directory containing both files with:
 sha256sum --check --ignore-missing SHA256SUMS
 ```
 
+The workflow signs GitHub artifact attestations for each checksum manifest and
+published container digest. Verify the manifest before trusting its archive
+hashes, or verify an authenticated OCI image directly:
+
+```console
+gh attestation verify SHA256SUMS --repo ceclin/agent-scale
+gh attestation verify oci://ghcr.io/ceclin/agent-scale-control:VERSION --repo ceclin/agent-scale
+```
+
 Every archive contains the project `LICENSE` and a generated
 `THIRD_PARTY_LICENSES.html` covering the binary's complete non-development Rust
 dependency graph. The Control and Relay container images carry the same files

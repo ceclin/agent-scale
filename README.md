@@ -38,6 +38,10 @@ Extract the executable and place it somewhere on `PATH`. Each release includes
 sha256sum --check --ignore-missing SHA256SUMS
 ```
 
+Releases also publish a GitHub attestation for that manifest; verify it with
+`gh attestation verify SHA256SUMS --repo ceclin/agent-scale` before trusting the
+listed hashes.
+
 On Windows, use `Get-FileHash -Algorithm SHA256 <archive>` in PowerShell and
 compare it with the corresponding entry in `SHA256SUMS`.
 
