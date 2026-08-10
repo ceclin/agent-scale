@@ -590,14 +590,6 @@ fn bootstrap(
         && relay_invite_out.exists()
     {
         let key = scale_core::read_secret(&key_path(&dir))?;
-        validate_prepared_invitation(
-            &relay_invite_out,
-            key.public(),
-            &audience,
-            &public_url,
-            &relay_name,
-            &InviteKind::Relay { url: relay_url.clone() },
-        )?;
         println!("control {} is already prepared", key.public());
         return Ok(());
     }
@@ -672,36 +664,6 @@ fn bootstrap(
         write_invitation(&relay_invite_out, &invite.join_url)?;
     }
     println!("prepared control {}", key.public());
-    Ok(())
-}
-
-fn validate_prepared_invitation(
-    path: &Path,
-    control_id: EndpointId,
-    audience: &str,
-    public_url: &str,
-    name: &str,
-    kind: &InviteKind,
-) -> Result<()> {
-    let join_url = std::fs::read_to_string(path).with_context(|| format!("read invitation {}", path.display()))?;
-    let parsed = Url::parse(join_url.trim()).with_context(|| format!("parse invitation {}", path.display()))?;
-    let fragment = parsed
-        .fragment()
-        .with_context(|| format!("invitation {} has no token", path.display()))?;
-    let token = JoinToken::decode(fragment).with_context(|| format!("decode invitation {}", path.display()))?;
-    anyhow::ensure!(
-        token.verify()? == control_id,
-        "invitation {} belongs to another Control",
-        path.display()
-    );
-    anyhow::ensure!(
-        token.invite.audience == audience
-            && token.invite.control_url == public_url
-            && token.invite.name == name
-            && token.invite.kind == *kind,
-        "invitation {} does not match configured deployment",
-        path.display()
-    );
     Ok(())
 }
 
@@ -2675,7 +2637,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_is_idempotent_and_does_not_require_invitation_artifacts_after_enrollment() {
+    fn bootstrap_is_idempotent_before_and_after_relay_enrollment() {
         let dir = tempfile::tempdir().unwrap();
         let relay_out = dir.path().join("bootstrap/relay.join");
         let run_bootstrap = || {
@@ -2695,6 +2657,7 @@ mod tests {
                 .unwrap()
                 .starts_with("http://127.0.0.1:3350/join#")
         );
+        std::fs::write(&relay_out, "opaque prepared invitation\n").unwrap();
 
         let control_dir = dir.path().join("control");
         let (lock, _key, database, mut state) = open_exclusive(&control_dir).unwrap();

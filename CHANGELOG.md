@@ -21,6 +21,8 @@ The project uses semantic versioning after its first public release. Before
   seven-day credentials bound the retained revocation window.
 - Applied Control mutations as committed row deltas so routine enrollment,
   renewal, and removal no longer clone or compare the complete topology.
+- Kept Compose bootstrap idempotent by treating an existing Relay invitation
+  as an opaque prepared artifact instead of decoding it again.
 
 ## 0.5.0 - 2026-08-07
 
