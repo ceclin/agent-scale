@@ -11,7 +11,7 @@ Run the `Distribution` workflow manually and optionally enter a branch, tag, or
 commit in `ref`. Leaving it empty snapshots the ref selected in the workflow UI.
 No version or changelog edit is required.
 
-Snapshot archives use a version such as `0.9.0-snapshot.42.0123456789ab`, are
+Snapshot archives use a version such as `0.10.0-snapshot.42.0123456789ab`, are
 available as a single GitHub Actions artifact for 14 days, and include a
 consolidated `SHA256SUMS`. Build jobs retain their internal transfer artifacts
 for one day only. Control and Relay images receive three tags:
