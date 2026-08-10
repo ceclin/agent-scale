@@ -1,7 +1,8 @@
 # agent-scale
 
-Run commands, move files, and use MCP servers on remote Linux, macOS, and
-Windows test machines over authenticated, direct [iroh](https://iroh.computer/) connections.
+Run commands, move files, access private services, and use MCP servers on remote
+Linux, macOS, and Windows test machines over authenticated, direct
+[iroh](https://iroh.computer/) connections.
 There is no shared command server and neither endpoint needs an inbound port.
 
 agent-scale is pre-release software. Its configuration and wire protocols may
@@ -74,14 +75,15 @@ See [simple mode](docs/simple-mode.md) and the
 - content-addressed, verified, disk-backed upload and download;
 - built-in full `fd` and `rg` CLIs in the single `as-edge` multicall binary;
 - transparent stdio, Streamable HTTP, and legacy SSE MCP proxying;
+- daemon-owned fixed TCP forwarding and no-auth SOCKS5 CONNECT/UDP proxying;
 - locally verified private Relay credentials with offline revocation recovery;
 - configurable Relay QAD UDP ports with Control-issued private TLS certificates;
 - optional multi-client enrollment and hot-reloaded desired state;
 - scheduler-neutral Provisioner API for isolated Client-to-Edge reconciliation.
 
-More detail is in [MCP](docs/mcp.md), [private relay](docs/private-relay.md), and
-[control plane](docs/control-plane.md). External controllers should also see the
-[Provisioner API](docs/provisioner-api.md).
+More detail is in [service proxying](docs/proxy.md), [MCP](docs/mcp.md),
+[private relay](docs/private-relay.md), and [control plane](docs/control-plane.md).
+External controllers should also see the [Provisioner API](docs/provisioner-api.md).
 
 ## Development
 

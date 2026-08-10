@@ -7,6 +7,10 @@ The project uses semantic versioning after its first public release. Before
 
 ## Unreleased
 
+- Added ephemeral Client-side fixed TCP forwarding and no-auth SOCKS5 CONNECT
+  and UDP ASSOCIATE listeners. Targets and DNS resolution remain on the Edge;
+  TCP streams are forwarded directly while UDP packets retain their boundaries
+  in a reliable framed QUIC stream.
 - Standardized the development-side role as Client across CLI commands, signed
   APIs, persisted state, filesystem paths, and documentation; advanced the
   incompatible Control and RPC protocol versions.

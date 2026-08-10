@@ -6,7 +6,8 @@ official iroh relays and requires no control-plane deployment.
 `as-control` is the coordination authority for a private agent-scale network.
 It owns the network signing key, registers multiple clients, assigns every edge
 to exactly one client, and distributes the global iroh relay map. It does not
-proxy command traffic.
+proxy command or service traffic; local proxy listeners remain runtime state in
+the Client daemon.
 
 ## Deploy Control
 
