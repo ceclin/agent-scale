@@ -95,8 +95,8 @@ This is an iroh requirement, not an agent-scale management endpoint.
 
 ## Authorization and Failure Behavior
 
-Credentials are valid for 30 days and are renewed through the normal Control
-watch before their final seven days. Each credential is bound to the Control
+Credentials are valid for seven days and are renewed through the normal Control
+watch before their final two days. Each credential is bound to the Control
 audience, EndpointId, subject kind, and generation. Removing a Client or Edge
 adds a signed generation tombstone; Relays merge and persist the delta
 before activating it and disconnect that EndpointId immediately.

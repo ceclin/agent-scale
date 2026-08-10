@@ -19,7 +19,8 @@ The project uses semantic versioning after its first public release. Before
   signed, identity-bound requests.
 - Replaced replicated Relay membership lists with EndpointId-bound admission
   credentials and a compact incremental revocation stream. New nodes can use any
-  available Relay immediately, while removals still disconnect live sessions.
+  available Relay immediately, while removals still disconnect live sessions;
+  seven-day credentials bound the retained revocation window.
 
 ## 0.5.0 - 2026-08-07
 

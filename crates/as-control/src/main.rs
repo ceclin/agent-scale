@@ -47,8 +47,8 @@ use url::Url;
 const STATE_SCHEMA: u32 = 6;
 const CLOCK_SKEW_SECS: i64 = 300;
 const DEFAULT_TTL_SECS: u64 = 15 * 60;
-const RELAY_CREDENTIAL_LIFETIME_SECS: i64 = 30 * 24 * 60 * 60;
-const RELAY_CREDENTIAL_RENEW_BEFORE_SECS: i64 = 7 * 24 * 60 * 60;
+const RELAY_CREDENTIAL_LIFETIME_SECS: i64 = 7 * 24 * 60 * 60;
+const RELAY_CREDENTIAL_RENEW_BEFORE_SECS: i64 = 2 * 24 * 60 * 60;
 
 #[derive(Parser)]
 #[command(
