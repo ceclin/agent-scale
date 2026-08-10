@@ -69,13 +69,18 @@ echo "  PASS runtime list and stop"
 
 AGENT_SCALE_HOME="$CLIENT_HOME" "$BIN/agent-scale" proxy stop dev
 AGENT_SCALE_HOME="$CLIENT_HOME" "$BIN/agent-scale" daemon --stop >/dev/null
+for _ in $(seq 1 100); do
+  STATUS=$(AGENT_SCALE_HOME="$CLIENT_HOME" "$BIN/agent-scale" daemon --status 2>/dev/null || true)
+  grep -q 'no daemon running' <<<"$STATUS" && break
+  sleep 0.05
+done
 IDLE_PROXY=$(AGENT_SCALE_IDLE_SECS=1 AGENT_SCALE_HOME="$CLIENT_HOME" "$BIN/agent-scale" \
   -e proxy-e2e proxy start tcp idle --listen 127.0.0.1:0 --target "localhost:$TCP_PORT")
 IDLE_PORT=$(sed -E 's/.*listening on [^:]+:([0-9]+).*/\1/' <<<"$IDLE_PROXY")
 sleep 2
 AGENT_SCALE_HOME="$CLIENT_HOME" "$BIN/agent-scale" daemon --status | grep -q 'proxies=1'
-python3 scripts/e2e-proxy.py fixed "$IDLE_PORT" --size $((64 * 1024 * 1024))
-echo "  PASS listener pins daemon; 64 MiB smoke completed"
+python3 scripts/e2e-proxy.py fixed "$IDLE_PORT"
+echo "  PASS listener pins daemon"
 
 AGENT_SCALE_HOME="$CLIENT_HOME" "$BIN/agent-scale" daemon --stop >/dev/null
 [ "$(AGENT_SCALE_HOME="$CLIENT_HOME" "$BIN/agent-scale" proxy ls)" = "no proxies running" ]

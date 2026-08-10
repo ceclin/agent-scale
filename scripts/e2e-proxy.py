@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import socket
 import struct
 import threading
@@ -44,15 +45,40 @@ def serve():
 
 
 def round_trip(stream, size):
-    remaining = size
-    block = bytes(range(256)) * 256
+    block = bytes(range(256)) * 4096
+    expected = hashlib.sha256()
+    received = hashlib.sha256()
+    receive_error = []
+
+    def receive():
+        remaining = size
+        try:
+            while remaining:
+                data = stream.recv(min(1024 * 1024, remaining))
+                if not data:
+                    raise RuntimeError("unexpected EOF")
+                received.update(data)
+                remaining -= len(data)
+        except Exception as error:
+            receive_error.append(error)
+
     started = time.monotonic()
+    receiver = threading.Thread(target=receive)
+    receiver.start()
+    remaining = size
     while remaining:
         payload = block[: min(remaining, len(block))]
         stream.sendall(payload)
-        if recv_exact(stream, len(payload)) != payload:
-            raise RuntimeError("echo payload mismatch")
+        expected.update(payload)
         remaining -= len(payload)
+    stream.shutdown(socket.SHUT_WR)
+    receiver.join(timeout=30)
+    if receiver.is_alive():
+        raise RuntimeError("echo receive timed out")
+    if receive_error:
+        raise receive_error[0]
+    if received.digest() != expected.digest():
+        raise RuntimeError("echo payload mismatch")
     return time.monotonic() - started
 
 
@@ -93,12 +119,13 @@ def fixed(proxy_port, size):
     print(f"{size / 1048576:.0f} MiB in {elapsed:.2f}s")
 
 
-def socks_connect(proxy_port, target_port):
+def socks_connect(proxy_port, target_port, size):
     with socket.create_connection(("127.0.0.1", proxy_port), timeout=10) as stream:
         socks_negotiate(stream)
         stream.sendall(b"\x05\x01\x00" + domain_address("localhost", target_port))
         socks_reply(stream)
-        round_trip(stream, 1024 * 1024)
+        elapsed = round_trip(stream, size)
+    print(f"{size / 1048576:.0f} MiB in {elapsed:.2f}s")
 
 
 def socks_udp(proxy_port, target_port):
@@ -132,6 +159,7 @@ fixed_parser.add_argument("--size", type=int, default=1024 * 1024)
 connect_parser = sub.add_parser("socks-connect")
 connect_parser.add_argument("proxy_port", type=int)
 connect_parser.add_argument("target_port", type=int)
+connect_parser.add_argument("--size", type=int, default=1024 * 1024)
 udp_parser = sub.add_parser("socks-udp")
 udp_parser.add_argument("proxy_port", type=int)
 udp_parser.add_argument("target_port", type=int)
@@ -142,6 +170,6 @@ if args.command == "server":
 elif args.command == "fixed":
     fixed(args.proxy_port, args.size)
 elif args.command == "socks-connect":
-    socks_connect(args.proxy_port, args.target_port)
+    socks_connect(args.proxy_port, args.target_port, args.size)
 elif args.command == "socks-udp":
     socks_udp(args.proxy_port, args.target_port)
