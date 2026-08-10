@@ -76,6 +76,11 @@ calls retain all identities and enrollment. The containers use read-only root
 filesystems with writable state volumes, drop Linux capabilities, and rotate
 their local JSON logs at three 10 MiB files per service.
 
+The Control and Relay images run as UID/GID `10001`. New named volumes inherit
+the correct ownership. Before upgrading a volume previously written by a root
+container, stop the stack and change that volume's contents to `10001:10001`;
+otherwise the service will fail safely rather than start without its state.
+
 Inspect or stop the stack with:
 
 ```sh
