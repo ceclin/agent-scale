@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "agent-scale"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -181,7 +181,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "as-control"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "as-edge"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "as-relay"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -700,7 +700,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "control-api"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3700,7 +3700,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "relay-api"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3711,7 +3711,7 @@ dependencies = [
 
 [[package]]
 name = "relay-dev"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "iroh-relay",
@@ -4024,7 +4024,7 @@ dependencies = [
 
 [[package]]
 name = "scale-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "fs2",
@@ -4036,7 +4036,7 @@ dependencies = [
 
 [[package]]
 name = "scale-protocol"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4044,7 +4044,7 @@ dependencies = [
 
 [[package]]
 name = "scale-transport"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "bao-tree",
@@ -5606,7 +5606,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
