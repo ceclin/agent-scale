@@ -17,7 +17,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tracing::warn;
 
 use super::{Ctx, get_conn};
-use crate::common::{ProxyAdmin, ProxyAdminResult, ProxyInfo, ProxyKind, ProxySpec};
+use crate::common::{ProxyAdmin, ProxyAdminResult, ProxyInfo, ProxyKind, ProxySpec, SocksAuth};
 
 #[derive(Clone, Default)]
 pub(super) struct ProxyManager {
@@ -59,6 +59,7 @@ impl ProxyManager {
             edge: spec.edge.clone(),
             listen,
             kind: spec.kind.clone(),
+            authenticated: spec.socks_auth.is_some(),
         };
 
         let mut running = self.running.lock().await;
@@ -168,6 +169,7 @@ async fn serve_listener(
                             &ctx,
                             &spec.edge,
                             spec.connect_timeout_secs,
+                            spec.socks_auth.as_ref(),
                             socket,
                         )
                         .await,
@@ -267,13 +269,17 @@ async fn bridge_tcp(mut socket: TcpStream, mut send: SendStream, mut recv: RecvS
     Ok(())
 }
 
-async fn serve_socks5(ctx: &Ctx, edge_name: &str, timeout_secs: u64, socket: TcpStream) -> Result<()> {
+async fn serve_socks5(
+    ctx: &Ctx,
+    edge_name: &str,
+    timeout_secs: u64,
+    auth: Option<&SocksAuth>,
+    socket: TcpStream,
+) -> Result<()> {
     let peer_ip = socket.peer_addr()?.ip();
     let local_ip = socket.local_addr()?.ip();
-    let (protocol, command, target) = Socks5ServerProtocol::accept_no_auth(socket)
-        .await?
-        .read_command()
-        .await?;
+    let protocol = accept_socks5(socket, auth).await?;
+    let (protocol, command, target) = protocol.read_command().await?;
     match command {
         Socks5Command::TCPConnect => {
             let target = proxy_target(target);
@@ -306,6 +312,23 @@ async fn serve_socks5(ctx: &Ctx, edge_name: &str, timeout_secs: u64, socket: Tcp
             Ok(())
         }
     }
+}
+
+async fn accept_socks5(
+    socket: TcpStream,
+    auth: Option<&SocksAuth>,
+) -> Result<Socks5ServerProtocol<TcpStream, fast_socks5::server::states::Authenticated>> {
+    let protocol = match auth {
+        Some(auth) => {
+            Socks5ServerProtocol::accept_password_auth(socket, |username, password| {
+                (username == auth.username && password == auth.password).then_some(())
+            })
+            .await?
+            .0
+        }
+        None => Socks5ServerProtocol::accept_no_auth(socket).await?,
+    };
+    Ok(protocol)
 }
 
 async fn open_udp_tunnel(
@@ -427,4 +450,48 @@ fn socks_reply(code: &str) -> ReplyError {
 
 fn remote_internal(error: impl Into<anyhow::Error>) -> RemoteError {
     RemoteError::internal(format!("{:#}", error.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn socks5_password_auth_accepts_only_matching_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let auth = SocksAuth {
+            username: "developer".into(),
+            password: "secret".into(),
+        };
+        let server = tokio::spawn(async move {
+            for expected in [true, false] {
+                let (socket, _) = listener.accept().await.unwrap();
+                assert_eq!(accept_socks5(socket, Some(&auth)).await.is_ok(), expected);
+            }
+        });
+
+        assert_eq!(password_auth(address, "developer", "secret").await, [1, 0]);
+        let rejected = password_auth(address, "developer", "wrong").await;
+        assert_eq!(rejected[0], 1);
+        assert_ne!(rejected[1], 0);
+        server.await.unwrap();
+    }
+
+    async fn password_auth(address: SocketAddr, username: &str, password: &str) -> [u8; 2] {
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        socket.write_all(&[5, 1, 2]).await.unwrap();
+        let mut method = [0; 2];
+        socket.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 2]);
+
+        let mut request = vec![1, username.len() as u8];
+        request.extend_from_slice(username.as_bytes());
+        request.push(password.len() as u8);
+        request.extend_from_slice(password.as_bytes());
+        socket.write_all(&request).await.unwrap();
+        let mut response = [0; 2];
+        socket.read_exact(&mut response).await.unwrap();
+        response
+    }
 }

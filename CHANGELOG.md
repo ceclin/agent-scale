@@ -7,6 +7,8 @@ The project uses semantic versioning after its first public release. Before
 
 ## Unreleased
 
+- Added optional username/password authentication for SOCKS5 proxy listeners.
+
 ## 0.9.0 - 2026-08-10
 
 - Hardened public Control and Edge endpoints against unauthenticated resource

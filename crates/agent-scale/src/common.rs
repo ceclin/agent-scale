@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const LOCAL_PROTOCOL_VERSION: u32 = 2;
+pub const LOCAL_PROTOCOL_VERSION: u32 = 3;
 const CONFIG_SCHEMA: u32 = 1;
 
 /// Client home: $AGENT_SCALE_HOME or ~/.agent-scale.
@@ -226,6 +226,20 @@ pub struct ProxySpec {
     pub listen: SocketAddr,
     pub connect_timeout_secs: u64,
     pub kind: ProxyKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socks_auth: Option<SocksAuth>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SocksAuth {
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for SocksAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SocksAuth { .. }")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +255,8 @@ pub struct ProxyInfo {
     pub edge: String,
     pub listen: SocketAddr,
     pub kind: ProxyKind,
+    #[serde(default)]
+    pub authenticated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

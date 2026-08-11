@@ -22,6 +22,18 @@ agent-scale -e linux-box proxy start socks5 test-network \
   --listen 127.0.0.1:1080
 ```
 
+Username/password authentication can be enabled when exposing the listener to
+other machines:
+
+```console
+agent-scale -e linux-box proxy start socks5 test-network \
+  --listen 0.0.0.0:1080 --username developer --password-file ~/.config/agent-scale/socks-password
+```
+
+Use `--password` instead for a convenient inline password. Authentication is
+optional on every listen address; SOCKS5 credentials are not encrypted, so use
+a trusted network or an encrypted network layer when confidentiality matters.
+
 The SOCKS listener supports TCP CONNECT and UDP ASSOCIATE with IPv4, IPv6, and
 domain targets. BIND is not supported. UDP packets use a reliable framed QUIC
 stream rather than QUIC datagrams. This preserves packet boundaries and works
@@ -29,11 +41,11 @@ through the same Relay path, but loss can delay later packets in that
 association; it is intended for development access, not latency-sensitive UDP
 workloads.
 
-Both listener types are intentionally unauthenticated. Bind to a loopback
-address unless every host that can reach the selected interface should receive
-the Edge's full network access. Agent-scale does not restrict destination
-addresses or ports because an Edge is already fully owned by its enrolled
-Client.
+TCP listeners and SOCKS5 listeners without credentials are unauthenticated.
+Bind them to a loopback address unless every host that can reach the selected
+interface should receive the Edge's full network access. Agent-scale does not
+restrict destination addresses or ports because an Edge is already fully owned
+by its enrolled Client.
 
 ## Lifecycle
 

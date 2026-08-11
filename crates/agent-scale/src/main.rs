@@ -145,6 +145,15 @@ enum ProxyStart {
         name: String,
         #[arg(long)]
         listen: std::net::SocketAddr,
+        /// Username for optional RFC 1929 authentication.
+        #[arg(long)]
+        username: Option<String>,
+        /// Password for optional RFC 1929 authentication.
+        #[arg(long, requires = "username", conflicts_with = "password_file")]
+        password: Option<String>,
+        /// Read the optional RFC 1929 password from a file.
+        #[arg(long, requires = "username", conflicts_with = "password")]
+        password_file: Option<std::path::PathBuf>,
         #[arg(long, default_value_t = 10)]
         connect_timeout_secs: u64,
     },
@@ -329,17 +338,22 @@ fn main() -> ExitCode {
                                 listen,
                                 connect_timeout_secs,
                                 kind: common::ProxyKind::Tcp { target },
+                                socks_auth: None,
                             }),
                             ProxyStart::Socks5 {
                                 name,
                                 listen,
+                                username,
+                                password,
+                                password_file,
                                 connect_timeout_secs,
-                            } => Ok(common::ProxySpec {
+                            } => socks_auth(username, password, password_file).map(|socks_auth| common::ProxySpec {
                                 name,
                                 edge,
                                 listen,
                                 connect_timeout_secs,
                                 kind: common::ProxyKind::Socks5,
+                                socks_auth,
                             }),
                         };
                         match spec {
@@ -409,6 +423,41 @@ fn parse_proxy_target(value: &str) -> anyhow::Result<protocol::ProxyTarget> {
     })
 }
 
+fn socks_auth(
+    username: Option<String>,
+    password: Option<String>,
+    password_file: Option<std::path::PathBuf>,
+) -> anyhow::Result<Option<common::SocksAuth>> {
+    let password = match (password, password_file) {
+        (Some(password), None) => Some(password),
+        (None, Some(path)) => {
+            let mut password = std::fs::read_to_string(&path)
+                .with_context(|| format!("read SOCKS5 password file {}", path.display()))?;
+            if password.ends_with('\n') {
+                password.pop();
+                if password.ends_with('\r') {
+                    password.pop();
+                }
+            }
+            Some(password)
+        }
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap rejects conflicting password sources"),
+    };
+    match (username, password) {
+        (None, None) => Ok(None),
+        (Some(username), Some(password)) => {
+            anyhow::ensure!(!username.is_empty(), "SOCKS5 username cannot be empty");
+            anyhow::ensure!(!password.is_empty(), "SOCKS5 password cannot be empty");
+            anyhow::ensure!(username.len() <= u8::MAX as usize, "SOCKS5 username exceeds 255 bytes");
+            anyhow::ensure!(password.len() <= u8::MAX as usize, "SOCKS5 password exceeds 255 bytes");
+            Ok(Some(common::SocksAuth { username, password }))
+        }
+        (Some(_), None) => anyhow::bail!("--username requires --password or --password-file"),
+        (None, Some(_)) => unreachable!("clap requires a username for either password source"),
+    }
+}
+
 fn print_proxies(proxies: Vec<common::ProxyInfo>) -> ExitCode {
     if proxies.is_empty() {
         println!("no proxies running");
@@ -417,6 +466,7 @@ fn print_proxies(proxies: Vec<common::ProxyInfo>) -> ExitCode {
     for proxy in proxies {
         let kind = match proxy.kind {
             common::ProxyKind::Tcp { target } => format!("tcp -> {}:{}", target.host, target.port),
+            common::ProxyKind::Socks5 if proxy.authenticated => "socks5 (authenticated)".into(),
             common::ProxyKind::Socks5 => "socks5".into(),
         };
         println!("{}: {} on {} via {}", proxy.name, kind, proxy.listen, proxy.edge);
@@ -529,5 +579,57 @@ mod tests {
             ])
             .is_ok()
         );
+        assert!(
+            Cli::try_parse_from([
+                "agent-scale",
+                "-e",
+                "linux",
+                "proxy",
+                "start",
+                "socks5",
+                "shared",
+                "--listen",
+                "0.0.0.0:1080",
+                "--username",
+                "developer",
+                "--password",
+                "secret",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agent-scale",
+                "-e",
+                "linux",
+                "proxy",
+                "start",
+                "socks5",
+                "shared",
+                "--listen",
+                "0.0.0.0:1080",
+                "--username",
+                "developer",
+                "--password",
+                "secret",
+                "--password-file",
+                "secret.txt",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn socks_password_file_removes_only_its_line_ending() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b" secret \r\n").unwrap();
+        let auth = socks_auth(Some("developer".into()), None, Some(file.path().into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(auth.username, "developer");
+        assert_eq!(auth.password, " secret ");
+        assert!(socks_auth(Some("developer".into()), None, None).is_err());
     }
 }
