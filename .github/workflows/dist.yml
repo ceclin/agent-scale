@@ -251,23 +251,32 @@ jobs:
           retention-days: 1
 
   android-edge:
-    name: Build as-edge (aarch64-linux-android)
+    name: Build as-edge (${{ matrix.target }})
     needs: [metadata, verify]
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: armv7-linux-androideabi
+            linker: armv7a-linux-androideabi21-clang
+          - target: aarch64-linux-android
+            linker: aarch64-linux-android21-clang
+          - target: x86_64-linux-android
+            linker: x86_64-linux-android21-clang
     env:
       ANDROID_NDK_VERSION: 27.3.13750724
-      ANDROID_TARGET: aarch64-linux-android
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.metadata.outputs.source_sha }}
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
-          targets: aarch64-linux-android
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: release-as-edge-aarch64-linux-android
+          key: release-as-edge-${{ matrix.target }}
       - name: Install Android NDK
         run: sdkmanager --install "ndk;$ANDROID_NDK_VERSION"
       - run: cargo x init
@@ -275,18 +284,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          target="${{ matrix.target }}"
           toolchain="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$toolchain/aarch64-linux-android21-clang"
-          export CC_aarch64_linux_android="$toolchain/aarch64-linux-android21-clang"
-          export AR_aarch64_linux_android="$toolchain/llvm-ar"
-          cargo build --locked --profile dist -p as-edge --target "$ANDROID_TARGET"
+          linker="$toolchain/${{ matrix.linker }}"
+          target_env="${target//-/_}"
+          export "CARGO_TARGET_${target_env^^}_LINKER=$linker"
+          export "CC_${target_env}=$linker"
+          export "AR_${target_env}=$toolchain/llvm-ar"
+          cargo build --locked --profile dist -p as-edge --target "$target"
       - name: Stage and package binary
         shell: bash
         run: |
           set -euo pipefail
-          input="target/android-dist/as-edge/$ANDROID_TARGET"
+          target="${{ matrix.target }}"
+          input="target/android-dist/as-edge/$target"
           mkdir -p "$input/licenses/fd" "$input/licenses/ripgrep"
-          cp "target/$ANDROID_TARGET/dist/as-edge" "$input/"
+          cp "target/$target/dist/as-edge" "$input/"
           cp LICENSE THIRD_PARTY.md "$input/"
           cp licenses/dependencies/as-edge.html "$input/THIRD_PARTY_LICENSES.html"
           cp .upstreams/fd/LICENSE-APACHE .upstreams/fd/LICENSE-MIT "$input/licenses/fd/"
@@ -299,7 +312,7 @@ jobs:
             target/release-artifacts
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-as-edge-aarch64-linux-android
+          name: release-as-edge-${{ matrix.target }}
           path: target/release-artifacts/*
           if-no-files-found: error
           retention-days: 1

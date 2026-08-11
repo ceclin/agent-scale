@@ -8,8 +8,8 @@ The project uses semantic versioning after its first public release. Before
 ## Unreleased
 
 - Added optional username/password authentication for SOCKS5 proxy listeners.
-- Added an Android ARM64 Edge binary for foreground use from `adb shell`, using
-  Android's system DNS path for Relay hostnames.
+- Added Android ARMv7, ARM64, and x86-64 Edge binaries for foreground use from
+  `adb shell`, using Android's system DNS path for Relay hostnames.
 
 ## 0.9.0 - 2026-08-10
 
