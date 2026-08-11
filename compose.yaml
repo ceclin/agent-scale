@@ -1,10 +1,10 @@
 name: agent-scale
 
 x-control-image: &control-image
-  image: ${AGENT_SCALE_CONTROL_IMAGE:-ghcr.io/ceclin/agent-scale-control:0.9.0}
+  image: ${AGENT_SCALE_CONTROL_IMAGE:-ghcr.io/ceclin/agent-scale-control:0.10.0}
 
 x-relay-image: &relay-image
-  image: ${AGENT_SCALE_RELAY_IMAGE:-ghcr.io/ceclin/agent-scale-relay:0.9.0}
+  image: ${AGENT_SCALE_RELAY_IMAGE:-ghcr.io/ceclin/agent-scale-relay:0.10.0}
 
 x-control-environment: &control-environment
   AS_CONTROL_STATE_DIR: /control

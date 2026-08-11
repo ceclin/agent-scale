@@ -5,7 +5,7 @@ All notable changes to this project will be documented here.
 The project uses semantic versioning after its first public release. Before
 1.0, configuration and wire formats may change incompatibly.
 
-## Unreleased
+## 0.10.0 - 2026-08-11
 
 - Added optional username/password authentication for SOCKS5 proxy listeners.
 - Added Android ARMv7, ARM64, and x86-64 Edge binaries for foreground use from
