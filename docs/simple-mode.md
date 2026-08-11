@@ -27,6 +27,14 @@ client's EndpointId. Later connections are strict. To avoid trust-on-first-use,
 run `agent-scale keygen` on the development machine and start the edge with
 `as-edge run test --client <CLIENT_ENDPOINT_ID>`.
 
+The Android ARM64 archive is a native command-line binary for `adb shell`:
+
+```sh
+adb push as-edge /data/local/tmp/as-edge
+adb shell chmod 755 /data/local/tmp/as-edge
+adb shell 'AGENT_SCALE_HOME=/data/local/tmp/agent-scale /data/local/tmp/as-edge run test'
+```
+
 For a persistent current-user service on Linux, macOS, or Windows:
 
 ```sh

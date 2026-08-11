@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use super::who_dir;
 
 #[cfg(target_os = "linux")]

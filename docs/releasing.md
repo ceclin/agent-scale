@@ -58,16 +58,17 @@ prereleases never advance `latest`, and stable releases never advance `preview`.
 
 The workflow creates versioned archives for:
 
-- `as-edge`: Linux x86-64, Linux ARM64, Windows x86-64, macOS ARM64, and macOS
-  x86-64;
+- `as-edge`: Linux x86-64, Linux ARM64, Android ARM64, Windows x86-64, macOS
+  ARM64, and macOS x86-64;
 - `agent-scale`: Linux x86-64, Linux ARM64, Windows x86-64, macOS ARM64,
   and macOS x86-64;
 - `as-control`: Linux x86-64 and Linux ARM64;
 - `as-relay`: Linux x86-64 and Linux ARM64.
 
 Linux archives use Rust's static musl targets on matching x86-64 and ARM64
-runners. Windows archives use the native `x86_64-pc-windows-msvc` toolchain;
-the release workflow does not cross-compile either platform.
+runners. The Android Edge is cross-compiled with the pinned Android NDK for
+`aarch64-linux-android`. Windows archives use the native
+`x86_64-pc-windows-msvc` toolchain.
 
 Every archive has an entry in the distribution's `SHA256SUMS`. Verify a download
 from the directory containing both files with:

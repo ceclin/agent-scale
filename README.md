@@ -46,9 +46,9 @@ On Windows, use `Get-FileHash -Algorithm SHA256 <archive>` in PowerShell and
 compare it with the corresponding entry in `SHA256SUMS`.
 
 Linux and macOS builds are available for x86-64 and ARM64. Windows builds are
-available for x86-64. Windows support is experimental and has not yet been
-validated through the complete workflow on a physical Windows development
-machine.
+available for x86-64. An Android ARM64 `as-edge` build can run in the foreground
+from `adb shell`. Windows and Android support are experimental and have not yet
+been validated through the complete workflow on physical devices.
 
 Control and private Relay deployments use the separately published
 `as-control` and `as-relay` Linux binaries, or these multi-architecture images:
