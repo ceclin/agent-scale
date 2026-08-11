@@ -4055,6 +4055,7 @@ dependencies = [
  "iroh",
  "iroh-blobs",
  "iroh-relay",
+ "n0-error",
  "rustls",
  "scale-protocol",
  "tempfile",

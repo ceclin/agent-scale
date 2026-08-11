@@ -16,6 +16,9 @@ use iroh::endpoint::{RelayMode, presets};
 use iroh::{Endpoint, RelayMap, RelayUrl, SecretKey};
 use protocol::{ProxyDatagram, ProxyTarget};
 
+#[cfg(target_os = "android")]
+mod android_dns;
+
 /// ALPN for the agent-scale RPC protocol.
 pub const ALPN: &[u8] = b"agent-scale/rpc/5";
 
@@ -178,6 +181,10 @@ pub async fn build_endpoint_with_config(
         .secret_key(secret_key)
         .relay_mode(RelayMode::Custom(map))
         .alpns(alpns);
+    #[cfg(target_os = "android")]
+    {
+        builder = builder.dns_resolver(android_dns::system_resolver());
+    }
     if let Some(ca_der) = relay_ca_der {
         anyhow::ensure!(!ca_der.is_empty(), "managed Relay CA certificate is empty");
         builder = builder.ca_tls_config(
