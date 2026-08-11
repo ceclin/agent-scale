@@ -22,10 +22,14 @@ fn replace_once(source: String, from: &str, to: &str, description: &str) -> Stri
     patched
 }
 
+fn normalize_newlines(source: String) -> String {
+    source.replace("\r\n", "\n")
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let source = manifest_dir.join("../../.upstreams/fd/src/main.rs");
-    let src = fs::read_to_string(&source).expect("failed to read fd main.rs — run `cargo x init`");
+    let src = normalize_newlines(fs::read_to_string(&source).expect("failed to read fd main.rs — run `cargo x init`"));
     let patched = replace_once(src, "\nfn main()", "\npub fn main()", "fd main function");
 
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("fd-src");
@@ -39,7 +43,7 @@ fn main() {
     // Keep numeric --owner filters available there without changing fd's
     // behavior on platforms that can resolve user and group names.
     let owner_path = out.join("filter/owner.rs");
-    let owner = fs::read_to_string(&owner_path).expect("failed to read copied fd owner filter");
+    let owner = normalize_newlines(fs::read_to_string(&owner_path).expect("failed to read copied fd owner filter"));
     let owner = replace_once(
         owner,
         "use nix::unistd::{Group, User};",
