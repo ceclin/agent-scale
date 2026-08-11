@@ -277,15 +277,25 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: release-as-edge-${{ matrix.target }}
-      - name: Install Android NDK
-        run: sdkmanager --install "ndk;$ANDROID_NDK_VERSION"
+      - name: Set up Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Install Android SDK and NDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          cmdline-tools-version: "14742923"
+          packages: ndk;${{ env.ANDROID_NDK_VERSION }}
+          log-accepted-android-sdk-licenses: false
       - run: cargo x init
       - name: Build Android distribution binary
         shell: bash
         run: |
           set -euo pipefail
           target="${{ matrix.target }}"
-          toolchain="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          android_sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/.android/sdk}}"
+          toolchain="$android_sdk/ndk/$ANDROID_NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin"
           linker="$toolchain/${{ matrix.linker }}"
           target_env="${target//-/_}"
           export "CARGO_TARGET_${target_env^^}_LINKER=$linker"
