@@ -7,6 +7,8 @@ The project uses semantic versioning after its first public release. Before
 
 ## Unreleased
 
+- Fixed slow downloads of disk-backed blobs on Windows.
+
 ## 0.10.0 - 2026-08-11
 
 - Added optional username/password authentication for SOCKS5 proxy listeners.
