@@ -8,4 +8,10 @@ iroh = "iroh"
 MPORT = "MPORT"
 
 [files]
-extend-exclude = [".upstreams/**", "licenses/dependencies/**", "submodules/**", "target/**"]
+extend-exclude = [
+  ".upstreams/**",
+  "licenses/dependencies/**",
+  "submodules/**",
+  "target/**",
+  "vendor/iroh-blobs/**",
+]
