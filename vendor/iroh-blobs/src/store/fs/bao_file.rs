@@ -33,8 +33,8 @@ use crate::{
     store::{
         fs::{meta::raw_outboard_size, util::entity_manager, HashContext},
         util::{
-            into_blob_file, read_checksummed_and_truncate, write_checksummed, BlobFile, FixedSize,
-            MemOrFile, PartialMemStorage, DD,
+            into_blob_file, into_fixed_blob_file, read_checksummed_and_truncate,
+            write_checksummed, BlobFile, FixedSize, MemOrFile, PartialMemStorage, DD,
         },
         IROH_BLOCK_SIZE,
     },
@@ -55,7 +55,7 @@ pub struct CompleteStorage {
     /// data part, which can be in memory or on disk.
     pub data: MemOrFile<Bytes, FixedSize<BlobFile>>,
     /// outboard part, which can be in memory or on disk.
-    pub outboard: MemOrFile<Bytes, File>,
+    pub outboard: MemOrFile<Bytes, FixedSize<BlobFile>>,
 }
 
 impl fmt::Debug for CompleteStorage {
@@ -225,7 +225,10 @@ impl PartialFileStorage {
                 )
             }
         } else {
-            (MemOrFile::File(self.outboard), OutboardLocation::Owned)
+            (
+                MemOrFile::File(into_fixed_blob_file(self.outboard)?),
+                OutboardLocation::Owned,
+            )
         };
         // todo: notify the store that the state has changed to complete
         Ok((
@@ -381,7 +384,10 @@ impl PartialMemStorage {
             } else {
                 OutboardLocation::Owned
             };
-            (MemOrFile::File(outboard_file), outboard_location)
+            (
+                MemOrFile::File(into_fixed_blob_file(outboard_file)?),
+                outboard_location,
+            )
         };
         Ok((
             CompleteStorage { data, outboard },
@@ -603,7 +609,7 @@ impl BaoFileStorage {
                     OutboardLocation::Owned => {
                         let path = options.path.outboard_path(hash);
                         let file = std::fs::File::open(&path)?;
-                        MemOrFile::File(file)
+                        MemOrFile::File(into_fixed_blob_file(file)?)
                     }
                 };
                 Self::new_complete(data, outboard)
@@ -632,7 +638,7 @@ impl BaoFileStorage {
     /// Create a new complete bao file handle.
     pub fn new_complete(
         data: MemOrFile<Bytes, FixedSize<BlobFile>>,
-        outboard: MemOrFile<Bytes, File>,
+        outboard: MemOrFile<Bytes, FixedSize<BlobFile>>,
     ) -> Self {
         CompleteStorage { data, outboard }.into()
     }
@@ -643,7 +649,7 @@ impl BaoFileHandle {
     pub fn complete(
         &self,
         data: MemOrFile<Bytes, FixedSize<BlobFile>>,
-        outboard: MemOrFile<Bytes, File>,
+        outboard: MemOrFile<Bytes, FixedSize<BlobFile>>,
     ) {
         self.send_if_modified(|guard| {
             let needs_complete = match guard {

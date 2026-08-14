@@ -121,7 +121,10 @@ use crate::{
             util::entity_manager::{self, ActiveEntityState},
         },
         gc::run_gc,
-        util::{into_blob_file, BaoTreeSender, FixedSize, MemOrFile, ValueOrPoisioned},
+        util::{
+            into_blob_file, into_fixed_blob_file, BaoTreeSender, FixedSize, MemOrFile,
+            ValueOrPoisioned,
+        },
         IROH_BLOCK_SIZE,
     },
     util::{
@@ -1103,7 +1106,7 @@ async fn finish_import_impl(ctx: &HashContext, import_data: ImportEntry) -> io::
         OutboardLocation::Owned => {
             let path = ctx.options().path.outboard_path(&hash);
             let file = fs::File::open(&path)?;
-            MemOrFile::File(file)
+            MemOrFile::File(into_fixed_blob_file(file)?)
         }
     };
     handle.complete(data, outboard);

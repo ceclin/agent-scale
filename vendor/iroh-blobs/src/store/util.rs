@@ -23,7 +23,7 @@ mod mem_or_file;
 #[cfg_attr(iroh_blobs_docsrs, doc(cfg(feature = "fs-store")))]
 pub use mem_or_file::{FixedSize, MemOrFile};
 #[cfg(feature = "fs-store")]
-pub(crate) use mem_or_file::{into_blob_file, BlobFile};
+pub(crate) use mem_or_file::{into_blob_file, into_fixed_blob_file, BlobFile};
 
 /// A named, persistent tag.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, From, Into)]
