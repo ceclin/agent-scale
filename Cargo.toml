@@ -16,6 +16,9 @@ default-members = [
   "crates/rg-lib",
 ]
 
+[patch.crates-io]
+iroh-blobs = { path = "vendor/iroh-blobs" }
+
 [workspace.package]
 edition = "2024"
 homepage = "https://github.com/ceclin/agent-scale"
