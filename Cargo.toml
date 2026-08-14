@@ -24,7 +24,7 @@ edition = "2024"
 homepage = "https://github.com/ceclin/agent-scale"
 license = "Apache-2.0"
 repository = "https://github.com/ceclin/agent-scale"
-version = "0.10.2"
+version = "0.10.3"
 
 [workspace.lints.rust]
 unknown_lints = "deny"
