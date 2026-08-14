@@ -7,6 +7,8 @@ The project uses semantic versioning after its first public release. Before
 
 ## Unreleased
 
+## 0.10.1 - 2026-08-14
+
 - Fixed slow downloads of disk-backed blobs on Windows.
 
 ## 0.10.0 - 2026-08-11
