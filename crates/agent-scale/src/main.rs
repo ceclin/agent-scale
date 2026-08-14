@@ -16,7 +16,11 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "agent-scale", about = "Run commands on remote test machines over iroh")]
+#[command(
+    name = "agent-scale",
+    version,
+    about = "Run commands on remote test machines over iroh"
+)]
 struct Cli {
     /// Select an edge for exec, transfer, or MCP operations. Repeat for MCP sync.
     #[arg(short = 'e', long = "edge")]
