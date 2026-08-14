@@ -33,6 +33,11 @@ pub(crate) fn into_blob_file(file: File) -> io::Result<BlobFile> {
     }
 }
 
+pub(crate) fn into_fixed_blob_file(file: File) -> io::Result<FixedSize<BlobFile>> {
+    let size = file.metadata()?.len();
+    Ok(FixedSize::new(into_blob_file(file)?, size))
+}
+
 /// A wrapper for a file with a fixed size.
 #[derive(Debug)]
 pub struct FixedSize<T> {
