@@ -7,6 +7,10 @@ The project uses semantic versioning after its first public release. Before
 
 ## Unreleased
 
+## 0.10.4 - 2026-08-17
+
+- Fixed stalled large-file downloads after a direct path is abandoned.
+
 ## 0.10.3 - 2026-08-14
 
 - Fixed distribution cache invalidation for vendored `iroh-blobs` sources.
