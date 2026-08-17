@@ -22,6 +22,8 @@ jobs:
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ci-quality-iroh-${{ hashFiles('vendor/iroh/**') }}-iroh-blobs-${{ hashFiles('vendor/iroh-blobs/**') }}
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
@@ -47,6 +49,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ci-linux-iroh-${{ hashFiles('vendor/iroh/**') }}-iroh-blobs-${{ hashFiles('vendor/iroh-blobs/**') }}
       - run: cargo x check
       - run: cargo x test
 
@@ -57,6 +61,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ci-macos-iroh-${{ hashFiles('vendor/iroh/**') }}-iroh-blobs-${{ hashFiles('vendor/iroh-blobs/**') }}
       - run: cargo x init
       - run: >-
           cargo test --locked
@@ -70,5 +76,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ci-windows-iroh-${{ hashFiles('vendor/iroh/**') }}-iroh-blobs-${{ hashFiles('vendor/iroh-blobs/**') }}
       - run: cargo x init
       - run: cargo test --locked -p as-edge -p agent-scale

@@ -17,6 +17,7 @@ default-members = [
 ]
 
 [patch.crates-io]
+iroh = { path = "vendor/iroh" }
 iroh-blobs = { path = "vendor/iroh-blobs" }
 
 [workspace.package]

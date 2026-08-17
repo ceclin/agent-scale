@@ -13,5 +13,5 @@ extend-exclude = [
   "licenses/dependencies/**",
   "submodules/**",
   "target/**",
-  "vendor/iroh-blobs/**",
+  "vendor/**",
 ]
