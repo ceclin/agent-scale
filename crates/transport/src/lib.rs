@@ -181,6 +181,16 @@ pub async fn build_endpoint_with_config(
         .secret_key(secret_key)
         .relay_mode(RelayMode::Custom(map))
         .alpns(alpns);
+    // We observed intermittent bulk QUIC transfer stalls with UDP segmentation
+    // offload enabled on Windows VirtIO adapters.
+    #[cfg(target_os = "windows")]
+    {
+        builder = builder.transport_config(
+            iroh::endpoint::QuicTransportConfig::builder()
+                .enable_segmentation_offload(false)
+                .build(),
+        );
+    }
     #[cfg(target_os = "android")]
     {
         builder = builder.dns_resolver(android_dns::system_resolver());
