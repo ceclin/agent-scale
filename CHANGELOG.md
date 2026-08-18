@@ -7,6 +7,11 @@ The project uses semantic versioning after its first public release. Before
 
 ## Unreleased
 
+## 0.10.5 - 2026-08-18
+
+- Disabled Windows UDP segmentation offload to prevent intermittent large-file
+  transfer stalls on VirtIO adapters.
+
 ## 0.10.4 - 2026-08-17
 
 - Fixed stalled large-file downloads after a direct path is abandoned.
